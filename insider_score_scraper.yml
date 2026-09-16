@@ -1,32 +1,46 @@
 # ============================================================================
 # insider_score_scraper.yml
 # ============================================================================
-# Runs insider_score_scraper.py on a daily schedule (GitHub Actions), the
-# same "Alarm Clock" pattern already proven in this same family of scripts.
+# Runs insider_score_scraper.py for exactly ONE company at a time, triggered
+# on demand via GitHub's own workflow_dispatch API -- called directly from
+# this project's own Google Apps Script row-refresh pipeline (fn_24_05)
+# whenever the user refreshes a specific row.
+#
+# VERSION 2 (REQUESTED DIRECTLY, ARCHITECTURE CHANGE): the original v1 of
+# this workflow ran on a fixed daily schedule (cron), scraping every
+# configured company in one run. Replaced entirely -- the actual intent was
+# always an on-demand, single-row trigger, not an independent daily bulk
+# job. The schedule trigger has been removed; workflow_dispatch now
+# requires row_number/abbrev_is as real inputs, matching what
+# insider_score_scraper.py's own v2 now expects as environment variables.
 #
 # Save this file as .github/workflows/insider_score_scraper.yml in the
 # repository.
 #
 # REQUIRED REPOSITORY SECRETS (Settings -> Secrets and variables -> Actions):
-#   GAS_WEBHOOK_URL              -- the deployed
-#                                   fn_90_01_InsiderScoreWebhook_StockData_60
-#                                   Web App URL
-#   GOOGLE_SERVICE_ACCOUNT_JSON  -- the full JSON key of a Google Cloud
-#                                   Service Account, with the spreadsheet
-#                                   shared to that account's own email as
-#                                   at least "Viewer"
-#   SPREADSHEET_ID               -- the StockData_60 spreadsheet's own ID
+#   GAS_WEBHOOK_URL  -- the deployed
+#                       fn_90_01_InsiderScoreWebhook_StockData_60 Web App URL
+#
+# (GOOGLE_SERVICE_ACCOUNT_JSON and SPREADSHEET_ID, required by v1, are no
+# longer needed at all -- this version never reads the spreadsheet itself.)
 # ============================================================================
 
-name: Daily Insider Buying Score Scraper
+name: Insider Buying Score Scraper
 
 "on":
-  schedule:
-    - cron: '0 10 * * *'
   workflow_dispatch:
+    inputs:
+      row_number:
+        description: 'The specific row on the "Salkku" sheet this run is for'
+        required: true
+        type: string
+      abbrev_is:
+        description: "That row's own current InsiderScreener company slug"
+        required: true
+        type: string
 
 jobs:
-  scrape-insider-scores:
+  scrape-insider-score:
     runs-on: ubuntu-latest
 
     steps:
@@ -45,6 +59,6 @@ jobs:
       - name: Run the scraper
         env:
           GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          ROW_NUMBER: ${{ inputs.row_number }}
+          ABBREV_IS: ${{ inputs.abbrev_is }}
         run: python insider_score_scraper.py
