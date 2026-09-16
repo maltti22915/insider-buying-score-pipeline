@@ -1,0 +1,50 @@
+# ============================================================================
+# insider_score_scraper.yml
+# ============================================================================
+# Runs insider_score_scraper.py on a daily schedule (GitHub Actions), the
+# same "Alarm Clock" pattern already proven in this same family of scripts.
+#
+# Save this file as .github/workflows/insider_score_scraper.yml in the
+# repository.
+#
+# REQUIRED REPOSITORY SECRETS (Settings -> Secrets and variables -> Actions):
+#   GAS_WEBHOOK_URL              -- the deployed
+#                                   fn_90_01_InsiderScoreWebhook_StockData_60
+#                                   Web App URL
+#   GOOGLE_SERVICE_ACCOUNT_JSON  -- the full JSON key of a Google Cloud
+#                                   Service Account, with the spreadsheet
+#                                   shared to that account's own email as
+#                                   at least "Viewer"
+#   SPREADSHEET_ID               -- the StockData_60 spreadsheet's own ID
+# ============================================================================
+
+name: Daily Insider Buying Score Scraper
+
+"on":
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape-insider-scores:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run the scraper
+        env:
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python insider_score_scraper.py
