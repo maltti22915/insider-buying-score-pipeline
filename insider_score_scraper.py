@@ -147,7 +147,9 @@ def print_purchase_breakdown(purchase_details):
     """
     Prints the full per-purchase breakdown the webhook passed back --
     each real transaction that fed into the final score, with its own
-    date, role, role points, planned-discount multiplier, and final
+    date, role, role points, planned-discount multiplier, magnitude
+    multiplier (added directly, new work: the transaction's own real
+    USD-equivalent value, banded into a 0.7x-1.5x multiplier), and final
     points. Requested directly, debugging convenience: this print
     output lands in GitHub Actions' own run log, a single, easy-to-reach
     place to see exactly which transactions produced a given score,
@@ -159,13 +161,26 @@ def print_purchase_breakdown(purchase_details):
         return
 
     for detail in purchase_details:
+        usd_value = detail.get("usdEquivalentValue")
+        currency = detail.get("currency")
+
+        if usd_value is not None:
+            value_text = "~${:,.0f} ({})".format(usd_value, currency)
+        elif currency:
+            value_text = "unrecognized currency ({})".format(currency)
+        else:
+            value_text = "value not found"
+
         print(
-            "   {} | {} | role={} | rolePoints={} | multiplier={} | points={:.1f}".format(
+            "   {} | {} | role={} | rolePoints={} | plannedMultiplier={} | "
+            "value={} | magnitudeMultiplier={} | points={:.1f}".format(
                 detail.get("date"),
                 detail.get("typeText"),
                 detail.get("role"),
                 detail.get("rolePoints"),
                 detail.get("multiplier"),
+                value_text,
+                detail.get("magnitudeMultiplier"),
                 detail.get("points", 0),
             )
         )
