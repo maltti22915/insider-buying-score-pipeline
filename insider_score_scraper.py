@@ -143,6 +143,34 @@ def scrape_company_html(sb, abbrev_is):
     return sb.get_page_source()
 
 
+def print_purchase_breakdown(purchase_details):
+    """
+    Prints the full per-purchase breakdown the webhook passed back --
+    each real transaction that fed into the final score, with its own
+    date, role, role points, planned-discount multiplier, and final
+    points. Requested directly, debugging convenience: this print
+    output lands in GitHub Actions' own run log, a single, easy-to-reach
+    place to see exactly which transactions produced a given score,
+    without needing this project's own separate Apps Script Executions
+    panel for the webhook at all.
+    """
+    if not purchase_details:
+        print("   (no purchases counted within the 6-month window)")
+        return
+
+    for detail in purchase_details:
+        print(
+            "   {} | {} | role={} | rolePoints={} | multiplier={} | points={:.1f}".format(
+                detail.get("date"),
+                detail.get("typeText"),
+                detail.get("role"),
+                detail.get("rolePoints"),
+                detail.get("multiplier"),
+                detail.get("points", 0),
+            )
+        )
+
+
 def post_to_webhook(webhook_url, row_number, abbrev_is, html):
     """
     Posts this company's own scraped HTML to the Apps Script webhook,
@@ -185,12 +213,16 @@ def post_to_webhook(webhook_url, row_number, abbrev_is, html):
                 response_body.get("insiderBuyingScore"),
             )
         )
+        print_purchase_breakdown(response_body.get("purchaseDetails"))
+
     elif response_body.get("ok"):
         print(
             "⏩ Row {} ({}): webhook accepted but did not write ({})".format(
                 row_number, abbrev_is, response_body.get("reason")
             )
         )
+        print_purchase_breakdown(response_body.get("purchaseDetails"))
+
     else:
         print(
             "❌ Row {} ({}): webhook refused/failed ({})".format(
