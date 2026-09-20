@@ -6,6 +6,20 @@
 # this project's own Google Apps Script row-refresh pipeline (fn_24_05)
 # whenever the user refreshes a specific row.
 #
+# VERSION 3 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): a new "sheet_name"
+# input added. A real production run showed the receiving webhook
+# (fn_90_01) refusing a genuinely correct write, reporting a completely
+# unrelated company for a row that in truth only ever held the expected
+# one. Root cause, confirmed directly: this workflow never had any concept
+# of which real sheet (e.g. "Watch", not just "Salkku") a given row-refresh
+# actually came from -- insider_score_scraper.py's own v2 had SHEET_NAME
+# hardcoded to 'Salkku' regardless, so the webhook's own mismatch check was
+# comparing against the wrong sheet's own row entirely whenever a refresh
+# came from any other sheet. Apps Script's own fn_24_71 (VERSION 2 there)
+# now passes the row's own real sheet name as this new input, and
+# insider_score_scraper.py's own v3 reads it as a real environment
+# variable instead of a hardcoded constant.
+#
 # VERSION 2 (REQUESTED DIRECTLY, ARCHITECTURE CHANGE): the original v1 of
 # this workflow ran on a fixed daily schedule (cron), scraping every
 # configured company in one run. Replaced entirely -- the actual intent was
@@ -31,11 +45,15 @@ name: Insider Buying Score Scraper
   workflow_dispatch:
     inputs:
       row_number:
-        description: 'The specific row on the "Salkku" sheet this run is for'
+        description: 'The specific row on the target sheet this run is for'
         required: true
         type: string
       abbrev_is:
         description: "That row's own current InsiderScreener company slug"
+        required: true
+        type: string
+      sheet_name:
+        description: 'The real sheet this row lives on (e.g. "Salkku", "Watch")'
         required: true
         type: string
 
@@ -61,4 +79,5 @@ jobs:
           GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
           ROW_NUMBER: ${{ inputs.row_number }}
           ABBREV_IS: ${{ inputs.abbrev_is }}
+          SHEET_NAME: ${{ inputs.sheet_name }}
         run: python insider_score_scraper.py
