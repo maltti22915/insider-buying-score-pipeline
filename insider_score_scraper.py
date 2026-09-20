@@ -81,8 +81,11 @@ GAS_WEBHOOK_URL       -- this project's own deployed
 REQUIRED GITHUB ACTIONS INPUTS (provided by the caller triggering this
 workflow, not read from anywhere by this script itself)
 ----------------------------------------------------------------------------
-row_number  -- the specific row on the "Salkku" sheet this run is for.
+row_number  -- the specific row on the target sheet this run is for.
 abbrev_is   -- that row's own current InsiderScreener company slug.
+sheet_name  -- the real sheet this row lives on (e.g. "Salkku", "Watch") --
+               VERSION 3 addition, see that version's own changelog entry
+               below for why this is now required rather than assumed.
 
 REQUIRED PYTHON PACKAGES (requirements.txt)
 ----------------------------------------------------------------------------
@@ -91,6 +94,19 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v3 -- Requested directly, real confirmed bug: SHEET_NAME used to be a
+  hardcoded module-level constant, always "Salkku", regardless of which
+  real sheet a given row-refresh actually came from. A real production
+  run showed the receiving webhook (fn_90_01) refusing a genuinely
+  correct write, reporting a completely unrelated company for a row that
+  in truth only ever held the expected one -- because the webhook's own
+  mismatch check was comparing against Column D on the WRONG sheet
+  entirely (always "Salkku", never the row's own real sheet, e.g.
+  "Watch"). Fixed: sheet_name is now a real, required GitHub Actions
+  input (see insider_score_scraper.yml's own matching changelog entry),
+  read here via a real environment variable and passed through to the
+  webhook explicitly, the same way row_number/abbrev_is already were.
+
 v2 -- Requested directly, architecture change: on-demand single-row
   trigger (via GitHub's own workflow_dispatch inputs), replacing v1's own
   daily bulk-scrape-everything design entirely. No longer reads the sheet
@@ -112,7 +128,18 @@ from seleniumbase import SB
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
-SHEET_NAME = "Salkku"
+# VERSION 3 FIX (REQUESTED DIRECTLY, REAL CONFIRMED BUG): SHEET_NAME used
+# to be a hardcoded constant here, always "Salkku" -- regardless of which
+# real sheet (e.g. "Watch") a given row-refresh actually came from. A real
+# production run showed the receiving webhook (fn_90_01) refusing a
+# genuinely correct write, reporting a completely unrelated company for a
+# row that in truth only ever held the expected one -- because the
+# webhook's own mismatch check was comparing against Column D on the
+# WRONG sheet entirely (always "Salkku", never the row's own real sheet).
+# Now read directly from the real "sheet_name" GitHub Actions input (see
+# insider_score_scraper.yml's own matching v3 changelog entry, and
+# fn_24_71's own matching v2 entry on the Apps Script side) inside run_bot
+# below, not hardcoded here at all.
 
 # Real Cloudflare-protected challenges can take a genuine few seconds to
 # resolve even inside a real, patched browser -- confirmed necessary
@@ -186,11 +213,22 @@ def print_purchase_breakdown(purchase_details):
         )
 
 
-def post_to_webhook(webhook_url, row_number, abbrev_is, html):
+def post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html):
     """
     Posts this company's own scraped HTML to the Apps Script webhook,
     which re-verifies the row still matches and writes the computed
     score, using this project's own existing fn_22_30 scoring logic.
+
+    sheet_name -- VERSION 3 FIX (REQUESTED DIRECTLY, REAL CONFIRMED
+    BUG): now a real parameter, passed through from run_bot's own real
+    SHEET_NAME environment variable read, rather than a hardcoded
+    module-level constant. A real production run showed the webhook
+    refusing a genuinely correct write, reporting a completely
+    unrelated company for a row that in truth only ever held the
+    expected one -- because this function was always sending
+    "Salkku" regardless of which real sheet the refresh actually came
+    from, so the webhook's own mismatch check was comparing against
+    the wrong sheet's own Column D entirely.
 
     timeout=120 -- confirmed necessary directly from a real v1 run: two
     companies with a genuinely large transaction history (AppLovin,
@@ -202,7 +240,7 @@ def post_to_webhook(webhook_url, row_number, abbrev_is, html):
     short timeout allows.
     """
     payload = {
-        "sheetName": SHEET_NAME,
+        "sheetName": sheet_name,
         "rowNumber": row_number,
         "abbrevIS": abbrev_is,
         "html": html,
@@ -252,8 +290,9 @@ def run_bot():
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
     abbrev_is = os.environ["ABBREV_IS"]
+    sheet_name = os.environ["SHEET_NAME"]
 
-    print("🎯 Row {}: {}".format(row_number, abbrev_is))
+    print("🎯 Sheet={} | Row={} | {}".format(sheet_name, row_number, abbrev_is))
 
     with SB(uc=True, headless=True) as sb:
         try:
@@ -267,7 +306,7 @@ def run_bot():
             )
             return
 
-        post_to_webhook(webhook_url, row_number, abbrev_is, html)
+        post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html)
 
     print("🧹 Task complete!")
 
