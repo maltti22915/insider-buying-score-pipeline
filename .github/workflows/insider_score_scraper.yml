@@ -6,6 +6,31 @@
 # this project's own Google Apps Script row-refresh pipeline (fn_24_05)
 # whenever the user refreshes a specific row.
 #
+# VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): "abbrev_is" is now
+# ALSO optional (required: false, default ''), matching "abbrev_as"'s own
+# v4 treatment exactly. Previously abbrev_is was required: true, which
+# meant a row with a real, resolved AlphaSpread abbreviation but NO
+# InsiderScreener coverage at all (a genuine, real possibility -- these
+# are two independent providers with independent company coverage) could
+# never trigger this workflow at all, even just for its own AS scrape.
+# insider_score_scraper.py's own v5 mirrors this: ABBREV_IS is now read
+# as an optional environment variable (default ''), and the IS scrape is
+# skipped cleanly, exactly the same way the AS scrape already was skipped
+# when abbrev_as was empty.
+#
+# VERSION 4 (REQUESTED DIRECTLY, NEW WORK): added an OPTIONAL "abbrev_as"
+# input. When provided, this same run also scrapes AlphaSpread's own
+# "valuation history" block for the "AS vs usual" column, reusing the
+# same already-launched browser session -- see insider_score_scraper.py's
+# own matching VERSION 4 changelog entry for the full motivation. Declared
+# with required: false and an empty-string default specifically so this
+# workflow keeps working exactly as before for any caller not yet updated
+# to pass it (Apps Script's own fn_24_71, VERSION 3 there, is the first
+# caller updated to actually supply a real value). No new repository
+# secret needed -- the AS scrape posts to the SAME GAS_WEBHOOK_URL already
+# used for Insider Buying Score; see fn_90_01's own matching VERSION 5
+# entry for how one webhook now serves both.
+#
 # VERSION 3 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): a new "sheet_name"
 # input added. A real production run showed the receiving webhook
 # (fn_90_01) refusing a genuinely correct write, reporting a completely
@@ -34,6 +59,8 @@
 # REQUIRED REPOSITORY SECRETS (Settings -> Secrets and variables -> Actions):
 #   GAS_WEBHOOK_URL  -- the deployed
 #                       fn_90_01_InsiderScoreWebhook_StockData_60 Web App URL
+#                       (serves BOTH Insider Buying Score and, as of v4/v5,
+#                       AlphaSpread "AS vs usual" -- one URL, one secret).
 #
 # (GOOGLE_SERVICE_ACCOUNT_JSON and SPREADSHEET_ID, required by v1, are no
 # longer needed at all -- this version never reads the spreadsheet itself.)
@@ -49,13 +76,19 @@ name: Insider Buying Score Scraper
         required: true
         type: string
       abbrev_is:
-        description: "That row's own current InsiderScreener company slug"
-        required: true
+        description: "OPTIONAL: that row's own current InsiderScreener company slug. Leave blank to skip the Insider Buying Score scrape entirely."
+        required: false
         type: string
+        default: ''
       sheet_name:
         description: 'The real sheet this row lives on (e.g. "Salkku", "Watch")'
         required: true
         type: string
+      abbrev_as:
+        description: "OPTIONAL: that row's own current AlphaSpread abbreviation (e.g. \"nasdaq/adsk\"). Leave blank to skip the AS scrape entirely."
+        required: false
+        type: string
+        default: ''
 
 jobs:
   scrape-insider-score:
@@ -80,4 +113,5 @@ jobs:
           ROW_NUMBER: ${{ inputs.row_number }}
           ABBREV_IS: ${{ inputs.abbrev_is }}
           SHEET_NAME: ${{ inputs.sheet_name }}
+          ABBREV_AS: ${{ inputs.abbrev_as }}
         run: python insider_score_scraper.py
