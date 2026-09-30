@@ -16,6 +16,35 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is is now ALSO
+optional (default '', mirroring abbrev_as's own v4 treatment exactly),
+rather than a required environment variable read. Previously a row with
+a real, resolved AlphaSpread abbreviation but NO InsiderScreener coverage
+at all (a genuine, real possibility -- these are two independent
+providers with independent company coverage) could never trigger this
+workflow at all, since the required ABBREV_IS read would raise a
+KeyError the moment it was left blank. See run_bot's own real logic for
+the full detail; insider_score_scraper.yml's own matching VERSION 5 entry
+covers the input-declaration side of this same fix.
+
+VERSION 4 (REQUESTED DIRECTLY, NEW WORK): this same script, and the same
+already-running browser session, now ALSO optionally scrapes AlphaSpread's
+own "valuation history" block for the "AS vs usual" column -- see
+scrape_alphaspread_html's own docstring for the full motivation. This
+project's own earlier attempts to get this one field via Google Apps
+Script's own Scrape.do-based fetch pipeline (a headless-render API with a
+CSS-selector wait, bounded by that API's own request-level timeout) were
+shown, across an extensive real diagnostic investigation
+(fn_99_01-fn_99_04), to fail unpredictably even at a 40-second wait,
+because the underlying AlphaSpread component is a genuinely LAZY-LOADED
+Livewire component whose real load time varies between a few seconds and
+longer than any bounded API timeout can reliably wait for. A real browser
+here has no equivalent per-request timeout/proxy-rotation cost, so it can
+simply wait as long as this one page genuinely needs. This is entirely
+optional per run (an empty/missing ABBREV_AS input skips it cleanly) and
+completely independent of the existing Insider Buying Score scrape --
+either one failing can never block the other.
+
 VERSION 2 (REQUESTED DIRECTLY, ARCHITECTURE CHANGE): the original v1 of
 this script ran on a fixed daily schedule, reading EVERY configured
 company's own abbrevIS directly from the sheet via the Sheets API, and
@@ -82,10 +111,17 @@ REQUIRED GITHUB ACTIONS INPUTS (provided by the caller triggering this
 workflow, not read from anywhere by this script itself)
 ----------------------------------------------------------------------------
 row_number  -- the specific row on the target sheet this run is for.
-abbrev_is   -- that row's own current InsiderScreener company slug.
+abbrev_is   -- OPTIONAL as of VERSION 5. That row's own current
+               InsiderScreener company slug. When absent or empty, the
+               Insider Buying Score scrape is skipped entirely.
 sheet_name  -- the real sheet this row lives on (e.g. "Salkku", "Watch") --
                VERSION 3 addition, see that version's own changelog entry
                below for why this is now required rather than assumed.
+abbrev_as   -- OPTIONAL, VERSION 4 addition. That row's own current
+               AlphaSpread abbreviation (e.g. "nasdaq/adsk"). When absent
+               or empty, the AlphaSpread scrape is skipped entirely and
+               this run behaves exactly as it did before v4 -- Insider
+               Buying Score only.
 
 REQUIRED PYTHON PACKAGES (requirements.txt)
 ----------------------------------------------------------------------------
@@ -94,6 +130,20 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v5 -- Requested directly, real confirmed gap: abbrev_is is now ALSO
+  optional, mirroring abbrev_as's own v4 treatment. See this file's own
+  top PURPOSE section's own VERSION 5 paragraph for the full detail.
+
+v4 -- Requested directly, new work: added an entirely
+  optional, independent AlphaSpread "valuation history" scrape
+  (scrape_alphaspread_html/post_alphaspread_to_webhook), reusing this same
+  script's own already-running browser session. See this file's own top
+  PURPOSE section's own VERSION 4 paragraph for the full motivation and
+  fn_90_01's own matching VERSION 5 changelog entry for the receiving
+  webhook side. Only runs when a real ABBREV_AS environment variable is
+  provided; the existing Insider Buying Score path is completely
+  unchanged and unaffected either way.
+
 v3 -- Requested directly, real confirmed bug: SHEET_NAME used to be a
   hardcoded module-level constant, always "Salkku", regardless of which
   real sheet a given row-refresh actually came from. A real production
@@ -149,6 +199,19 @@ from seleniumbase import SB
 # settle, not just a real browser.
 PAGE_LOAD_SETTLE_SECONDS = 6
 
+# VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): the maximum time to
+# wait for AlphaSpread's own "valuation history" block to render, using a
+# REAL, condition-based wait (SeleniumBase's own wait_for_element) rather
+# than a fixed sleep -- the core advantage this approach has over the
+# project's own earlier Scrape.do-based attempts, which were bounded by
+# Scrape.do's own request-level ceiling and were shown, across several
+# real diagnostic runs, to sometimes fail even at a 40-second wait while
+# a separate, fresh attempt succeeded in as little as 3-5 seconds. A real
+# browser with no per-request proxy/rotation cost can simply wait longer,
+# with no equivalent penalty for doing so.
+ALPHASPREAD_HEADLINE_SELECTOR = ".valuation-history-context__headline"
+ALPHASPREAD_WAIT_TIMEOUT_SECONDS = 60
+
 
 def scrape_company_html(sb, abbrev_is):
     """
@@ -166,6 +229,71 @@ def scrape_company_html(sb, abbrev_is):
     # Give the real Cloudflare challenge time to fully resolve, and the
     # page's own real content to render, before reading the HTML back out.
     sb.sleep(PAGE_LOAD_SETTLE_SECONDS)
+
+    return sb.get_page_source()
+
+
+def scrape_alphaspread_html(sb, abbrev_as):
+    """
+    VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): fetches the real,
+    complete HTML of one company's own AlphaSpread summary page, waiting
+    for the "valuation history" block's own real headline element to
+    actually appear (via SeleniumBase's own condition-based
+    wait_for_element) rather than a fixed sleep.
+
+    WHY THIS EXISTS: this project's own earlier Apps Script pipeline
+    fetched this same page via Scrape.do's own headless-render API with a
+    playWithBrowser WaitSelector action, capped at a fixed timeout
+    (raised progressively from 15s to 40s across several real production
+    fixes). Extensive, real diagnostic testing (this project's own
+    fn_99_01/fn_99_02/fn_99_03/fn_99_04 investigation) confirmed directly
+    that this specific block is a genuinely LAZY-LOADED Livewire
+    component (AlphaSpread's own explicit design choice, not an
+    incidental slow query) whose real load time varies widely between
+    attempts -- as little as 3-5 seconds on one fresh attempt, and still
+    incomplete at a full 40-second wait on another, with no way to
+    predict which in advance. A real browser, running here with no
+    per-request proxy-rotation cost and no arbitrarily-bounded API
+    timeout, can simply wait as long as this one page genuinely needs,
+    the same way a real user's own browser would.
+
+    Does NOT use uc_open_with_reconnect (that mechanism exists
+    specifically to defeat InsiderScreener's own Cloudflare
+    challenge-platform protection) -- AlphaSpread has shown no equivalent
+    challenge in this project's own real fetch history via Scrape.do
+    (confirmed working there without any comparable anti-bot bypass),
+    so a plain sb.open() is used here instead, reusing the SAME already-
+    running uc-mode browser session regardless (uc=True affects how the
+    whole browser session presents itself, not each individual
+    navigation), which costs nothing extra and keeps this function
+    consistent with the rest of this same run.
+
+    Raises whatever SeleniumBase's own wait_for_element raises
+    (a real timeout exception) if the headline never appears within
+    ALPHASPREAD_WAIT_TIMEOUT_SECONDS -- the caller (run_bot) is
+    responsible for catching this, exactly as it already does for
+    scrape_company_html's own failures, so one scrape failing can never
+    block the other.
+    """
+    target_url = "https://www.alphaspread.com/security/{}/summary".format(
+        abbrev_as
+    )
+
+    print("🌐 Navigating to: {}".format(target_url))
+
+    sb.open(target_url)
+
+    print(
+        "⏳ Waiting up to {}s for the real valuation-history headline"
+        " to appear (real browser, no fixed sleep)...".format(
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+        )
+    )
+
+    sb.wait_for_element(
+        ALPHASPREAD_HEADLINE_SELECTOR,
+        timeout=ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+    )
 
     return sb.get_page_source()
 
@@ -284,29 +412,171 @@ def post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html):
         )
 
 
+def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, html):
+    """
+    VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): posts this
+    company's own scraped AlphaSpread HTML to the SAME Apps Script
+    webhook URL already used for Insider Buying Score
+    (fn_90_01_InsiderScoreWebhook_StockData_60) -- Apps Script Web Apps
+    support only one doPost entry point per deployment, so rather than
+    deploying and maintaining a second, separate Web App URL (and a
+    second GitHub Actions secret to match), this reuses the existing
+    deployed URL, and the payload's own new "target": "AS" field tells
+    the webhook which of its two scoring paths to run. See that
+    function's own matching VERSION 5 changelog entry for the receiving
+    side of this.
+
+    Deliberately a SEPARATE function from post_to_webhook, not a shared
+    one with an if/else inside -- the two payload shapes, response
+    shapes, and log messages are different enough (no purchaseDetails
+    breakdown for AS, a plain vsUsualText field instead) that a shared
+    function would need its own internal branching anyway, and this way
+    each function's own docstring stays focused on the one path it
+    actually handles.
+
+    timeout=120, same reasoning as post_to_webhook's own matching
+    parameter -- not yet confirmed necessary specifically for AS's own
+    payload size (which is a single page's HTML, not a company's own
+    full growing transaction history), but kept consistent since there
+    is no real cost to doing so and it protects against the same class
+    of large-page/slow-round-trip issue if AS's own page size ever grows.
+    """
+    payload = {
+        "target": "AS",
+        "sheetName": sheet_name,
+        "rowNumber": row_number,
+        "abbrevAS": abbrev_as,
+        "html": html,
+    }
+
+    try:
+        response = requests.post(webhook_url, json=payload, timeout=120)
+        response_body = response.json()
+
+    except Exception as post_error:
+        print(
+            "❌ Row {} ({}): AS webhook POST itself failed: {}".format(
+                row_number, abbrev_as, post_error
+            )
+        )
+        return
+
+    if response_body.get("ok") and response_body.get("written"):
+        print(
+            "✅ Row {} ({}): AS vs usual = \"{}\"".format(
+                row_number,
+                abbrev_as,
+                response_body.get("vsUsualText"),
+            )
+        )
+
+    elif response_body.get("ok"):
+        print(
+            "⏩ Row {} ({}): AS webhook accepted but did not write ({})".format(
+                row_number, abbrev_as, response_body.get("reason")
+            )
+        )
+
+    else:
+        print(
+            "❌ Row {} ({}): AS webhook refused/failed ({})".format(
+                row_number, abbrev_as, response_body.get("reason")
+            )
+        )
+
+
 def run_bot():
-    print("🤖 Booting up the Insider Buying Score scraper (single-row mode)...")
+    print("🤖 Booting up the row-refresh scraper (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
-    abbrev_is = os.environ["ABBREV_IS"]
     sheet_name = os.environ["SHEET_NAME"]
 
-    print("🎯 Sheet={} | Row={} | {}".format(sheet_name, row_number, abbrev_is))
+    # VERSION 5 FIX (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is
+    # is now ALSO read as an OPTIONAL environment variable (default '',
+    # mirroring abbrev_as's own v4 treatment exactly), rather than a
+    # required os.environ[...] lookup. Previously a row with a real,
+    # resolved AlphaSpread abbreviation but NO InsiderScreener coverage
+    # at all (a genuine, real possibility -- these are two independent
+    # providers with independent company coverage) could never trigger
+    # this workflow at all, since insider_score_scraper.yml's own
+    # abbrev_is input was required: true and this line would raise a
+    # KeyError the moment it was left blank. See
+    # insider_score_scraper.yml's own matching VERSION 5 entry for the
+    # input-declaration side of this same fix.
+    abbrev_is = os.environ.get("ABBREV_IS", "").strip()
+
+    # VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): abbrev_as is
+    # read as an OPTIONAL environment variable (default '', not a
+    # required os.environ[...] lookup) -- not every real trigger of this
+    # workflow will necessarily have a real, resolved abbrevAS available
+    # for that row yet (or a caller not yet updated to pass it at all),
+    # and this must never turn what used to be a working Insider Buying
+    # Score run into a hard failure just because the newer, optional AS
+    # piece was not supplied. See insider_score_scraper.yml's own
+    # matching VERSION 4 entry for this same input declared optional
+    # there too.
+    abbrev_as = os.environ.get("ABBREV_AS", "").strip()
+
+    print(
+        "🎯 Sheet={} | Row={} | IS={} | AS={}".format(
+            sheet_name, row_number, abbrev_is or "(none)", abbrev_as or "(none)"
+        )
+    )
+
+    if not abbrev_is and not abbrev_as:
+        print(
+            "⏩ Row {}: neither abbrev_is nor abbrev_as was provided --"
+            " nothing to scrape this run.".format(row_number)
+        )
+        return
 
     with SB(uc=True, headless=True) as sb:
-        try:
-            html = scrape_company_html(sb, abbrev_is)
+        # ------------------------------------------------------------------
+        # Insider Buying Score -- only attempted when a real abbrev_is was
+        # actually provided (VERSION 5: this check itself is new; the
+        # scrape/post call inside was already wrapped in its own
+        # try/except from v4, so a failure here still cannot block the AS
+        # scrape below).
+        # ------------------------------------------------------------------
+        if abbrev_is:
+            try:
+                html = scrape_company_html(sb, abbrev_is)
+                post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html)
 
-        except Exception as scrape_error:
-            print(
-                "❌ Row {} ({}): scrape itself failed: {}".format(
-                    row_number, abbrev_is, scrape_error
+            except Exception as scrape_error:
+                print(
+                    "❌ Row {} ({}): IS scrape itself failed: {}".format(
+                        row_number, abbrev_is, scrape_error
+                    )
                 )
+        else:
+            print(
+                "⏩ Row {}: no abbrev_is provided -- skipping Insider Buying"
+                " Score scrape this run.".format(row_number)
             )
-            return
 
-        post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html)
+        # ------------------------------------------------------------------
+        # VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): AlphaSpread
+        # "valuation history" scrape, reusing this SAME already-running
+        # browser session -- only attempted when a real abbrev_as was
+        # actually provided. A separate, independent try/except, so an
+        # IS-side failure above (or an AS-side failure here) can never
+        # block the other from still being attempted and posted.
+        # ------------------------------------------------------------------
+        if abbrev_as:
+            try:
+                as_html = scrape_alphaspread_html(sb, abbrev_as)
+                post_alphaspread_to_webhook(
+                    webhook_url, row_number, abbrev_as, sheet_name, as_html
+                )
+
+            except Exception as as_scrape_error:
+                print(
+                    "❌ Row {} ({}): AS scrape itself failed: {}".format(
+                        row_number, abbrev_as, as_scrape_error
+                    )
+                )
 
     print("🧹 Task complete!")
 
