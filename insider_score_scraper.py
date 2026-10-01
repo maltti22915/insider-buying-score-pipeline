@@ -16,6 +16,30 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 7 (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOTS): three
+observability fixes, found by reading a real Row 34 (Chemometec) run
+where v6 correctly matched the new .intrinsic-value-history__verdict
+element but the AS webhook then answered "accepted but did not write
+(VALUE_NULL)", and the log could not say why.
+  (1) EVERY AS scrape now prints the matched element's own visible text
+      (and whether that text is empty) plus an HTML snippet, not just
+      the selector that matched. This is what distinguishes "the element
+      was still empty/loading when the wait returned" from "the element
+      had real text the webhook's parser could not read".
+  (2) AS diagnostics (page summary, screenshot, HTML) are now also saved
+      when the webhook answers "not written" or refuses/fails -- not only
+      when the scrape itself throws. v6 only covered the timeout case, so
+      the VALUE_NULL run left nothing to inspect.
+  (3) When a webhook response is not valid JSON, the HTTP status code,
+      content type, redirect count, body length and the first 200
+      characters of the body are now logged (shared read_webhook_json
+      helper, used by both the IS and AS posts), and the message no
+      longer implies the write failed. The real Row 34 IS run printed
+      "webhook POST itself failed: Expecting value: line 1 column 1"
+      while Apps Script's own log showed the score had in fact been
+      written -- an unreadable response is not the same as a failed
+      write, and the log must not say so.
+
 VERSION 6 (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): the AlphaSpread
 scrape now waits for EITHER of AlphaSpread's two known "valuation
 history" markup shapes, and saves real diagnostics when the wait fails.
@@ -153,6 +177,17 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v7 -- Requested directly, real confirmed blind spots (Row 34,
+  cse/chemm): every AS scrape now logs the matched element's text and
+  an HTML snippet (describe_matched_elements); AS diagnostics are also
+  saved when the webhook answers "not written" or refuses/fails, via
+  post_alphaspread_to_webhook now returning whether it wrote; and
+  non-JSON webhook responses now log status code, content type,
+  redirect count, body length and the first 200 body characters
+  (read_webhook_json), with wording that no longer claims the write
+  failed. Insider Buying Score scraping and scoring unchanged. See this
+  file's own top PURPOSE section's own VERSION 7 paragraph.
+
 v6 -- Requested directly, real confirmed failure (Row 34, cse/chemm): the
   AS scrape now waits for either known valuation-history markup shape
   (.valuation-history-context__headline OR
@@ -269,6 +304,14 @@ DIAGNOSTICS_DIR = "diagnostics"
 # print into the run log when an AS scrape fails.
 DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
 
+# VERSION 7 ADDITIONS: how much of a matched valuation-history element's
+# own text / outer HTML to print on every AS scrape, and how much of a
+# non-JSON webhook response body to print (REQUESTED DIRECTLY: first 200
+# characters).
+ELEMENT_TEXT_PREVIEW_CHARS = 300
+ELEMENT_HTML_SNIPPET_CHARS = 600
+WEBHOOK_BODY_PREVIEW_CHARS = 200
+
 
 def scrape_company_html(sb, abbrev_is):
     """
@@ -300,7 +343,12 @@ def scrape_alphaspread_html(sb, abbrev_as):
 
     VERSION 6 CHANGE: waits for EITHER known markup shape of that block
     (see ALPHASPREAD_HEADLINE_SELECTORS) rather than only the original
-    headline element, and logs which one actually matched. The original
+    headline element, and logs which one actually matched.
+
+    VERSION 7 CHANGE: also logs the matched element's own text and an
+    HTML snippet (describe_matched_elements), since a selector merely
+    being present does not prove the lazy-loaded block had finished
+    filling in. The original
     only-first-selector wait could never succeed on a page that serves
     the newer intrinsic-value-history__verdict component instead.
 
@@ -359,23 +407,140 @@ def scrape_alphaspread_html(sb, abbrev_as):
         timeout=ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
     )
 
-    # Log which markup shape this page actually served, so a later
-    # comparison across stocks shows how common each one really is.
-    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
-        try:
-            if sb.is_element_present(selector):
-                print("🔎 Matched valuation-history element: {}".format(selector))
-        except Exception:
-            pass
+    # VERSION 7: log which markup shape this page actually served AND
+    # what that element actually contained, on every scrape (not only
+    # failures) -- see describe_matched_elements.
+    describe_matched_elements(sb)
 
     return sb.get_page_source()
 
 
-def save_alphaspread_diagnostics(sb, row_number, abbrev_as):
+def describe_matched_elements(sb):
+    """
+    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOT):
+    for each known valuation-history selector that is present on the
+    page, prints its own visible text, whether that text is empty, its
+    child-element count, and a snippet of its outer HTML.
+
+    WHY: v6 only printed which selector matched. A real Row 34 run
+    matched .intrinsic-value-history__verdict and the webhook then
+    reported VALUE_NULL, with nothing in the log to show whether the
+    element had real text (a parser problem) or was still an empty or
+    loading shell when the wait returned (a wait problem). This output
+    answers that on every scrape, including successful ones, so a
+    working run can be compared with a failing one.
+
+    Fully guarded -- never raises, never affects the scrape itself.
+    """
+    script = (
+        "var el = document.querySelector(arguments[0]);"
+        " if (!el) { return null; }"
+        " return {text: (el.innerText || el.textContent || ''),"
+        " html: (el.outerHTML || ''),"
+        " children: el.children ? el.children.length : 0};"
+    )
+
+    matched_any = False
+
+    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
+        try:
+            if not sb.is_element_present(selector):
+                continue
+        except Exception:
+            continue
+
+        matched_any = True
+        print("🔎 Matched valuation-history element: {}".format(selector))
+
+        try:
+            details = sb.execute_script(script, selector)
+        except Exception as error:
+            print("   (could not read element content: {})".format(error))
+            continue
+
+        if not details:
+            print("   (element disappeared before its content could be read)")
+            continue
+
+        text = re.sub(r"\s+", " ", details.get("text") or "").strip()
+        html_snippet = re.sub(r"\s+", " ", details.get("html") or "").strip()
+
+        print(
+            "   text length: {} | text empty: {} | child elements: {}".format(
+                len(text), not text, details.get("children")
+            )
+        )
+        print(
+            "   text (first {} chars): {}".format(
+                ELEMENT_TEXT_PREVIEW_CHARS,
+                text[:ELEMENT_TEXT_PREVIEW_CHARS] if text else "(empty)",
+            )
+        )
+        print(
+            "   HTML (first {} chars): {}".format(
+                ELEMENT_HTML_SNIPPET_CHARS,
+                html_snippet[:ELEMENT_HTML_SNIPPET_CHARS],
+            )
+        )
+
+    if not matched_any:
+        print("🔎 No known valuation-history element is present on the page.")
+
+
+def read_webhook_json(response, label):
+    """
+    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED MISLEADING
+    LOG): parses a webhook response as JSON, returning the parsed object,
+    or None if the body is not valid JSON.
+
+    When parsing fails, prints the HTTP status code, content type,
+    redirect count, body length, and the first WEBHOOK_BODY_PREVIEW_CHARS
+    characters of the body, so an empty body, an HTML error page, and a
+    truncated response can be told apart from the log alone.
+
+    label -- a short prefix for the log lines, e.g. "Row 34 (abbrev)".
+    """
+    try:
+        return response.json()
+    except ValueError:
+        pass
+
+    try:
+        body_text = response.text or ""
+    except Exception:
+        body_text = ""
+
+    preview = re.sub(r"\s+", " ", body_text).strip()[:WEBHOOK_BODY_PREVIEW_CHARS]
+
+    print(
+        "⚠️ {}: webhook response was not valid JSON | HTTP {} |"
+        " content-type={} | redirects={} | body length={} chars".format(
+            label,
+            response.status_code,
+            response.headers.get("Content-Type"),
+            len(response.history),
+            len(body_text),
+        )
+    )
+    print(
+        "   body (first {} chars): {}".format(
+            WEBHOOK_BODY_PREVIEW_CHARS, preview if preview else "(empty)"
+        )
+    )
+
+    return None
+
+
+def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape failed"):
     """
     VERSION 6 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): when
     the AS scrape fails (typically the wait timing out), records what
     the browser was actually looking at so the failure explains itself.
+
+    VERSION 7 CHANGE: also called when the scrape succeeded but the
+    webhook answered "not written" or refused/failed (a real Row 34 run
+    ended in VALUE_NULL with nothing saved to inspect). The new reason
+    argument says which situation this is in the log.
 
     Does two things, each independently guarded so a failure in one (or
     in this whole function) can never raise out of it or affect the rest
@@ -391,7 +556,11 @@ def save_alphaspread_diagnostics(sb, row_number, abbrev_as):
 
     Not a fix for anything by itself -- it only observes.
     """
-    print("🩺 AS failure diagnostics for Row {} ({}):".format(row_number, abbrev_as))
+    print(
+        "🩺 AS diagnostics for Row {} ({}) -- reason: {}".format(
+            row_number, abbrev_as, reason
+        )
+    )
 
     try:
         print("   title: {}".format(sb.get_title()))
@@ -562,13 +731,28 @@ def post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html):
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=120)
-        response_body = response.json()
 
     except Exception as post_error:
         print(
             "❌ Row {} ({}): webhook POST itself failed: {}".format(
                 row_number, abbrev_is, post_error
             )
+        )
+        return
+
+    # VERSION 7: parse separately from the POST, so an unreadable body is
+    # reported as exactly that. A real Row 34 run printed a "POST itself
+    # failed" error here while the webhook had in fact scored and written
+    # the value.
+    response_body = read_webhook_json(
+        response, "Row {} ({})".format(row_number, abbrev_is)
+    )
+
+    if response_body is None:
+        print(
+            "   The response could not be read, so it is unknown whether the"
+            " webhook wrote the score -- check the sheet or Apps Script"
+            " Executions before assuming it failed."
         )
         return
 
@@ -620,6 +804,11 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     each function's own docstring stays focused on the one path it
     actually handles.
 
+    VERSION 7 CHANGE: returns True only when the webhook confirmed it
+    actually wrote the value, and False for every other outcome (not
+    written, refused/failed, unreadable response, POST failure), so
+    run_bot can save page diagnostics whenever the value did not land.
+
     timeout=120, same reasoning as post_to_webhook's own matching
     parameter -- not yet confirmed necessary specifically for AS's own
     payload size (which is a single page's HTML, not a company's own
@@ -637,7 +826,6 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=120)
-        response_body = response.json()
 
     except Exception as post_error:
         print(
@@ -645,7 +833,19 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
                 row_number, abbrev_as, post_error
             )
         )
-        return
+        return False
+
+    response_body = read_webhook_json(
+        response, "Row {} ({}) AS".format(row_number, abbrev_as)
+    )
+
+    if response_body is None:
+        print(
+            "   The response could not be read, so it is unknown whether the"
+            " webhook wrote the value -- check the sheet or Apps Script"
+            " Executions before assuming it failed."
+        )
+        return False
 
     if response_body.get("ok") and response_body.get("written"):
         print(
@@ -655,20 +855,22 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
                 response_body.get("vsUsualText"),
             )
         )
+        return True
 
-    elif response_body.get("ok"):
+    if response_body.get("ok"):
         print(
             "⏩ Row {} ({}): AS webhook accepted but did not write ({})".format(
                 row_number, abbrev_as, response_body.get("reason")
             )
         )
+        return False
 
-    else:
-        print(
-            "❌ Row {} ({}): AS webhook refused/failed ({})".format(
-                row_number, abbrev_as, response_body.get("reason")
-            )
+    print(
+        "❌ Row {} ({}): AS webhook refused/failed ({})".format(
+            row_number, abbrev_as, response_body.get("reason")
         )
+    )
+    return False
 
 
 def run_bot():
@@ -756,11 +958,18 @@ def run_bot():
         # a bigger one.
         # ------------------------------------------------------------------
         if abbrev_as:
+            diagnostics_reason = None
+
             try:
                 as_html = scrape_alphaspread_html(sb, abbrev_as)
-                post_alphaspread_to_webhook(
+                as_written = post_alphaspread_to_webhook(
                     webhook_url, row_number, abbrev_as, sheet_name, as_html
                 )
+
+                if not as_written:
+                    diagnostics_reason = (
+                        "scrape succeeded but the webhook did not write"
+                    )
 
             except Exception as as_scrape_error:
                 print(
@@ -768,9 +977,16 @@ def run_bot():
                         row_number, abbrev_as, as_scrape_error
                     )
                 )
+                diagnostics_reason = "AS scrape itself failed"
 
+            # VERSION 7: diagnostics are now saved for BOTH situations --
+            # a scrape that threw (v6) and a scrape that worked but whose
+            # value the webhook did not write (e.g. VALUE_NULL).
+            if diagnostics_reason:
                 try:
-                    save_alphaspread_diagnostics(sb, row_number, abbrev_as)
+                    save_alphaspread_diagnostics(
+                        sb, row_number, abbrev_as, diagnostics_reason
+                    )
                 except Exception as diagnostics_error:
                     print(
                         "⚠️ AS diagnostics themselves failed: {}".format(
