@@ -16,6 +16,27 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 9 (REQUESTED DIRECTLY, REAL CONFIRMED RISK): the AlphaSpread wait
+no longer ends on "whichever of the two selectors appears first". v6 waited
+on both as one CSS list. A real Row 34 (Chemometec) run matched
+.intrinsic-value-history__verdict and the webhook then reported
+VALUE_NULL; the Apps Script side treats the verdict element as the wrong
+widget for "AS vs usual", and on the same page the real
+.valuation-history-context__headline can still be loading when the verdict
+is already present, so the combined wait could end too early.
+  (1) The scraper now waits for the headline element ALONE for
+      ALPHASPREAD_FALLBACK_AFTER_SECONDS (25s).
+  (2) Only if the headline has not appeared by then, it keeps polling for
+      the rest of ALPHASPREAD_WAIT_TIMEOUT_SECONDS (60s) and accepts the
+      verdict element ONLY when it holds real, non-empty text; the headline
+      still wins if it shows up at any point. This keeps the page-markup
+      fallback from v6 (some pages may serve only the new component) while
+      removing the early-exit on an empty verdict shell.
+  (3) To go strictly headline-only, set ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
+      = False (the wait then runs the full timeout for the headline alone).
+  (4) The matched-element logging (v7/v8) and failure diagnostics are
+      unchanged; no .yml change is needed (the selectors are not in it).
+
 VERSION 8 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): the v7 element
 diagnostic never actually worked. A real Row 34 (Chemometec) run printed
 "could not read element content: SyntaxError: Illegal return statement"
@@ -321,6 +342,14 @@ ALPHASPREAD_HEADLINE_SELECTORS = [
 ]
 ALPHASPREAD_WAIT_SELECTOR = ", ".join(ALPHASPREAD_HEADLINE_SELECTORS)
 
+# VERSION 9 ADDITION: the headline is the real target; the verdict element
+# is only an opt-in fallback, accepted only with non-empty text after the
+# headline has had ALPHASPREAD_FALLBACK_AFTER_SECONDS to appear on its own.
+ALPHASPREAD_PRIMARY_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[0]
+ALPHASPREAD_FALLBACK_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[1]
+ALPHASPREAD_ACCEPT_VERDICT_FALLBACK = True
+ALPHASPREAD_FALLBACK_AFTER_SECONDS = 25
+
 # VERSION 6 ADDITION: where AS failure diagnostics (screenshot + HTML) are
 # written. Relative to the workflow's working directory; the matching
 # insider_score_scraper.yml v6 step uploads this folder as an artifact.
@@ -410,6 +439,73 @@ def scrape_company_html(sb, abbrev_is):
     return sb.get_page_source()
 
 
+def wait_for_alphaspread_block(sb):
+    """
+    VERSION 9 ADDITION: waits for AlphaSpread's valuation-history block.
+    The headline element alone is waited on first. After
+    ALPHASPREAD_FALLBACK_AFTER_SECONDS the verdict element is also accepted,
+    but only when it has real, non-empty text. Raises if neither is usable
+    within ALPHASPREAD_WAIT_TIMEOUT_SECONDS (the caller already catches it).
+    """
+    first_wait = (
+        ALPHASPREAD_FALLBACK_AFTER_SECONDS
+        if ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
+        else ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+    )
+
+    try:
+        sb.wait_for_element(ALPHASPREAD_PRIMARY_SELECTOR, timeout=first_wait)
+        return
+    except Exception as primary_error:
+        if not ALPHASPREAD_ACCEPT_VERDICT_FALLBACK:
+            raise primary_error
+
+    print(
+        "⚠️ Headline not present after {}s; also accepting a non-empty"
+        " verdict element for up to {} more seconds.".format(
+            ALPHASPREAD_FALLBACK_AFTER_SECONDS,
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+            - ALPHASPREAD_FALLBACK_AFTER_SECONDS,
+        )
+    )
+
+    remaining = max(
+        1, ALPHASPREAD_WAIT_TIMEOUT_SECONDS - ALPHASPREAD_FALLBACK_AFTER_SECONDS
+    )
+
+    for _ in range(int(remaining)):
+        try:
+            if sb.is_element_present(ALPHASPREAD_PRIMARY_SELECTOR):
+                return
+        except Exception:
+            pass
+
+        try:
+            if sb.is_element_present(ALPHASPREAD_FALLBACK_SELECTOR):
+                details = run_js(
+                    sb,
+                    "var el = document.querySelector("
+                    + json.dumps(ALPHASPREAD_FALLBACK_SELECTOR)
+                    + "); if (!el) { return ''; }"
+                    " return (el.innerText || el.textContent || '');",
+                )
+                if isinstance(details, str) and details.strip():
+                    print("ℹ️ Using non-empty verdict element as fallback.")
+                    return
+        except Exception:
+            pass
+
+        sb.sleep(1)
+
+    raise Exception(
+        "Neither {} nor a non-empty {} appeared within {} seconds".format(
+            ALPHASPREAD_PRIMARY_SELECTOR,
+            ALPHASPREAD_FALLBACK_SELECTOR,
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+        )
+    )
+
+
 def scrape_alphaspread_html(sb, abbrev_as):
     """
     VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): fetches the real,
@@ -475,14 +571,18 @@ def scrape_alphaspread_html(sb, abbrev_as):
         "⏳ Waiting up to {}s for the real valuation-history element"
         " ({}) to appear (real browser, no fixed sleep)...".format(
             ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
-            " OR ".join(ALPHASPREAD_HEADLINE_SELECTORS),
+            ALPHASPREAD_PRIMARY_SELECTOR
+            + (
+                " (verdict fallback after {}s, non-empty only)".format(
+                    ALPHASPREAD_FALLBACK_AFTER_SECONDS
+                )
+                if ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
+                else ""
+            ),
         )
     )
 
-    sb.wait_for_element(
-        ALPHASPREAD_WAIT_SELECTOR,
-        timeout=ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
-    )
+    wait_for_alphaspread_block(sb)
 
     # VERSION 7: log which markup shape this page actually served AND
     # what that element actually contained, on every scrape (not only
