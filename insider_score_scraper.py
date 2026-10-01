@@ -16,6 +16,29 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 6 (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): the AlphaSpread
+scrape now waits for EITHER of AlphaSpread's two known "valuation
+history" markup shapes, and saves real diagnostics when the wait fails.
+A real GitHub Actions run for Row 34 (Chemometec, cse/chemm) showed the
+Insider Buying Score half succeeding while the AS half failed with
+"Element {.valuation-history-context__headline} was not found after 60
+seconds" -- while fn_22_30 v87 (Apps Script side) had already learned
+that AlphaSpread can serve a second, structurally different component
+(intrinsic-value-history__verdict) INSTEAD of the original headline for
+some stock pages. v4/v5 waited only for the original selector, so on a
+page using the newer component this script could wait its full timeout
+for an element that would never appear, no matter how long it waited.
+v6 waits for either selector (one combined CSS selector list) and logs
+which one matched. On any AS scrape failure it now also prints a compact
+page summary into the run log (title, URL, which selectors are present,
+whether the page looks like a Cloudflare/consent interstitial, and the
+first part of the visible text) and writes the page's own screenshot and
+HTML into ./diagnostics/ so the workflow can upload them as an artifact
+(see insider_score_scraper.yml's own matching v6 entry). The cause of
+the Row 34 failure itself is NOT yet confirmed -- the new selector is the
+leading hypothesis, and the diagnostics exist so the next failure
+explains itself instead of ending in a bare "not found".
+
 VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is is now ALSO
 optional (default '', mirroring abbrev_as's own v4 treatment exactly),
 rather than a required environment variable read. Previously a row with
@@ -130,6 +153,17 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v6 -- Requested directly, real confirmed failure (Row 34, cse/chemm): the
+  AS scrape now waits for either known valuation-history markup shape
+  (.valuation-history-context__headline OR
+  .intrinsic-value-history__verdict) instead of only the first, logs
+  which one matched, and on any AS scrape failure prints a compact page
+  summary to the run log and saves the page's screenshot and HTML to
+  ./diagnostics/ (uploaded as a workflow artifact by the matching
+  insider_score_scraper.yml v6 step). Insider Buying Score path
+  unchanged. See this file's own top PURPOSE section's own VERSION 6
+  paragraph for the full detail.
+
 v5 -- Requested directly, real confirmed gap: abbrev_is is now ALSO
   optional, mirroring abbrev_as's own v4 treatment. See this file's own
   top PURPOSE section's own VERSION 5 paragraph for the full detail.
@@ -170,6 +204,7 @@ v1 -- First version -- read every configured company's own abbrevIS from
 """
 
 import os
+import re
 
 import requests
 from seleniumbase import SB
@@ -209,8 +244,30 @@ PAGE_LOAD_SETTLE_SECONDS = 6
 # a separate, fresh attempt succeeded in as little as 3-5 seconds. A real
 # browser with no per-request proxy/rotation cost can simply wait longer,
 # with no equivalent penalty for doing so.
-ALPHASPREAD_HEADLINE_SELECTOR = ".valuation-history-context__headline"
 ALPHASPREAD_WAIT_TIMEOUT_SECONDS = 60
+
+# VERSION 6 CHANGE (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE):
+# AlphaSpread appears to serve at least two structurally different markup
+# shapes for the "valuation history" block (see fn_22_30 v87 on the Apps
+# Script side, which already falls back from the original headline to
+# intrinsic-value-history__verdict). v4/v5 waited only for the first, so
+# a page using the second could never satisfy the wait. Both selectors
+# are now waited on together as one CSS selector list -- whichever
+# appears first ends the wait.
+ALPHASPREAD_HEADLINE_SELECTORS = [
+    ".valuation-history-context__headline",
+    ".intrinsic-value-history__verdict",
+]
+ALPHASPREAD_WAIT_SELECTOR = ", ".join(ALPHASPREAD_HEADLINE_SELECTORS)
+
+# VERSION 6 ADDITION: where AS failure diagnostics (screenshot + HTML) are
+# written. Relative to the workflow's working directory; the matching
+# insider_score_scraper.yml v6 step uploads this folder as an artifact.
+DIAGNOSTICS_DIR = "diagnostics"
+
+# VERSION 6 ADDITION: how many characters of the page's visible text to
+# print into the run log when an AS scrape fails.
+DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
 
 
 def scrape_company_html(sb, abbrev_is):
@@ -241,6 +298,12 @@ def scrape_alphaspread_html(sb, abbrev_as):
     actually appear (via SeleniumBase's own condition-based
     wait_for_element) rather than a fixed sleep.
 
+    VERSION 6 CHANGE: waits for EITHER known markup shape of that block
+    (see ALPHASPREAD_HEADLINE_SELECTORS) rather than only the original
+    headline element, and logs which one actually matched. The original
+    only-first-selector wait could never succeed on a page that serves
+    the newer intrinsic-value-history__verdict component instead.
+
     WHY THIS EXISTS: this project's own earlier Apps Script pipeline
     fetched this same page via Scrape.do's own headless-render API with a
     playWithBrowser WaitSelector action, capped at a fixed timeout
@@ -269,7 +332,7 @@ def scrape_alphaspread_html(sb, abbrev_as):
     consistent with the rest of this same run.
 
     Raises whatever SeleniumBase's own wait_for_element raises
-    (a real timeout exception) if the headline never appears within
+    (a real timeout exception) if neither element appears within
     ALPHASPREAD_WAIT_TIMEOUT_SECONDS -- the caller (run_bot) is
     responsible for catching this, exactly as it already does for
     scrape_company_html's own failures, so one scrape failing can never
@@ -284,18 +347,141 @@ def scrape_alphaspread_html(sb, abbrev_as):
     sb.open(target_url)
 
     print(
-        "⏳ Waiting up to {}s for the real valuation-history headline"
-        " to appear (real browser, no fixed sleep)...".format(
-            ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+        "⏳ Waiting up to {}s for the real valuation-history element"
+        " ({}) to appear (real browser, no fixed sleep)...".format(
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+            " OR ".join(ALPHASPREAD_HEADLINE_SELECTORS),
         )
     )
 
     sb.wait_for_element(
-        ALPHASPREAD_HEADLINE_SELECTOR,
+        ALPHASPREAD_WAIT_SELECTOR,
         timeout=ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
     )
 
+    # Log which markup shape this page actually served, so a later
+    # comparison across stocks shows how common each one really is.
+    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
+        try:
+            if sb.is_element_present(selector):
+                print("🔎 Matched valuation-history element: {}".format(selector))
+        except Exception:
+            pass
+
     return sb.get_page_source()
+
+
+def save_alphaspread_diagnostics(sb, row_number, abbrev_as):
+    """
+    VERSION 6 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): when
+    the AS scrape fails (typically the wait timing out), records what
+    the browser was actually looking at so the failure explains itself.
+
+    Does two things, each independently guarded so a failure in one (or
+    in this whole function) can never raise out of it or affect the rest
+    of the run:
+
+    1. Prints a compact summary into the run log: page title, current
+       URL, which of the known valuation-history selectors are present,
+       whether the page looks like a Cloudflare/consent/blocked
+       interstitial, the page source length, and the first part of the
+       page's visible text.
+    2. Writes the page's own screenshot and full HTML into
+       DIAGNOSTICS_DIR, for the workflow's own upload-artifact step.
+
+    Not a fix for anything by itself -- it only observes.
+    """
+    print("🩺 AS failure diagnostics for Row {} ({}):".format(row_number, abbrev_as))
+
+    try:
+        print("   title: {}".format(sb.get_title()))
+    except Exception as error:
+        print("   title: (unavailable: {})".format(error))
+
+    try:
+        print("   url: {}".format(sb.get_current_url()))
+    except Exception as error:
+        print("   url: (unavailable: {})".format(error))
+
+    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
+        try:
+            print(
+                "   present {}: {}".format(
+                    selector, sb.is_element_present(selector)
+                )
+            )
+        except Exception as error:
+            print("   present {}: (check failed: {})".format(selector, error))
+
+    page_source = ""
+
+    try:
+        page_source = sb.get_page_source() or ""
+        lowered = page_source.lower()
+        print("   page source length: {} chars".format(len(page_source)))
+        print(
+            "   looks like interstitial/blocked: {}".format(
+                any(
+                    marker in lowered
+                    for marker in (
+                        "just a moment",
+                        "challenge-platform",
+                        "access denied",
+                        "captcha",
+                        "cookie consent",
+                        "consent",
+                    )
+                )
+            )
+        )
+        print(
+            "   mentions livewire: {} | mentions wire:snapshot: {}".format(
+                "livewire" in lowered, "wire:snapshot" in lowered
+            )
+        )
+    except Exception as error:
+        print("   page source: (unavailable: {})".format(error))
+
+    try:
+        visible_text = sb.execute_script(
+            "return document.body ? document.body.innerText : '';"
+        ) or ""
+        visible_text = re.sub(r"\s+", " ", visible_text).strip()
+        print(
+            "   visible text (first {} chars): {}".format(
+                DIAGNOSTIC_TEXT_PREVIEW_CHARS,
+                visible_text[:DIAGNOSTIC_TEXT_PREVIEW_CHARS],
+            )
+        )
+    except Exception as error:
+        print("   visible text: (unavailable: {})".format(error))
+
+    safe_abbrev = re.sub(r"[^A-Za-z0-9_-]+", "_", abbrev_as)
+    base_name = "as_row{}_{}".format(row_number, safe_abbrev)
+
+    try:
+        os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+    except Exception as error:
+        print("   could not create {}: {}".format(DIAGNOSTICS_DIR, error))
+        return
+
+    try:
+        sb.save_screenshot(base_name + ".png", folder=DIAGNOSTICS_DIR)
+        print("   saved screenshot: {}/{}.png".format(DIAGNOSTICS_DIR, base_name))
+    except Exception as error:
+        print("   screenshot not saved: {}".format(error))
+
+    try:
+        if page_source:
+            with open(
+                os.path.join(DIAGNOSTICS_DIR, base_name + ".html"),
+                "w",
+                encoding="utf-8",
+            ) as html_file:
+                html_file.write(page_source)
+            print("   saved HTML: {}/{}.html".format(DIAGNOSTICS_DIR, base_name))
+    except Exception as error:
+        print("   HTML not saved: {}".format(error))
 
 
 def print_purchase_breakdown(purchase_details):
@@ -563,6 +749,11 @@ def run_bot():
         # actually provided. A separate, independent try/except, so an
         # IS-side failure above (or an AS-side failure here) can never
         # block the other from still being attempted and posted.
+        #
+        # VERSION 6: on failure, also records real page diagnostics (see
+        # save_alphaspread_diagnostics) before moving on. That call is
+        # itself fully guarded, so it can never turn an AS failure into
+        # a bigger one.
         # ------------------------------------------------------------------
         if abbrev_as:
             try:
@@ -577,6 +768,15 @@ def run_bot():
                         row_number, abbrev_as, as_scrape_error
                     )
                 )
+
+                try:
+                    save_alphaspread_diagnostics(sb, row_number, abbrev_as)
+                except Exception as diagnostics_error:
+                    print(
+                        "⚠️ AS diagnostics themselves failed: {}".format(
+                            diagnostics_error
+                        )
+                    )
 
     print("🧹 Task complete!")
 
