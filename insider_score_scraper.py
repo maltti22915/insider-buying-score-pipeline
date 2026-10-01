@@ -16,6 +16,31 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 8 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): the v7 element
+diagnostic never actually worked. A real Row 34 (Chemometec) run printed
+"could not read element content: SyntaxError: Illegal return statement"
+(column 58 of the script, exactly where its own "return null;" sat)
+instead of the matched element's text. In this script's own uc-mode
+session, sb.execute_script evaluates the string as a bare expression
+(the error object is a DevTools-protocol evaluation result), NOT as a
+function body the way plain Selenium does, so a top-level "return" is
+illegal and "arguments[0]" would not exist either. The same flaw sat in
+save_alphaspread_diagnostics' own visible-text read (its error was
+swallowed, so it only ever reported "unavailable").
+  (1) New run_js helper: wraps a function body in an immediately-invoked
+      function, JSON.stringify's the result inside the page (so objects
+      survive either evaluation mode), and tries a "return (...)" form
+      first (classic Selenium) then a bare-expression form (uc/CDP
+      evaluation), JSON-decoding whatever comes back. Selectors are
+      embedded with json.dumps instead of passed as arguments[0].
+  (2) describe_matched_elements and the diagnostics' visible-text read
+      now both use run_js.
+  (3) Behaviour otherwise unchanged: both helpers stay fully guarded and
+      can never affect the scrape, the webhook POST or the other
+      provider's own scrape. Only the log output changes -- it should
+      now finally show whether a matched element had real text or was
+      an empty/loading shell (the question v7 was built to answer).
+
 VERSION 7 (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOTS): three
 observability fixes, found by reading a real Row 34 (Chemometec) run
 where v6 correctly matched the new .intrinsic-value-history__verdict
@@ -238,6 +263,7 @@ v1 -- First version -- read every configured company's own abbrevIS from
 ============================================================================
 """
 
+import json
 import os
 import re
 
@@ -311,6 +337,57 @@ DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
 ELEMENT_TEXT_PREVIEW_CHARS = 300
 ELEMENT_HTML_SNIPPET_CHARS = 600
 WEBHOOK_BODY_PREVIEW_CHARS = 200
+
+
+def run_js(sb, function_body):
+    """
+    VERSION 8 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BUG): runs a
+    JavaScript function BODY in the page and returns its JSON-decoded
+    result (None when nothing usable came back).
+
+    WHY: in this script's uc-mode session sb.execute_script can evaluate
+    its string as a bare expression, where a top-level "return" is a
+    SyntaxError ("Illegal return statement") and "arguments" does not
+    exist. Plain Selenium instead wraps the string as a function body,
+    where a bare expression returns nothing. So the body is wrapped in an
+    IIFE, its result is JSON.stringify'd inside the page (objects then
+    survive either mode), and both call shapes are tried in order.
+
+    Raises the last error if neither shape works; callers stay guarded.
+    """
+    iife = (
+        "(function(){"
+        " try {"
+        " var __r = (function(){" + function_body + "})();"
+        " return JSON.stringify(__r === undefined ? null : __r);"
+        " } catch (e) {"
+        " return JSON.stringify({__js_error: String(e)});"
+        " }"
+        "})()"
+    )
+
+    last_error = None
+    for candidate in ("return " + iife + ";", iife):
+        try:
+            raw = sb.execute_script(candidate)
+        except Exception as error:
+            last_error = error
+            continue
+
+        if raw is None:
+            continue
+
+        result = json.loads(raw) if isinstance(raw, str) else raw
+
+        if isinstance(result, dict) and "__js_error" in result:
+            raise RuntimeError(result["__js_error"])
+
+        return result
+
+    if last_error is not None:
+        raise last_error
+
+    return None
 
 
 def scrape_company_html(sb, abbrev_is):
@@ -432,13 +509,16 @@ def describe_matched_elements(sb):
 
     Fully guarded -- never raises, never affects the scrape itself.
     """
-    script = (
-        "var el = document.querySelector(arguments[0]);"
-        " if (!el) { return null; }"
-        " return {text: (el.innerText || el.textContent || ''),"
-        " html: (el.outerHTML || ''),"
-        " children: el.children ? el.children.length : 0};"
-    )
+    # VERSION 8: a function BODY run via run_js (no top-level-return
+    # problem in uc mode); the selector is embedded, not "arguments[0]".
+    def build_script(selector):
+        return (
+            "var el = document.querySelector(" + json.dumps(selector) + ");"
+            " if (!el) { return null; }"
+            " return {text: (el.innerText || el.textContent || ''),"
+            " html: (el.outerHTML || ''),"
+            " children: el.children ? el.children.length : 0};"
+        )
 
     matched_any = False
 
@@ -453,7 +533,7 @@ def describe_matched_elements(sb):
         print("🔎 Matched valuation-history element: {}".format(selector))
 
         try:
-            details = sb.execute_script(script, selector)
+            details = run_js(sb, build_script(selector))
         except Exception as error:
             print("   (could not read element content: {})".format(error))
             continue
@@ -612,8 +692,8 @@ def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape faile
         print("   page source: (unavailable: {})".format(error))
 
     try:
-        visible_text = sb.execute_script(
-            "return document.body ? document.body.innerText : '';"
+        visible_text = run_js(
+            sb, "return document.body ? document.body.innerText : '';"
         ) or ""
         visible_text = re.sub(r"\s+", " ", visible_text).strip()
         print(
