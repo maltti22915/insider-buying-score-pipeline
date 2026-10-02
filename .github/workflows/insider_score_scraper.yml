@@ -1,98 +1,25 @@
-# ============================================================================
-# insider_score_scraper.yml
-# ============================================================================
-# Runs insider_score_scraper.py for exactly ONE company at a time, triggered
-# on demand via GitHub's own workflow_dispatch API -- called directly from
-# this project's own Google Apps Script row-refresh pipeline (fn_24_05)
-# whenever the user refreshes a specific row.
-#
-# VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): "abbrev_is" is now
-# ALSO optional (required: false, default ''), matching "abbrev_as"'s own
-# v4 treatment exactly. Previously abbrev_is was required: true, which
-# meant a row with a real, resolved AlphaSpread abbreviation but NO
-# InsiderScreener coverage at all (a genuine, real possibility -- these
-# are two independent providers with independent company coverage) could
-# never trigger this workflow at all, even just for its own AS scrape.
-# insider_score_scraper.py's own v5 mirrors this: ABBREV_IS is now read
-# as an optional environment variable (default ''), and the IS scrape is
-# skipped cleanly, exactly the same way the AS scrape already was skipped
-# when abbrev_as was empty.
-#
-# VERSION 4 (REQUESTED DIRECTLY, NEW WORK): added an OPTIONAL "abbrev_as"
-# input. When provided, this same run also scrapes AlphaSpread's own
-# "valuation history" block for the "AS vs usual" column, reusing the
-# same already-launched browser session -- see insider_score_scraper.py's
-# own matching VERSION 4 changelog entry for the full motivation. Declared
-# with required: false and an empty-string default specifically so this
-# workflow keeps working exactly as before for any caller not yet updated
-# to pass it (Apps Script's own fn_24_71, VERSION 3 there, is the first
-# caller updated to actually supply a real value). No new repository
-# secret needed -- the AS scrape posts to the SAME GAS_WEBHOOK_URL already
-# used for Insider Buying Score; see fn_90_01's own matching VERSION 5
-# entry for how one webhook now serves both.
-#
-# VERSION 3 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): a new "sheet_name"
-# input added. A real production run showed the receiving webhook
-# (fn_90_01) refusing a genuinely correct write, reporting a completely
-# unrelated company for a row that in truth only ever held the expected
-# one. Root cause, confirmed directly: this workflow never had any concept
-# of which real sheet (e.g. "Watch", not just "Salkku") a given row-refresh
-# actually came from -- insider_score_scraper.py's own v2 had SHEET_NAME
-# hardcoded to 'Salkku' regardless, so the webhook's own mismatch check was
-# comparing against the wrong sheet's own row entirely whenever a refresh
-# came from any other sheet. Apps Script's own fn_24_71 (VERSION 2 there)
-# now passes the row's own real sheet name as this new input, and
-# insider_score_scraper.py's own v3 reads it as a real environment
-# variable instead of a hardcoded constant.
-#
-# VERSION 2 (REQUESTED DIRECTLY, ARCHITECTURE CHANGE): the original v1 of
-# this workflow ran on a fixed daily schedule (cron), scraping every
-# configured company in one run. Replaced entirely -- the actual intent was
-# always an on-demand, single-row trigger, not an independent daily bulk
-# job. The schedule trigger has been removed; workflow_dispatch now
-# requires row_number/abbrev_is as real inputs, matching what
-# insider_score_scraper.py's own v2 now expects as environment variables.
-#
-# Save this file as .github/workflows/insider_score_scraper.yml in the
-# repository.
-#
-# REQUIRED REPOSITORY SECRETS (Settings -> Secrets and variables -> Actions):
-#   GAS_WEBHOOK_URL  -- the deployed
-#                       fn_90_01_InsiderScoreWebhook_StockData_60 Web App URL
-#                       (serves BOTH Insider Buying Score and, as of v4/v5,
-#                       AlphaSpread "AS vs usual" -- one URL, one secret).
-#
-# (GOOGLE_SERVICE_ACCOUNT_JSON and SPREADSHEET_ID, required by v1, are no
-# longer needed at all -- this version never reads the spreadsheet itself.)
-# ============================================================================
+insider_score_scraper.yml  v5 -> v6
+====================================
 
-name: Insider Buying Score Scraper
+1) Add this paragraph in the header comment, above "VERSION 5":
 
-"on":
-  workflow_dispatch:
-    inputs:
-      row_number:
-        description: 'The specific row on the target sheet this run is for'
-        required: true
-        type: string
-      abbrev_is:
-        description: "OPTIONAL: that row's own current InsiderScreener company slug. Leave blank to skip the Insider Buying Score scrape entirely."
-        required: false
-        type: string
-        default: ''
-      sheet_name:
-        description: 'The real sheet this row lives on (e.g. "Salkku", "Watch")'
-        required: true
-        type: string
-      abbrev_as:
-        description: "OPTIONAL: that row's own current AlphaSpread abbreviation (e.g. \"nasdaq/adsk\"). Leave blank to skip the AS scrape entirely."
-        required: false
-        type: string
-        default: ''
+# VERSION 6 (REQUESTED DIRECTLY, SPEED + DIAGNOSTICS): (1) pip packages are
+# now cached between runs (setup-python's own cache: 'pip'), so seleniumbase
+# and its dependencies are no longer downloaded and installed from scratch
+# on every single run. (2) The ./diagnostics folder that
+# insider_score_scraper.py v6+ writes (AlphaSpread screenshot + HTML when
+# the AS scrape or webhook write fails) is now uploaded as a run artifact;
+# v5 had no such step, so those files were discarded when the runner was
+# torn down. (3) timeout-minutes: 10, so a hung browser can never hold a
+# runner for GitHub's default six hours.
+
+
+2) Replace everything from the line `jobs:` to the end of the file with:
 
 jobs:
   scrape-insider-score:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       - name: Check out repository
@@ -102,6 +29,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: |
@@ -115,3 +44,24 @@ jobs:
           SHEET_NAME: ${{ inputs.sheet_name }}
           ABBREV_AS: ${{ inputs.abbrev_as }}
         run: python insider_score_scraper.py
+
+      - name: Upload AS diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: as-diagnostics-row${{ inputs.row_number }}-${{ github.run_id }}
+          path: diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
+
+
+NOTES
+-----
+- The cache needs requirements.txt to exist in the repo root (it already does,
+  since the install step reads it). The first run after this change still
+  installs everything and fills the cache; later runs reuse it.
+- The artifact only exists for runs where diagnostics were written, so you
+  will see one on failures such as the Alibaba VALUE_NULL run and none on
+  clean runs (if-no-files-found: ignore).
+- To see where the time goes, open one run in the Actions tab: each step
+  shows its own duration. Compare "Install dependencies" before and after.
