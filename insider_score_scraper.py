@@ -16,6 +16,12 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 11 (REQUESTED DIRECTLY, DIAGNOSTICS ONLY): the AS webhook's full
+JSON reply (trimmed to 1500 characters) is now printed after every AS post,
+because the webhook's own Apps Script execution log was not visible and
+"accepted but did not write (VALUE_NULL)" alone does not say which column
+failed or why. No behaviour change otherwise.
+
 VERSION 10 (REQUESTED DIRECTLY, REAL CONFIRMED MISTAKE): removed the v9
 verdict fallback. A real Alibaba run (Row 22, nyse/baba) waited 25s, then
 accepted .intrinsic-value-history__verdict (its text said the valuation
@@ -1092,6 +1098,17 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     response_body = read_webhook_json(
         response, "Row {} ({}) AS".format(row_number, abbrev_as)
     )
+
+    # VERSION 11: the webhook's own Apps Script log is not always visible,
+    # so print the whole JSON reply (trimmed) -- it carries the reason and
+    # any per-column result fn_90_02 reports.
+    try:
+        print(
+            "   AS webhook reply: "
+            + json.dumps(response_body, ensure_ascii=False)[:1500]
+        )
+    except Exception:
+        pass
 
     if response_body is None:
         print(
