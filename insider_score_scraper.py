@@ -16,6 +16,22 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 12 (REQUESTED DIRECTLY, REAL CONFIRMED ROOT CAUSE): the saved
+diagnostics HTML (Row 28, nasdaq/amzn) shows the lazy Livewire component
+wire:name="valuation.history-context.block" (x-intersect lazy load,
+class valuation-history-context--loading, aria-busy) is rendered INSIDE the
+"More details" modal of the Intrinsic Value History widget
+(x-teleport="body", style="display: none;"). A hidden element never
+intersects the viewport, so the headline can never load by scrolling --
+which is why Rows 18 and 28 stayed at the loading placeholder after 26-27
+scrolls. (v10/v11's "block" scroll target was also the wrong element: the
+selector [class*='valuation-history-context'] matched the verdict widget
+first.) The wait now clicks .intrinsic-value-history__details ("More
+details") to open the modal, then waits for the real headline with text,
+re-clicking every ALPHASPREAD_OPEN_EVERY_SECONDS. The verdict element is
+still never accepted. UNCONFIRMED until run: that opening the modal
+actually completes the lazy load from the GitHub runner.
+
 VERSION 11 (REQUESTED DIRECTLY, DIAGNOSTICS ONLY): the AS webhook's full
 JSON reply (trimmed to 1500 characters) is now printed after every AS post,
 because the webhook's own Apps Script execution log was not visible and
@@ -377,10 +393,18 @@ ALPHASPREAD_FALLBACK_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[1]
 ALPHASPREAD_ACCEPT_VERDICT_FALLBACK = False
 ALPHASPREAD_FALLBACK_AFTER_SECONDS = 25   # unused as of v10
 
-# VERSION 10: the block is a lazy Livewire component; scroll it (or the
-# page) toward the viewport this often while waiting.
-ALPHASPREAD_BLOCK_SELECTOR = "[class*='valuation-history-context']"
-ALPHASPREAD_SCROLL_EVERY_SECONDS = 2
+# VERSION 10 (superseded by v12 below): scrolling was tried first.
+ALPHASPREAD_BLOCK_SELECTOR = "[class*='valuation-history-context']"  # unused as of v12
+ALPHASPREAD_SCROLL_EVERY_SECONDS = 2  # unused as of v12
+
+# VERSION 12: confirmed from the saved diagnostics HTML (Row 28, AMZN): the
+# lazy Livewire block (wire:name="valuation.history-context.block",
+# x-intersect lazy load) lives INSIDE the hidden "More details" modal of the
+# Intrinsic Value History widget (style="display: none;"), so it can never
+# intersect the viewport and scrolling cannot load it. Clicking this button
+# opens the modal, which is what triggers the lazy load.
+ALPHASPREAD_OPEN_DETAILS_SELECTOR = ".intrinsic-value-history__details"
+ALPHASPREAD_OPEN_EVERY_SECONDS = 10
 
 # VERSION 10: filled in by wait_for_alphaspread_block so run_bot can save
 # diagnostics when the headline never appeared, even though the page is
@@ -476,24 +500,21 @@ def scrape_company_html(sb, abbrev_is):
     return sb.get_page_source()
 
 
-def scroll_alphaspread_block_into_view(sb):
+def open_alphaspread_details_modal(sb):
     """
-    VERSION 10 ADDITION: nudges the lazy-loaded valuation-history block
-    into the viewport. If the block's own element exists (placeholder or
-    real), it is scrolled to the centre of the screen; otherwise the page
-    is scrolled down by most of a screen. Returns 'block', 'page' or None.
+    VERSION 12 ADDITION: clicks the "More details" button of the Intrinsic
+    Value History widget. That opens the modal which contains the lazy
+    valuation-history block, so the block finally becomes visible and
+    Livewire loads it. Returns 'clicked', 'no-button' or None (error).
     Fully guarded.
     """
     try:
         return run_js(
             sb,
-            "var el = document.querySelector("
-            + json.dumps(ALPHASPREAD_BLOCK_SELECTOR)
-            + "); if (el) { el.scrollIntoView({block: 'center'});"
-            " return 'block'; }"
-            " window.scrollBy(0, Math.max(400,"
-            " Math.floor(window.innerHeight * 0.8)));"
-            " return 'page';",
+            "var b = document.querySelector("
+            + json.dumps(ALPHASPREAD_OPEN_DETAILS_SELECTOR)
+            + "); if (!b) { return 'no-button'; }"
+            " b.click(); return 'clicked';",
         )
     except Exception:
         return None
@@ -523,12 +544,13 @@ def wait_for_alphaspread_block(sb):
     with real text, for up to ALPHASPREAD_WAIT_TIMEOUT_SECONDS. The verdict
     element is never accepted (wrong widget, see fn_22_30 v88).
 
-    While waiting it scrolls the lazy Livewire block into view every
-    ALPHASPREAD_SCROLL_EVERY_SECONDS seconds. The log says how long the
-    headline took and how many scrolls had happened, which is the evidence
-    needed to confirm or reject the "block only loads in the viewport"
-    explanation: a headline that appears right after the first scroll
-    confirms it; one that never appears despite scrolling rejects it.
+    VERSION 12: the lazy block sits inside the hidden "More details" modal
+    of the Intrinsic Value History widget, so scrolling (v10/v11) could
+    never load it. The loop now clicks that button right away and again
+    every ALPHASPREAD_OPEN_EVERY_SECONDS seconds until the headline has
+    text. The log says how long the headline took and how many times the
+    modal was opened ('clicked' = button found; 'no-button' = the page
+    has no such button, i.e. the layout changed again).
 
     Returns True when the headline appeared, False when it did not. It does
     NOT raise on timeout (unlike the v10 patch notes): the page is still
@@ -537,9 +559,9 @@ def wait_for_alphaspread_block(sb):
     """
     started = time.monotonic()
     deadline = started + ALPHASPREAD_WAIT_TIMEOUT_SECONDS
-    last_scroll_at = None
-    scroll_count = 0
-    last_scroll_result = None
+    last_open_at = None
+    open_count = 0
+    last_open_result = None
 
     ALPHASPREAD_WAIT_STATE["headline_appeared"] = None
 
@@ -547,34 +569,34 @@ def wait_for_alphaspread_block(sb):
         if alphaspread_headline_has_text(sb):
             ALPHASPREAD_WAIT_STATE["headline_appeared"] = True
             print(
-                "\u2705 Headline appeared after {:.1f}s | scrolls so far: {}"
-                " (last scroll target: {})".format(
+                "\u2705 Headline appeared after {:.1f}s | modal opens so far: {}"
+                " (last result: {})".format(
                     time.monotonic() - started,
-                    scroll_count,
-                    last_scroll_result,
+                    open_count,
+                    last_open_result,
                 )
             )
             return True
 
         now = time.monotonic()
         if (
-            last_scroll_at is None
-            or now - last_scroll_at >= ALPHASPREAD_SCROLL_EVERY_SECONDS
+            last_open_at is None
+            or now - last_open_at >= ALPHASPREAD_OPEN_EVERY_SECONDS
         ):
-            last_scroll_result = scroll_alphaspread_block_into_view(sb)
-            last_scroll_at = now
-            scroll_count += 1
+            last_open_result = open_alphaspread_details_modal(sb)
+            last_open_at = now
+            open_count += 1
 
         sb.sleep(1)
 
     ALPHASPREAD_WAIT_STATE["headline_appeared"] = False
     print(
         "\u26a0\ufe0f {} (with text) did not appear within {} seconds |"
-        " scrolls: {} (last scroll target: {})".format(
+        " modal opens: {} (last result: {})".format(
             ALPHASPREAD_PRIMARY_SELECTOR,
             ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
-            scroll_count,
-            last_scroll_result,
+            open_count,
+            last_open_result,
         )
     )
     return False
