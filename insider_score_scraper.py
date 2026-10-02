@@ -16,6 +16,24 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 13 (REQUESTED DIRECTLY, TWO SMALL OBSERVABILITY FIXES, NO
+BEHAVIOUR CHANGE): 
+  (1) save_alphaspread_diagnostics no longer reports a false
+      "looks like interstitial/blocked: True". The markers "consent" and
+      "challenge-platform" appear on perfectly normal AlphaSpread pages
+      (confirmed on real Row 18 and Row 28 runs whose headline loaded
+      fine), so they were removed from the marker list. The remaining
+      markers ("just a moment", "access denied", "captcha",
+      "cookie consent") are unchanged.
+  (2) The "AS webhook reply:" log line now carries a UTC timestamp
+      (HH:MM:SS). The reply itself says the webhook wrote the value, but
+      without a time the run log could not show whether that write landed
+      before or after the Apps Script row refresh's own final write
+      (Apps Script logs are in local time, UTC+3 for this project; this
+      log is UTC). The timestamp is taken when the reply is received.
+  No change to scraping, waiting, the modal click, posting, or the
+  Insider Buying Score path. No .yml change needed.
+
 VERSION 12 (REQUESTED DIRECTLY, REAL CONFIRMED ROOT CAUSE): the saved
 diagnostics HTML (Row 28, nasdaq/amzn) shows the lazy Livewire component
 wire:name="valuation.history-context.block" (x-intersect lazy load,
@@ -30,7 +48,9 @@ first.) The wait now clicks .intrinsic-value-history__details ("More
 details") to open the modal, then waits for the real headline with text,
 re-clicking every ALPHASPREAD_OPEN_EVERY_SECONDS. The verdict element is
 still never accepted. UNCONFIRMED until run: that opening the modal
-actually completes the lazy load from the GitHub runner.
+actually completes the lazy load from the GitHub runner. (CONFIRMED on
+real Row 28 and Row 18 runs: the headline appeared 1.5-1.9s after the
+first click.)
 
 VERSION 11 (REQUESTED DIRECTLY, DIAGNOSTICS ONLY): the AS webhook's full
 JSON reply (trimmed to 1500 characters) is now printed after every AS post,
@@ -261,6 +281,36 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v13 -- Requested directly, observability only: the diagnostics'
+  "looks like interstitial/blocked" check no longer counts the markers
+  "consent" and "challenge-platform" (false positive on normal
+  AlphaSpread pages), and the "AS webhook reply:" line now carries a UTC
+  timestamp so the write order against the Apps Script row refresh can
+  be read from the logs. See this file's own top PURPOSE section's own
+  VERSION 13 paragraph.
+
+v12 -- Requested directly, real confirmed root cause (Row 28, nasdaq/amzn):
+  the lazy valuation-history block lives inside the hidden "More details"
+  modal, so the wait now clicks .intrinsic-value-history__details
+  immediately and every ALPHASPREAD_OPEN_EVERY_SECONDS until the headline
+  has text. Does not raise on timeout (posts the page anyway, saves
+  diagnostics). Scrolling removed from use.
+
+v11 -- Diagnostics only: prints the AS webhook's full JSON reply
+  (trimmed to 1500 characters) after every AS post.
+
+v10 -- Removed the v9 verdict fallback (the verdict element is the
+  Intrinsic Value History widget, not the headline "AS vs usual" needs);
+  waits for the headline with non-empty text only.
+
+v9 -- Headline-first wait with an opt-in, non-empty-only verdict fallback
+  (superseded by v10).
+
+v8 -- Requested directly, real confirmed bug: run_js helper (IIFE plus
+  JSON.stringify, two call shapes) replaces execute_script calls that
+  used a top-level "return" / arguments[0] and failed with "Illegal
+  return statement" in uc mode.
+
 v7 -- Requested directly, real confirmed blind spots (Row 34,
   cse/chemm): every AS scrape now logs the matched element's text and
   an HTML snippet (describe_matched_elements); AS diagnostics are also
@@ -326,6 +376,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 
 import requests
 from seleniumbase import SB
@@ -420,6 +471,17 @@ DIAGNOSTICS_DIR = "diagnostics"
 # print into the run log when an AS scrape fails.
 DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
 
+# VERSION 13: markers that make save_alphaspread_diagnostics report
+# "looks like interstitial/blocked: True". "consent" and
+# "challenge-platform" were REMOVED because normal AlphaSpread pages
+# contain them (false positive on real Row 18 / Row 28 runs).
+INTERSTITIAL_MARKERS = (
+    "just a moment",
+    "access denied",
+    "captcha",
+    "cookie consent",
+)
+
 # VERSION 7 ADDITIONS: how much of a matched valuation-history element's
 # own text / outer HTML to print on every AS scrape, and how much of a
 # non-JSON webhook response body to print (REQUESTED DIRECTLY: first 200
@@ -427,6 +489,11 @@ DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
 ELEMENT_TEXT_PREVIEW_CHARS = 300
 ELEMENT_HTML_SNIPPET_CHARS = 600
 WEBHOOK_BODY_PREVIEW_CHARS = 200
+
+
+def utc_clock_text():
+    """VERSION 13 ADDITION: current UTC time as HH:MM:SS, for log lines."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 def run_js(sb, function_body):
@@ -824,6 +891,10 @@ def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape faile
     ended in VALUE_NULL with nothing saved to inspect). The new reason
     argument says which situation this is in the log.
 
+    VERSION 13 CHANGE: the "looks like interstitial/blocked" check uses
+    INTERSTITIAL_MARKERS, which no longer contains "consent" or
+    "challenge-platform" (both appear on normal AlphaSpread pages).
+
     Does two things, each independently guarded so a failure in one (or
     in this whole function) can never raise out of it or affect the rest
     of the run:
@@ -872,17 +943,7 @@ def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape faile
         print("   page source length: {} chars".format(len(page_source)))
         print(
             "   looks like interstitial/blocked: {}".format(
-                any(
-                    marker in lowered
-                    for marker in (
-                        "just a moment",
-                        "challenge-platform",
-                        "access denied",
-                        "captcha",
-                        "cookie consent",
-                        "consent",
-                    )
-                )
+                any(marker in lowered for marker in INTERSTITIAL_MARKERS)
             )
         )
         print(
@@ -1091,6 +1152,9 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     written, refused/failed, unreadable response, POST failure), so
     run_bot can save page diagnostics whenever the value did not land.
 
+    VERSION 13 CHANGE: the "AS webhook reply:" line now includes the UTC
+    time at which the reply was received.
+
     timeout=120, same reasoning as post_to_webhook's own matching
     parameter -- not yet confirmed necessary specifically for AS's own
     payload size (which is a single page's HTML, not a company's own
@@ -1117,6 +1181,8 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
         )
         return False
 
+    reply_received_at = utc_clock_text()
+
     response_body = read_webhook_json(
         response, "Row {} ({}) AS".format(row_number, abbrev_as)
     )
@@ -1124,9 +1190,10 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     # VERSION 11: the webhook's own Apps Script log is not always visible,
     # so print the whole JSON reply (trimmed) -- it carries the reason and
     # any per-column result fn_90_02 reports.
+    # VERSION 13: with the UTC time the reply was received.
     try:
         print(
-            "   AS webhook reply: "
+            "   AS webhook reply (UTC {}): ".format(reply_received_at)
             + json.dumps(response_body, ensure_ascii=False)[:1500]
         )
     except Exception:
