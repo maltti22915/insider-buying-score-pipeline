@@ -32,6 +32,26 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 4
+  Third real run (Alibaba, row 32): headed mode passed Cloudflare (cleared
+  after 10.7s), the Data button was found, the dialog opened and 6 sections
+  were extracted. The saved dialog HTML (first look at the real DOM) shows
+  a clean structure: <section role="dialog" aria-label="Share Price vs.
+  Fair Value"> holding 6 <table>s, each with a <caption> (e.g. "NYSE:BABA
+  Discounted Cash Flow Data Sources"), a <thead> and a <tbody>. The v1-v3
+  extractor already handled this correctly (verified by running it against
+  that HTML in a headless browser: 6 sections, ~4.7 KB of JSON), but it
+  never read <caption>, the real section label, and its "before"/"after"
+  sibling text was mostly wrong (e.g. every table's "after" was the same
+  "Learn more about our DCF calculations" footer). Changes:
+    * Each section now carries "caption" (the table's <caption> text).
+    * "before"/"after" are no longer sent (misleading; the caption replaces
+      them). fn_91_01 only deletes them when over the size limit, so it
+      does not depend on them; fn_91_02 (not seen when this was written)
+      should be checked.
+    * DEFAULT_LAUNCH_MODES is now "headed,headless": headless was blocked in
+      both real runs and only wastes ~45s before the headed attempt.
+
 VERSION 3
   Second real run (Alibaba, row 32) showed the v2 page-state probe:
   title "Just a moment...", body "Performing security verification ...
@@ -114,9 +134,10 @@ from seleniumbase import SB
 # --- Cloudflare handling (v3) ---------------------------------------------
 # Browser launch modes tried in order for each provider. "headless" is what
 # insider_score_scraper.py uses; "headed" runs a real (virtual-display)
-# window, which Cloudflare challenges less often. Override with the env
-# var LAUNCH_MODES, e.g. "headed" or "headless,headed".
-DEFAULT_LAUNCH_MODES = "headless,headed"
+# window, which Cloudflare challenges less often (headless was blocked in
+# both real runs, so headed goes first). Override with the env var
+# LAUNCH_MODES, e.g. "headed" or "headless,headed".
+DEFAULT_LAUNCH_MODES = "headed,headless"
 
 # Seconds to wait for a Cloudflare challenge to clear on its own.
 CF_CHALLENGE_WAIT_SECONDS = 45
@@ -404,21 +425,6 @@ function isHeaderRow(row) {
       !row.querySelector('td, [role="cell"], [role="gridcell"]')) { return true; }
   return false;
 }
-function siblingText(start, dir) {
-  var n = start, depth = 0;
-  while (n && n !== root && depth < 6) {
-    var p = (dir < 0) ? n.previousElementSibling : n.nextElementSibling;
-    while (p) {
-      var pt = clean(p.innerText || p.textContent);
-      var holdsTable = (p.matches && p.matches(TABLE_SEL)) || p.querySelector(TABLE_SEL);
-      if (pt && !holdsTable) { return pt.slice(0, 300); }
-      p = (dir < 0) ? p.previousElementSibling : p.nextElementSibling;
-    }
-    n = n.parentElement; depth++;
-  }
-  return '';
-}
-
 var tableEls = root.querySelectorAll(TABLE_SEL);
 var sections = [];
 for (var k = 0; k < tableEls.length; k++) {
@@ -434,9 +440,9 @@ for (var k = 0; k < tableEls.length; k++) {
     else { rows.push(cellsText); }
   }
   if (!headers.length && !rows.length) { continue; }
+  var capEl = tbl.querySelector('caption');
   sections.push({
-    before: siblingText(tbl, -1),
-    after: siblingText(tbl, 1),
+    caption: capEl ? clean(capEl.innerText || capEl.textContent) : '',
     headers: headers,
     rows: rows
   });
