@@ -32,6 +32,36 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 3
+  Second real run (Alibaba, row 32) showed the v2 page-state probe:
+  title "Just a moment...", body "Performing security verification ...
+  Cloudflare". The runner was stopped by a Cloudflare challenge, so there
+  was never a "Data" button to find (the v2 scroll/attribute fixes could
+  not matter yet). insider_score_scraper.py uses the SAME launch
+  (SB(uc=True, headless=True) + uc_open_with_reconnect) and passes
+  InsiderScreener's Cloudflare, so SW's challenge is simply stricter or
+  slower; the launch line alone is not the difference. Changes:
+    * After navigating, the page is checked for a Cloudflare challenge
+      (title / body text). While it is showing, the script waits up to
+      CF_CHALLENGE_WAIT_SECONDS for it to clear on its own and, in a
+      HEADED browser only, also tries sb.uc_gui_click_captcha() every
+      CF_CAPTCHA_CLICK_EVERY_SECONDS (it needs a real display; it cannot
+      work headless).
+    * A page that stays blocked raises CloudflareBlocked (a clear message
+      plus screenshot) instead of the misleading "no Data button".
+    * run_bot tries LAUNCH_MODES in order (default: headless, then
+      headed). Headed on a Linux runner relies on SeleniumBase starting
+      xvfb itself; if the headed browser cannot start, that is logged.
+      Override with env LAUNCH_MODES="headed" or "headless,headed".
+    * uc_open_with_reconnect uses reconnect_time=CF_RECONNECT_SECONDS (6).
+    * The window is resized only AFTER the challenge has cleared (the
+      working IS script never resizes).
+  NOT verified: that either extra step actually clears SW's challenge from
+  a GitHub Actions IP. Datacenter IPs are often challenged regardless of
+  browser mode; if both modes stay blocked, the realistic options are a
+  different network path (e.g. a residential proxy) or a self-hosted
+  runner, not more code here.
+
 VERSION 2
   First real run (Alibaba, row 32) failed with "Visible 'Data' buttons
   found: 0". The page's own DevTools markup showed the button as
@@ -81,7 +111,31 @@ from seleniumbase import SB
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
-# Browser window size set before navigating (desktop layout, above the md
+# --- Cloudflare handling (v3) ---------------------------------------------
+# Browser launch modes tried in order for each provider. "headless" is what
+# insider_score_scraper.py uses; "headed" runs a real (virtual-display)
+# window, which Cloudflare challenges less often. Override with the env
+# var LAUNCH_MODES, e.g. "headed" or "headless,headed".
+DEFAULT_LAUNCH_MODES = "headless,headed"
+
+# Seconds to wait for a Cloudflare challenge to clear on its own.
+CF_CHALLENGE_WAIT_SECONDS = 45
+
+# Seconds given to uc_open_with_reconnect (IS script uses 4).
+CF_RECONNECT_SECONDS = 6
+
+# Headed mode only: how often to try clicking the challenge checkbox.
+CF_CAPTCHA_CLICK_EVERY_SECONDS = 12
+
+# Lower-case fragments that mean "this is a Cloudflare challenge page".
+CF_CHALLENGE_MARKERS = (
+    "just a moment",
+    "performing security verification",
+    "verify you are human",
+    "attention required",
+)
+
+# Browser window size set AFTER the page has loaded (desktop layout, above the md
 # breakpoint, so responsive "hidden md:inline" labels are shown).
 WINDOW_WIDTH = 1600
 WINDOW_HEIGHT = 1200
@@ -455,6 +509,67 @@ def log_sw_page_state(sb):
         print("⚠️ page-state probe failed: {}".format(info_error))
 
 
+class CloudflareBlocked(RuntimeError):
+    """The page is still a Cloudflare challenge after all waiting."""
+
+
+def is_challenge_page(sb):
+    """True when the title or visible text looks like a Cloudflare challenge."""
+    try:
+        title = (sb.get_title() or "").lower()
+    except Exception:
+        title = ""
+
+    try:
+        body = run_js(
+            sb,
+            "return String(document.body ? (document.body.innerText || '') : '')"
+            ".slice(0, 600);",
+        ) or ""
+    except Exception:
+        body = ""
+
+    haystack = title + " " + str(body).lower()
+    return any(marker in haystack for marker in CF_CHALLENGE_MARKERS)
+
+
+def wait_past_challenge(sb, headless):
+    """
+    Waits up to CF_CHALLENGE_WAIT_SECONDS for a Cloudflare challenge to
+    clear. In headed mode also tries sb.uc_gui_click_captcha() now and then.
+    Returns True when the challenge is gone (or was never there).
+    """
+    if not is_challenge_page(sb):
+        return True
+
+    print("🛡️ Cloudflare challenge detected -- waiting for it to clear...")
+    started = time.monotonic()
+    last_click_at = None
+
+    while time.monotonic() - started < CF_CHALLENGE_WAIT_SECONDS:
+        sb.sleep(2)
+
+        if not is_challenge_page(sb):
+            print(
+                "🛡️ Challenge cleared after {:.1f}s".format(
+                    time.monotonic() - started
+                )
+            )
+            return True
+
+        if not headless:
+            now = time.monotonic()
+            if last_click_at is None or now - last_click_at >= CF_CAPTCHA_CLICK_EVERY_SECONDS:
+                last_click_at = now
+                try:
+                    sb.uc_gui_click_captcha()
+                    print("🖱️ Tried uc_gui_click_captcha()")
+                except Exception as click_error:
+                    print("⚠️ uc_gui_click_captcha failed: {}".format(click_error))
+
+    return not is_challenge_page(sb)
+
+
 def wait_for_data_buttons(sb):
     """
     Polls until at least one visible 'Data' button exists. Returns count.
@@ -546,7 +661,7 @@ def poll_for_dialog(sb):
     return last if (last and last.get("found")) else None
 
 
-def scrape_sw_data(sb, abbrev_sw, row_number):
+def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
     """
     Opens the Simply Wall St valuation page for abbrev_sw, clicks the
     "Data" button, waits for the "Share Price vs. Fair Value" dialog and
@@ -559,13 +674,22 @@ def scrape_sw_data(sb, abbrev_sw, row_number):
     url = sw_page_url(abbrev_sw)
     print("🌐 Navigating to: {}".format(url))
 
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+
+    if not wait_past_challenge(sb, headless):
+        log_sw_page_state(sb)
+        save_sw_diagnostics(sb, row_number, None, "blocked by Cloudflare")
+        raise CloudflareBlocked(
+            "page is still a Cloudflare challenge after {}s ({} browser)".format(
+                CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"
+            )
+        )
+
     try:
         sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
     except Exception as size_error:
         print("⚠️ could not set window size: {}".format(size_error))
-
-    sb.uc_open_with_reconnect(url, reconnect_time=4)
-    sb.sleep(PAGE_SETTLE_SECONDS)
 
     button_count = wait_for_data_buttons(sb)
     print("🔎 Visible 'Data' buttons found: {}".format(button_count))
@@ -737,29 +861,55 @@ def run_bot():
         )
         return
 
-    with SB(uc=True, headless=True) as sb:
-        for target, abbrev, scrape in providers:
-            if not abbrev:
+    modes_text = os.environ.get("LAUNCH_MODES", DEFAULT_LAUNCH_MODES)
+    launch_modes = [
+        m.strip().lower() for m in modes_text.split(",") if m.strip()
+    ] or ["headless"]
+
+    for target, abbrev, scrape in providers:
+        if not abbrev:
+            print(
+                "⏩ Row {}: no abbreviation for {} -- skipping.".format(
+                    row_number, target
+                )
+            )
+            continue
+
+        # Each provider in its OWN try/except: one failing can never
+        # block another from still being attempted and posted.
+        for mode in launch_modes:
+            headless = mode != "headed"
+            browser_ready = False
+            print("🚀 {}: launching {} browser".format(target, mode))
+
+            try:
+                with SB(uc=True, headless=headless) as sb:
+                    browser_ready = True
+                    data = scrape(sb, abbrev, row_number, headless)
+                    post_provider_json(
+                        webhook_url, target, row_number, abbrev, sheet_name, data
+                    )
+                break
+
+            except CloudflareBlocked as blocked:
                 print(
-                    "⏩ Row {}: no abbreviation for {} -- skipping.".format(
-                        row_number, target
+                    "🛑 Row {} ({}): {} blocked in {} mode: {}".format(
+                        row_number, abbrev, target, mode, blocked
                     )
                 )
                 continue
 
-            # Each provider in its OWN try/except: one failing can never
-            # block another from still being attempted and posted.
-            try:
-                data = scrape(sb, abbrev, row_number)
-                post_provider_json(
-                    webhook_url, target, row_number, abbrev, sheet_name, data
-                )
             except Exception as scrape_error:
                 print(
-                    "❌ Row {} ({}): {} scrape itself failed: {}".format(
-                        row_number, abbrev, target, scrape_error
+                    "❌ Row {} ({}): {} scrape itself failed ({} mode): {}".format(
+                        row_number, abbrev, target, mode, scrape_error
                     )
                 )
+                if not browser_ready:
+                    # The browser itself could not start (e.g. no display
+                    # for headed mode) -- try the next mode.
+                    continue
+                break
 
     print("🧹 Task complete!")
 
