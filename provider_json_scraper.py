@@ -30,18 +30,43 @@ abbrev_gf workflow input, one new PROVIDERS entry here, and one new handler
 on the Apps Script side (fn_91_03). Providers are fully isolated from one
 another: one failing never blocks another.
 
-VERSION 1 (NEW WORK)
+VERSION HISTORY
 ----------------------------------------------------------------------------
-First version. The dialog's real DOM was NOT available when this was
-written (only screenshots), so the extraction is deliberately generic:
-every <table> / role="table" inside the dialog becomes one section with its
-own headers and rows, plus the text just before and after it. If the dialog
-has no table-like elements at all, its visible text lines are sent instead
-(sections stay empty, textLines is filled), so something still lands in the
-sheet. The dialog's own HTML and a screenshot are saved to ./diagnostics on
-every run (SAVE_DIAGNOSTICS_ALWAYS) and uploaded by the workflow as an
-artifact -- use them to tighten the extraction after the first real run,
-then flip that constant to False.
+VERSION 2
+  First real run (Alibaba, row 32) failed with "Visible 'Data' buttons
+  found: 0". The page's own DevTools markup showed the button as
+      <button data-cy-id="chart-action-toggle-data-dcf-chart"
+              aria-label="Data"> ... <span class="hidden md:inline">Data
+  inside a data-testid="intersection-renderer" block, i.e. a lazily
+  rendered section that probably does not exist in the DOM until it has
+  been scrolled into view. The scraper never scrolled. Changes:
+    * wait_for_data_buttons() now scrolls down a step on every poll, so
+      lazy "intersection-renderer" sections actually render.
+    * SW_TAG_DATA_BUTTONS_JS now also matches a button by aria-label
+      "Data" or a data-cy-id containing "toggle-data", not only by its
+      visible text (the text span is hidden below the md breakpoint).
+    * The browser window is set to 1600x1200 before navigating, so the
+      layout matches the desktop view the markup was inspected in.
+    * When no Data button is found, a "page state" probe is logged
+      (title, URL, button counts, lazy-block count, page height, first
+      300 chars of body text) so the next failure explains itself, e.g.
+      a Cloudflare/consent wall versus a lazy-render problem.
+  NOT verified against the real page: that the data-cy-id stays stable,
+  and that the "dcf-chart" Data button opens the dialog titled
+  "Share Price vs. Fair Value". The dialog title check below still
+  guards against saving the wrong dialog.
+
+VERSION 1 (NEW WORK)
+  First version. The dialog's real DOM was NOT available when this was
+  written (only screenshots), so the extraction is deliberately generic:
+  every <table> / role="table" inside the dialog becomes one section with
+  its own headers and rows, plus the text just before and after it. If the
+  dialog has no table-like elements at all, its visible text lines are
+  sent instead (sections stay empty, textLines is filled), so something
+  still lands in the sheet. The dialog's own HTML and a screenshot are
+  saved to ./diagnostics on every run (SAVE_DIAGNOSTICS_ALWAYS) and
+  uploaded by the workflow as an artifact -- use them to tighten the
+  extraction after the first real run, then flip that constant to False.
 """
 
 import json
@@ -56,11 +81,20 @@ from seleniumbase import SB
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
+# Browser window size set before navigating (desktop layout, above the md
+# breakpoint, so responsive "hidden md:inline" labels are shown).
+WINDOW_WIDTH = 1600
+WINDOW_HEIGHT = 1200
+
 # Seconds to let a freshly opened page settle before looking for buttons.
 PAGE_SETTLE_SECONDS = 4
 
 # How long to wait for the page's own "Data" button(s) to appear.
 SW_DATA_BUTTON_TIMEOUT_SECONDS = 30
+
+# Pixels scrolled down on every poll while waiting for the "Data" button,
+# so lazily rendered sections (intersection-renderer) get built.
+SW_SCROLL_STEP_PIXELS = 700
 
 # How long to wait, after one click on a "Data" button, for the
 # "Share Price vs. Fair Value" dialog (with at least one table) to appear.
@@ -180,9 +214,12 @@ def read_webhook_json(response, label):
 # ----------------------------------------------------------------------------
 # SW (Simply Wall St) -- JavaScript run inside the page
 # ----------------------------------------------------------------------------
-# Lists every visible element whose own text is exactly "Data" (buttons,
-# links, role=button), tags each with data-sw-scrape-idx="<n>" so Python
-# can click a specific one, and returns how many there are.
+# Lists every visible element that is a "Data" button -- matched by its own
+# text being exactly "Data", OR by aria-label "Data", OR by a data-cy-id
+# containing "toggle-data" (the text span is hidden below the md breakpoint,
+# and the attributes are the more stable hook). Tags each with
+# data-sw-scrape-idx="<n>" so Python can click a specific one, and returns
+# how many there are.
 SW_TAG_DATA_BUTTONS_JS = r"""
 function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
 function visible(el) {
@@ -197,12 +234,33 @@ var nodes = document.querySelectorAll('button, a, [role="button"]');
 var n = 0;
 for (var i = 0; i < nodes.length; i++) {
   var el = nodes[i];
-  if (/^data$/i.test(clean(el.innerText || el.textContent)) && visible(el)) {
+  var byAttr = /^data$/i.test(clean(el.getAttribute('aria-label') || '')) ||
+    /toggle-data/i.test(el.getAttribute('data-cy-id') || '');
+  if ((/^data$/i.test(clean(el.innerText || el.textContent)) || byAttr) &&
+      visible(el)) {
     el.setAttribute('data-sw-scrape-idx', String(n));
     n++;
   }
 }
 return n;
+"""
+
+# Snapshot of the page's state, logged when no Data button was found, so the
+# failure explains itself (blocked/consent page vs. lazy render vs. wrong
+# markup).
+SW_PAGE_STATE_JS = r"""
+return {
+  title: document.title,
+  url: location.href,
+  buttons: document.querySelectorAll('button').length,
+  dataCyToggleData: document.querySelectorAll('[data-cy-id*="toggle-data"]').length,
+  ariaLabelData: document.querySelectorAll('button[aria-label="Data"]').length,
+  lazyBlocks: document.querySelectorAll('[data-testid="intersection-renderer"]').length,
+  scrollHeight: document.documentElement.scrollHeight,
+  scrollY: window.scrollY,
+  bodyStart: String(document.body ? (document.body.innerText || '') : '')
+    .replace(/\s+/g, ' ').slice(0, 300)
+};
 """
 
 # Optional, guarded cookie/consent dismissal. Clicks at most one button whose
@@ -384,8 +442,27 @@ def save_sw_diagnostics(sb, row_number, dialog_html, reason):
         print("⚠️ SW diagnostics themselves failed: {}".format(error))
 
 
+def log_sw_page_state(sb):
+    """Logs a one-line snapshot of the page's state. Never raises."""
+    try:
+        info = run_js(sb, SW_PAGE_STATE_JS)
+        print(
+            "🔬 Page state at failure: {}".format(
+                json.dumps(info, ensure_ascii=False)
+            )
+        )
+    except Exception as info_error:
+        print("⚠️ page-state probe failed: {}".format(info_error))
+
+
 def wait_for_data_buttons(sb):
-    """Polls until at least one visible 'Data' button exists. Returns count."""
+    """
+    Polls until at least one visible 'Data' button exists. Returns count.
+
+    Scrolls down a step on every poll: the chart sections live inside
+    lazily rendered "intersection-renderer" blocks that may not exist in
+    the DOM until they have been scrolled into view.
+    """
     deadline = time.monotonic() + SW_DATA_BUTTON_TIMEOUT_SECONDS
     consent_tried = False
     count = 0
@@ -404,6 +481,16 @@ def wait_for_data_buttons(sb):
                     print("🍪 Dismissed a consent banner ({})".format(clicked))
             except Exception:
                 pass
+
+        try:
+            run_js(
+                sb,
+                "window.scrollBy(0, {}); return window.scrollY;".format(
+                    int(SW_SCROLL_STEP_PIXELS)
+                ),
+            )
+        except Exception:
+            pass
 
         sb.sleep(1)
 
@@ -472,6 +559,11 @@ def scrape_sw_data(sb, abbrev_sw, row_number):
     url = sw_page_url(abbrev_sw)
     print("🌐 Navigating to: {}".format(url))
 
+    try:
+        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    except Exception as size_error:
+        print("⚠️ could not set window size: {}".format(size_error))
+
     sb.uc_open_with_reconnect(url, reconnect_time=4)
     sb.sleep(PAGE_SETTLE_SECONDS)
 
@@ -479,6 +571,7 @@ def scrape_sw_data(sb, abbrev_sw, row_number):
     print("🔎 Visible 'Data' buttons found: {}".format(button_count))
 
     if not button_count:
+        log_sw_page_state(sb)
         save_sw_diagnostics(sb, row_number, None, "no Data button")
         raise RuntimeError("no 'Data' button appeared on the page")
 
