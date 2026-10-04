@@ -128,6 +128,8 @@ from datetime import datetime, timezone
 import requests
 from seleniumbase import SB
 
+import gh_log_uploader
+
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
