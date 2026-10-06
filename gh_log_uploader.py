@@ -35,7 +35,12 @@ Never raises, never changes the scraper's exit code, never prints the Web App
 URL, sends at most the last MAX_LINES lines. If the upload fails it prints one
 short line to the real stdout so the Actions page shows it.
 
-VERSION: gh_log_uploader v1
+VERSION: gh_log_uploader v2
+v2 -- the result line also shows queued=: since fn_60_03 v2 the Apps Script side
+      normally QUEUES the entry (reply {ok:true, saved:false, queued:true}) and
+      the Drive file is written a few minutes later. saved=False with
+      queued=True is the normal, successful case.
+v1 -- first version.
 ============================================================================
 """
 import atexit
@@ -127,8 +132,9 @@ def _upload():
             reply = {}
 
         sys.__stdout__.write(
-            "[gh_log_uploader v1] log sent: ok={} saved={} lines={}\n".format(
-                reply.get("ok"), reply.get("saved"), len(payload["lines"])
+            "[gh_log_uploader v2] log sent: ok={} saved={} queued={} lines={}\n".format(
+                reply.get("ok"), reply.get("saved"), reply.get("queued"),
+                len(payload["lines"])
             )
         )
         sys.__stdout__.flush()
@@ -136,7 +142,7 @@ def _upload():
     except Exception as error:
         try:
             sys.__stdout__.write(
-                "[gh_log_uploader v1] log upload failed: {}\n".format(
+                "[gh_log_uploader v2] log upload failed: {}\n".format(
                     type(error).__name__
                 )
             )
