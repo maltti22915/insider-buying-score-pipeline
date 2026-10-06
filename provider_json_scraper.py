@@ -32,6 +32,29 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 5
+  Second provider: AlphaSpread DCF (target "ASDCF"). New optional env var
+  ABBREV_AS (e.g. "nasdaq/adsk"); when set, as_dcf_extractor.py (repo root,
+  next to this file) opens alphaspread.com/security/<abbrev>/dcf-valuation,
+  clicks "View Calculation" then "Full Model" and returns the whole model table
+  (every year column, every row), the modal header and the selected row's side
+  panel. This file posts it with target "ASDCF"; fn_90_00 routes that to
+  fn_91_01, whose registry sends it to fn_91_03, which stores it in the "AS
+  JSON" cell. Changes here:
+    * ABBREV_AS env var, a "ASDCF" entry in the providers list, scrape_as_dcf().
+    * post_provider_json: the abbreviation key was built as "abbrev" + target,
+      which for ASDCF would be "abbrevASDCF"; the webhook reads "abbrevAS".
+      ABBREV_KEY_BY_TARGET now names the exact key (SW still "abbrevSW").
+    * as_dcf_extractor is imported inside try/except: if the file is missing
+      from the repository only the AS provider fails, SW is unaffected.
+    * AlphaSpread diagnostics: the full page HTML (modal included) and a
+      screenshot go to ./diagnostics (as_row<N>_page.html / .png) on every run
+      while SAVE_DIAGNOSTICS_ALWAYS is True, and on every AS failure together
+      with a one-line page-state log (title, URL, first 300 text characters).
+    * First log line now carries the version.
+  NOT VERIFIED LIVE: the AlphaSpread clicks, what a logged-out browser may
+  open, and the AS page under the headed/headless launch modes.
+
 VERSION 4
   Third real run (Alibaba, row 32): headed mode passed Cloudflare (cleared
   after 10.7s), the Data button was found, the dialog opened and 6 sections
@@ -130,6 +153,13 @@ from seleniumbase import SB
 
 import gh_log_uploader
 
+# AlphaSpread DCF extractor (v5). Optional: if the file is not in the
+# repository root, only the AS provider fails; SW keeps working.
+try:
+    import as_dcf_extractor
+except ImportError:
+    as_dcf_extractor = None
+
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
@@ -191,6 +221,23 @@ DIAGNOSTICS_DIR = "diagnostics"
 
 WEBHOOK_BODY_PREVIEW_CHARS = 200
 WEBHOOK_TIMEOUT_SECONDS = 120
+
+# v5: the payload key under which the webhook reads each target's abbreviation.
+# Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
+# from that rule are listed here (ASDCF reads the row's abbrevAS).
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS"}
+
+# v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
+AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
+
+AS_PAGE_STATE_JS = r"""
+return {
+  title: document.title,
+  url: location.href,
+  text: (document.body ? (document.body.innerText || '') : '')
+          .replace(/\s+/g, ' ').trim().slice(0, 300)
+};
+"""
 
 
 def utc_clock_text():
@@ -767,6 +814,90 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
 
 
 # ----------------------------------------------------------------------------
+# AlphaSpread DCF provider (v5)
+# ----------------------------------------------------------------------------
+def save_as_diagnostics(sb, row_number, reason):
+    """
+    Writes the AlphaSpread page's full HTML (the open modal included) and a
+    screenshot into DIAGNOSTICS_DIR. Fully guarded -- never raises.
+    """
+    try:
+        os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+
+        html = sb.get_page_source() or ""
+        html_name = "as_row{}_page.html".format(row_number)
+        with open(
+            os.path.join(DIAGNOSTICS_DIR, html_name), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(html[:AS_DIAGNOSTICS_MAX_HTML_CHARS])
+        print(
+            "🧾 Saved AlphaSpread page HTML ({} chars) -> {}/{} [{}]".format(
+                min(len(html), AS_DIAGNOSTICS_MAX_HTML_CHARS),
+                DIAGNOSTICS_DIR, html_name, reason
+            )
+        )
+
+        shot_name = "as_row{}_page.png".format(row_number)
+        sb.save_screenshot(shot_name, folder=DIAGNOSTICS_DIR)
+        print("📸 Saved screenshot -> {}/{}".format(DIAGNOSTICS_DIR, shot_name))
+
+    except Exception as error:
+        print("⚠️ AS diagnostics themselves failed: {}".format(error))
+
+
+def log_as_page_state(sb):
+    """Logs title, URL and the first 300 visible characters. Never raises."""
+    try:
+        info = run_js(sb, AS_PAGE_STATE_JS)
+        print(
+            "🔬 AlphaSpread page state: {}".format(
+                json.dumps(info, ensure_ascii=False)
+            )
+        )
+    except Exception as info_error:
+        print("⚠️ AS page-state probe failed: {}".format(info_error))
+
+
+def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
+    """
+    Opens AlphaSpread's DCF page for abbrev_as, opens View Calculation ->
+    Full Model and returns the JSON-ready dict built by as_dcf_extractor.
+    Read-only: the extractor only ever clicks those two labels. Raises on any
+    problem; run_bot catches that per provider, so SW is never blocked.
+    """
+    if as_dcf_extractor is None:
+        raise RuntimeError(
+            "as_dcf_extractor.py is not in the repository root -- AlphaSpread"
+            " DCF skipped"
+        )
+
+    try:
+        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    except Exception as size_error:
+        print("⚠️ could not set window size: {}".format(size_error))
+
+    try:
+        data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
+
+    except Exception as error:
+        log_as_page_state(sb)
+        save_as_diagnostics(sb, row_number, "scrape failed")
+
+        if isinstance(error, as_dcf_extractor.AsDcfLoginRequired):
+            print(
+                "🔒 AlphaSpread asked for a login instead of opening the DCF"
+                " model -- nothing was written."
+            )
+
+        raise
+
+    if SAVE_DIAGNOSTICS_ALWAYS:
+        save_as_diagnostics(sb, row_number, "always-on")
+
+    return data
+
+
+# ----------------------------------------------------------------------------
 # Posting
 # ----------------------------------------------------------------------------
 def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data):
@@ -782,7 +913,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
         "target": target,
         "sheetName": sheet_name,
         "rowNumber": row_number,
-        "abbrev" + target.upper(): abbrev,
+        ABBREV_KEY_BY_TARGET.get(target.upper(), "abbrev" + target.upper()): abbrev,
         "data": data,
     }
 
@@ -839,7 +970,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v5 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -849,17 +980,19 @@ def run_bot():
     # insider_score_scraper.py's abbrev_is / abbrev_as: a row may have any
     # subset of them, and an empty one just skips that provider.
     abbrev_sw = os.environ.get("ABBREV_SW", "").strip()
+    abbrev_as = os.environ.get("ABBREV_AS", "").strip()  # v5
     # Future: abbrev_gf = os.environ.get("ABBREV_GF", "").strip()
 
     print(
-        "🎯 Sheet={} | Row={} | SW={}".format(
-            sheet_name, row_number, abbrev_sw or "(none)"
+        "🎯 Sheet={} | Row={} | SW={} | AS={}".format(
+            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)"
         )
     )
 
     # (target key, abbreviation, scrape function). Add GF here later.
     providers = [
         ("SW", abbrev_sw, scrape_sw_data),
+        ("ASDCF", abbrev_as, scrape_as_dcf),
     ]
 
     if not any(abbrev for _, abbrev, _ in providers):
