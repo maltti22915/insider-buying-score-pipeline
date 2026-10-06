@@ -10,6 +10,11 @@
 # (Insider Buying Score + AlphaSpread), so this new functionality can be
 # tested on its own and can never affect that already-working chain.
 #
+# VERSION 2: second provider, AlphaSpread DCF. New optional input abbrev_as
+# (e.g. "nasdaq/adsk") and one env line ABBREV_AS. as_dcf_extractor.py must be
+# at the repository root next to provider_json_scraper.py. No new secret and
+# no new dependency (the extractor uses only the Python standard library).
+#
 # VERSION 1 (NEW WORK): first version. Providers are optional inputs, one
 # per provider -- today only abbrev_sw (Simply Wall St). A future abbrev_gf
 # (GuruFocus) is added here as one more optional input, plus one env line.
@@ -50,6 +55,11 @@ name: Provider JSON Scraper
         required: false
         type: string
         default: ''
+      abbrev_as:
+        description: "OPTIONAL: that row's own current AlphaSpread abbreviation (e.g. \"nasdaq/adsk\"). Leave empty to skip the AlphaSpread DCF."
+        required: false
+        type: string
+        default: ''
 
 jobs:
   scrape-provider-json:
@@ -77,6 +87,7 @@ jobs:
           ROW_NUMBER: ${{ inputs.row_number }}
           SHEET_NAME: ${{ inputs.sheet_name }}
           ABBREV_SW: ${{ inputs.abbrev_sw }}
+          ABBREV_AS: ${{ inputs.abbrev_as }}
         run: python provider_json_scraper.py
 
       - name: Upload diagnostics
