@@ -10,6 +10,10 @@
 # (Insider Buying Score + AlphaSpread), so this new functionality can be
 # tested on its own and can never affect that already-working chain.
 #
+# VERSION 3: job timeout raised from 10 to 20 minutes, because provider_json_scraper.py
+# v6 retries a Cloudflare-blocked provider (up to 3 attempts, about 330 s budget each).
+# Nothing else changed.
+#
 # VERSION 2: second provider, AlphaSpread DCF. New optional input abbrev_as
 # (e.g. "nasdaq/adsk") and one env line ABBREV_AS. as_dcf_extractor.py must be
 # at the repository root next to provider_json_scraper.py. No new secret and
@@ -64,7 +68,7 @@ name: Provider JSON Scraper
 jobs:
   scrape-provider-json:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
 
     steps:
       - name: Check out repository
