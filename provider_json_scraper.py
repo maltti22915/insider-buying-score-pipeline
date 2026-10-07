@@ -32,6 +32,16 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 10
+  Requested directly ("fix first"). Log 84 had 3 unreadable webhook replies in
+  13 runs (Rows 10 SW/AS: HTTP 200 text/html; Row 36 SW: HTTP 404 text/html)
+  although Apps Script logged SUCCESS for Row 36. The scraper counted those as
+  failures. Now post_provider_json re-posts the identical payload (up to 2 more
+  times, 6 s apart, env POST_UNREADABLE_RETRIES) when the reply is unreadable or
+  the POST itself fails; the write is idempotent (fixed cell), so it is safe. A
+  readable reply is final. If every try is unreadable the reason becomes
+  reply_unreadable_after_retries. NOT VERIFIED LIVE.
+
 VERSION 9
   Requested directly ("optimize the process further"). Changes are based on
   the real log of 19 Simply Wall St launches (Oct 7), not on guesses:
@@ -1136,7 +1146,36 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
 _LAST_POST = {}
 
 
+# v10: an unreadable reply (Google HTML error page although Apps Script
+# succeeded) or a failed/timed-out POST is retried: the write goes to a fixed
+# cell, so posting the same payload again only overwrites it with the same value.
+POST_UNREADABLE_RETRIES = int(os.environ.get("POST_UNREADABLE_RETRIES", "2"))
+POST_RETRY_PAUSE_SECONDS = 6
+
+
 def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data):
+    """
+    v10 wrapper: posts, and re-posts the identical payload (up to
+    POST_UNREADABLE_RETRIES times) when the reply was unreadable or the POST
+    itself failed. Any readable reply (written / refused / not written) is final.
+    """
+    posted = False
+    for post_try in range(1, POST_UNREADABLE_RETRIES + 2):
+        posted = _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name, data)
+        reason = str(_LAST_POST.get("reason") or "")
+        if posted or not (reason == "reply_unreadable" or reason.startswith("post_failed")):
+            if posted and post_try > 1:
+                print("   (v10) confirmed on post try {}".format(post_try))
+            return posted
+        if post_try <= POST_UNREADABLE_RETRIES:
+            print("🔁 Row {} {}: reply unreadable/POST failed ({}) -- re-posting the same payload in {} s (try {} of {})".format(
+                row_number, target, reason, POST_RETRY_PAUSE_SECONDS, post_try + 1, POST_UNREADABLE_RETRIES + 1))
+            time.sleep(POST_RETRY_PAUSE_SECONDS)
+    _LAST_POST["reason"] = reason + "_after_retries"
+    return posted
+
+
+def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name, data):
     """
     POSTs one provider's JSON to the Apps Script webhook (the SAME Web App
     URL as insider_score_scraper.py -- one doPost per project -- routed
@@ -1224,7 +1263,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v9",
+            "v": "v10",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1241,7 +1280,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v9 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v10 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
