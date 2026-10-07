@@ -51,7 +51,55 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v1
+VERSION: as_dcf_extractor v3
+v3 -- Requested directly. REAL CONFIRMED BUG in v1 and v2 (found by reading the
+      saved page of a real run, Row 34, nyse/baba, headed browser): every
+      browser-side script was sent as the text  "return " + <script>  and each
+      script string began with a line break, so the browser saw
+          return
+          (function () { ... })()
+      JavaScript ends a statement at "return" + line break (automatic
+      semicolon insertion): it returned nothing and NEVER RAN the function.
+      In the headed (classic function-body) mode that raised no error, so the
+      old fallback never fired, the click script never ran, and the result
+      (None) was read as "button not found" for the whole 45 s wait, although
+      the saved page shows the "View Calculation" button present and visible
+      in ordinary containers. The same flaw silently disabled the table wait,
+      the login check, the extraction, and v2's scroll and probe. In headless
+      uc (bare-expression) mode the leading "return" is a SyntaxError, which
+      DID trigger the fallback, so that mode worked -- the bug depended on the
+      browser mode. The tests used a fake browser that never ran real
+      JavaScript, so none of this was visible.
+      Fix: _run_js() strips the script, wraps it in JSON.stringify(...), and
+      tries BOTH shapes -- "return <expr>;" (function-body mode) and the bare
+      expression (CDP/uc mode) -- moving to the second when the first raises
+      OR returns nothing. The results are decoded from JSON. The first working
+      shape is logged once ("javascript evaluation mode: ...").
+      New: _check_js_channel() runs a trivial script right after the page is
+      opened and raises JAVASCRIPT_CHANNEL_NOT_WORKING at once when scripts do
+      not run or return nothing, so a dead channel can never again look like a
+      missing button. Nothing else changes: same clicks (only "View
+      Calculation" and "Full Model"), same extraction, same errors.
+      Tested with REAL JavaScript (jsdom) in both evaluation modes on the
+      saved Row 34 page and on the real MSCI table fragment.
+v2 -- Requested directly after the first real run stopped with
+v2 -- Requested directly after the first real run stopped with
+      VIEW_CALCULATION_NOT_FOUND (page loaded, logged out, no button found):
+      * While waiting for "View Calculation" the page is now scrolled a step on
+        every poll (wrapping back to the top at the bottom), so lazily rendered
+        blocks get a chance to appear.
+      * probe_page() prints what is actually on the page straight into the log:
+        every button/link/tab whose text, aria-label, title or href mentions
+        "calculation", "model" or "dcf" (tag, text, visible?, class, position),
+        other elements whose short text mentions "calculation", the visible
+        button texts, the headings, any dialog/cookie/consent overlay, whether a
+        login form is showing, and how many lazy (Livewire) blocks are still
+        unloaded. It runs once after PROBE_AFTER_SECONDS of waiting, and again
+        right before every failure (VIEW_CALCULATION_NOT_FOUND,
+        FULL_MODEL_TAB_NOT_FOUND, TABLE_NOT_RENDERED). It never clicks anything
+        and never raises: a failing probe is logged and the real error still
+        propagates. Read-only guarantee (SAFE_CLICK_LABELS) unchanged.
+v1 -- first version.
 ============================================================================
 """
 import json
@@ -59,7 +107,9 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v1"
+VERSION = "as_dcf_extractor v3"
+PROBE_AFTER_SECONDS = 15
+MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
 SAFE_CLICK_LABELS = ("view calculation", "full model")
 
@@ -264,12 +314,193 @@ _LOGIN_JS = r"""
 """
 
 
-def _run_js(sb, expression):
-    """Evaluate an IIFE expression; some uc sessions reject a leading 'return'."""
-    try:
-        return sb.execute_script("return " + expression)
-    except Exception:
-        return sb.execute_script(expression)
+_SCROLL_JS = r"""
+(function () { /*SCROLL*/
+  var height = document.documentElement.scrollHeight || 0;
+  var viewport = window.innerHeight || 800;
+  var next = (window.scrollY || 0) + 600;
+  if (next + viewport >= height - 10) { next = 0; }
+  window.scrollTo(0, next);
+  return [Math.round(next), height];
+})()
+"""
+
+PROBE_JS = r"""
+(function () { /*PROBE*/
+  var norm = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
+  var text = function (el) { return norm(el.innerText !== undefined ? el.innerText : el.textContent); };
+  var attr = function (el, name) { return norm(el.getAttribute(name) || ''); };
+  var visible = function (el) {
+    var r = el.getClientRects();
+    return !!(r && r.length) && window.getComputedStyle(el).visibility !== 'hidden';
+  };
+  var top = function (el) {
+    try { return Math.round(el.getBoundingClientRect().top + (window.scrollY || 0)); } catch (e) { return null; }
+  };
+  var pattern = /calculation|model|dcf/i;
+  var scrollY = window.scrollY || 0;
+
+  var counts = { buttons: 0, links: 0, visibleInteractive: 0 };
+  var matches = [];
+  var visibleTexts = [];
+  var seen = {};
+  var nodes = document.querySelectorAll('button, a, [role="button"], [role="tab"], summary, input[type="button"], input[type="submit"]');
+
+  for (var i = 0; i < nodes.length; i++) {
+    var el = nodes[i];
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'a') { counts.links += 1; } else { counts.buttons += 1; }
+
+    var label = text(el).slice(0, 80) || attr(el, 'value');
+    var aria = attr(el, 'aria-label');
+    var title = attr(el, 'title');
+    var href = tag === 'a' ? attr(el, 'href').slice(0, 100) : '';
+    var isVisible = visible(el);
+
+    if (isVisible) {
+      counts.visibleInteractive += 1;
+      var shortLabel = label.slice(0, 40);
+      if (shortLabel && !seen[shortLabel] && visibleTexts.length < 50) {
+        seen[shortLabel] = true;
+        visibleTexts.push(shortLabel);
+      }
+    }
+
+    if (matches.length < 40 && (pattern.test(label) || pattern.test(aria) || pattern.test(title) || pattern.test(href))) {
+      matches.push({
+        tag: tag, text: label, aria: aria, title: title, href: href,
+        id: el.id || '', cls: attr(el, 'class').slice(0, 80),
+        visible: isVisible, disabled: !!el.disabled, top: top(el)
+      });
+    }
+  }
+
+  var others = [];
+  var generic = document.querySelectorAll('div, span, li, p, strong, h1, h2, h3, h4');
+  for (var j = 0; j < generic.length && others.length < 15; j++) {
+    var g = generic[j];
+    var gt = text(g);
+    if (gt && gt.length <= 60 && /calculation/i.test(gt)) {
+      others.push({ tag: g.tagName.toLowerCase(), text: gt, cls: attr(g, 'class').slice(0, 60), visible: visible(g) });
+    }
+  }
+
+  var headings = [];
+  var hs = document.querySelectorAll('h1, h2, h3');
+  for (var k = 0; k < hs.length && headings.length < 12; k++) {
+    var ht = text(hs[k]).slice(0, 60);
+    if (ht) { headings.push(ht); }
+  }
+
+  var lazyPending = 0;
+  var wire = document.querySelectorAll('[wire\\:snapshot]');
+  for (var w = 0; w < wire.length && w < 300; w++) {
+    var snap = wire[w].getAttribute('wire:snapshot') || '';
+    if (snap.indexOf('"lazyLoaded":false') >= 0) { lazyPending += 1; }
+  }
+
+  var overlays = [];
+  var ov = document.querySelectorAll('[role="dialog"], .modal, [class*="cookie"], [class*="consent"]');
+  for (var o = 0; o < ov.length && overlays.length < 5; o++) {
+    if (visible(ov[o])) { overlays.push({ cls: attr(ov[o], 'class').slice(0, 60), text: text(ov[o]).slice(0, 80) }); }
+  }
+
+  var loginForm = false;
+  var pw = document.querySelectorAll('input[type="password"]');
+  for (var p = 0; p < pw.length; p++) { if (visible(pw[p])) { loginForm = true; } }
+
+  return JSON.stringify({
+    url: location.href, title: document.title, readyState: document.readyState,
+    scrollY: Math.round(scrollY), scrollHeight: document.documentElement.scrollHeight || 0,
+    viewport: window.innerHeight || 0,
+    wireComponents: document.querySelectorAll('[wire\\:id]').length, lazyPending: lazyPending,
+    counts: counts, matches: matches, others: others, visibleTexts: visibleTexts,
+    headings: headings, overlays: overlays, loginForm: loginForm
+  });
+})()
+"""
+
+
+_JS_MODE_LOGGED = {"done": False}
+
+
+def _run_js(sb, script):
+    """
+    Runs one browser-side script (an IIFE) and returns its JSON-decoded result.
+
+    sb.execute_script treats its string in one of two ways, depending on the
+    browser session: as a FUNCTION BODY (classic Selenium: a result needs a
+    "return") or as a bare EXPRESSION (uc/CDP: a leading "return" is a
+    SyntaxError). Both shapes are tried, in that order, moving on when the
+    first raises OR returns nothing.
+
+    The script is stripped first: the stored scripts begin with a line break,
+    and "return" followed by a line break returns nothing in JavaScript
+    (automatic semicolon insertion) without ever running the code after it.
+    That was the v1/v2 bug. The result is JSON.stringify'd inside the page, so
+    any value survives either mode; None means no value came back at all.
+    """
+    wrapped = "JSON.stringify(" + str(script).strip() + ")"
+
+    last_error = None
+
+    for shape, candidate in (
+        ("function-body", "return " + wrapped + ";"),
+        ("expression", wrapped),
+    ):
+        try:
+            raw = sb.execute_script(candidate)
+        except Exception as error:
+            last_error = error
+            continue
+
+        if raw is None:
+            continue
+
+        if not _JS_MODE_LOGGED["done"]:
+            _JS_MODE_LOGGED["done"] = True
+            _log("javascript evaluation mode: {}".format(shape))
+
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except ValueError:
+                return raw
+
+        return raw
+
+    if last_error is not None:
+        raise last_error
+
+    return None
+
+
+def _check_js_channel(sb, timeout=6, interval=0.5):
+    """
+    Proves that browser scripts really run and return a value. Without it a
+    dead channel is indistinguishable from a missing button (v1/v2 waited 45 s
+    and reported VIEW_CALCULATION_NOT_FOUND). Raises AsDcfError
+    JAVASCRIPT_CHANNEL_NOT_WORKING when no script result ever comes back.
+    """
+    problem = {"text": "no result"}
+
+    def attempt():
+        try:
+            value = _run_js(sb, "(function () { return 20 + 22; })()")
+        except Exception as error:
+            problem["text"] = "error: {}".format(error)
+            return False
+
+        if value == 42:
+            return True
+
+        problem["text"] = "got {!r} instead of 42".format(value)
+        return False
+
+    if not _wait_until(attempt, timeout, interval):
+        raise AsDcfError("JAVASCRIPT_CHANNEL_NOT_WORKING: {}".format(problem["text"]))
+
+    _log("javascript channel check: ok")
 
 
 def _click_by_text(sb, label):
@@ -296,7 +527,74 @@ def _wait_until(check, timeout, interval):
         time.sleep(interval)
 
 
-def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_interval=0.5):
+def _scroll_step(sb):
+    """Scrolls the page one step (wraps to the top at the bottom). Never raises."""
+    try:
+        _run_js(sb, _SCROLL_JS)
+    except Exception:
+        pass
+
+
+def probe_page(sb, reason):
+    """
+    Prints what is on the page into the log (read-only, never clicks, never
+    raises). See the v2 note in the module docstring for what it reports.
+    """
+    try:
+        raw = _run_js(sb, PROBE_JS)
+        info = json.loads(raw) if isinstance(raw, str) else raw
+
+        if not isinstance(info, dict):
+            _log("🔍 PROBE ({}): the page returned nothing readable".format(reason))
+            return
+
+        counts = info.get("counts") or {}
+        _log(
+            "🔍 PROBE ({}) | url={} | title={!r} | readyState={} | scrollY={} of {} (viewport {})"
+            " | buttons={} links={} visible controls={} | wire components={} | lazy blocks still loading={}"
+            " | login form showing={}".format(
+                reason, info.get("url"), (info.get("title") or "")[:80], info.get("readyState"),
+                info.get("scrollY"), info.get("scrollHeight"), info.get("viewport"),
+                counts.get("buttons"), counts.get("links"), counts.get("visibleInteractive"),
+                info.get("wireComponents"), info.get("lazyPending"), info.get("loginForm"),
+            )
+        )
+
+        _log("🔍 PROBE headings: {}".format(json.dumps(info.get("headings") or [], ensure_ascii=False)[:500]))
+
+        matches = (info.get("matches") or [])[:MAX_PROBE_MATCHES]
+        _log("🔍 PROBE controls mentioning calculation/model/dcf: {}".format(len(matches)))
+
+        for number, item in enumerate(matches, 1):
+            _log(
+                "🔍   {}. <{}> {!r} | visible={} | disabled={} | aria-label={!r} | title={!r}"
+                " | href={!r} | id={!r} | class={!r} | top={}".format(
+                    number, item.get("tag"), (item.get("text") or "")[:80], item.get("visible"),
+                    item.get("disabled"), (item.get("aria") or "")[:60], (item.get("title") or "")[:60],
+                    item.get("href") or "", item.get("id") or "", item.get("cls") or "", item.get("top"),
+                )
+            )
+
+        for number, item in enumerate((info.get("others") or [])[:15], 1):
+            _log(
+                "🔍   other element {}. <{}> {!r} | visible={} | class={!r}".format(
+                    number, item.get("tag"), (item.get("text") or "")[:60], item.get("visible"), item.get("cls") or "",
+                )
+            )
+
+        _log("🔍 PROBE visible button/link texts: {}".format(
+            json.dumps(info.get("visibleTexts") or [], ensure_ascii=False)[:900]))
+
+        overlays = info.get("overlays") or []
+
+        if overlays:
+            _log("🔍 PROBE overlays/dialogs showing: {}".format(json.dumps(overlays, ensure_ascii=False)[:500]))
+
+    except Exception as probe_error:
+        _log("⚠️ probe failed (the real error is unaffected): {}".format(probe_error))
+
+
+def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_interval=0.5, probe_after=PROBE_AFTER_SECONDS):
     """Open the DCF page, open View Calculation -> Full Model, return the data dict."""
     abbrev = str(abbrev_as or "").strip().strip("/")
 
@@ -311,8 +609,26 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
     except AttributeError:
         sb.open(url)
 
-    # 1. the page's "View Calculation" button
-    if not _wait_until(lambda: _click_by_text(sb, "view calculation"), page_timeout, poll_interval):
+    # 0. (v3) make sure browser scripts really run before waiting for anything
+    _check_js_channel(sb)
+
+    # 1. the page's "View Calculation" button (scrolling while waiting, v2)
+    wait_state = {"started": time.monotonic(), "probed": False}
+
+    def click_view_calculation():
+        if _click_by_text(sb, "view calculation"):
+            return True
+
+        _scroll_step(sb)
+
+        if (not wait_state["probed"]) and time.monotonic() - wait_state["started"] >= probe_after:
+            wait_state["probed"] = True
+            probe_page(sb, "still no 'View Calculation' after {}s of waiting and scrolling".format(probe_after))
+
+        return False
+
+    if not _wait_until(click_view_calculation, page_timeout, poll_interval):
+        probe_page(sb, "VIEW_CALCULATION_NOT_FOUND")
         raise AsDcfError("VIEW_CALCULATION_NOT_FOUND")
 
     _log("clicked 'View Calculation'")
@@ -327,6 +643,7 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
         return _click_by_text(sb, "full model")
 
     if not _wait_until(click_full_model, step_timeout, poll_interval):
+        probe_page(sb, "FULL_MODEL_TAB_NOT_FOUND")
         raise AsDcfError("FULL_MODEL_TAB_NOT_FOUND")
 
     if state["login"]:
@@ -336,6 +653,7 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
 
     # 3. wait for the table to be rendered, then read it
     if not _wait_until(lambda: bool(_run_js(sb, _PRESENT_JS)), step_timeout, poll_interval):
+        probe_page(sb, "TABLE_NOT_RENDERED")
         raise AsDcfError("TABLE_NOT_RENDERED")
 
     raw = _run_js(sb, EXTRACT_JS)
