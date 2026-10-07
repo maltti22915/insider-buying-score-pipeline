@@ -32,6 +32,44 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 8
+  Requested directly: a much more detailed report in the log, so a failure says
+  WHICH step failed and WHAT the page looked like ("button not found" plus the
+  buttons that WERE there). Two additions, no scraping logic changed:
+    * STEP lines. Every provider attempt prints, in order, lines like
+        🔹 STEP SW a1/headed | 03 find_data_button | OK | count=1 | +14.2s
+      (provider, attempt, browser mode, step number, step name, OK/FAIL/INFO,
+      details, seconds since this browser launch). The same step names appear
+      in the RUN_SUMMARY attempts as "step" (the last step reached).
+    * FAILURE REPORT. Every failure that reaches the log now prints one block,
+      "🔬 FAILURE REPORT | <provider> | step=<name> | reason=<text>", followed
+      by indented lines: where the page is (URL, title, readyState, scroll),
+      counts (buttons, links, visible buttons, inputs), every control whose text
+      matches what the step was looking for (with visible/disabled flags), the
+      texts of the visible buttons, any dialogs/overlays/consent banners that
+      are showing, the page headings, a visible password field, and the first
+      400 characters of page text. SW failures that used to print only counts
+      ("no 'Data' button", "dialog never appeared") now print this block too.
+  The report is read-only (it only reads the page), never raises, and is capped
+  in size. A failure inside the report prints one warning line.
+
+VERSION 7
+  Requested directly: make the log easier for an AI to read as one picture of
+  the run. At the end of every run (also when nothing was scraped) ONE line is
+  printed, starting with the fixed marker "📋 RUN_SUMMARY " followed by a single
+  JSON object (no line breaks, so one search finds it):
+    {"v":"v7","sheet","row","runId","startedUtc","secondsTotal","providers":{
+       "SW":{"abbrev","status","attempts":[{"n","mode","result","sec"}],
+             "seconds","chars","column","reason"},
+       "ASDCF":{...same fields..., "extractor":"as_dcf_extractor v3"}}}
+  status is one of: ok | blocked (Cloudflare in every attempt) | error (the
+  scrape or webhook failed) | not_written (scraped, webhook did not write) |
+  skipped (no abbreviation). attempt result is: ok | blocked | error:<short>.
+  The line is built from facts the run already has; no scraping logic changed,
+  and building it can never raise (it is wrapped, a failure prints one warning).
+  The summary reaches the Drive log through gh_log_uploader like every other
+  line, so  grep RUN_SUMMARY  lists every run, one line each.
+
 VERSION 6
   Requested directly: Simply Wall St was blocked by Cloudflare in both
   browser modes on several recent runs (Rows 34 and 30), while the same row
@@ -575,6 +613,123 @@ def save_sw_diagnostics(sb, row_number, dialog_html, reason):
         print("⚠️ SW diagnostics themselves failed: {}".format(error))
 
 
+# ----------------------------------------------------------------------------
+# v8: step trace and standard failure report
+# ----------------------------------------------------------------------------
+_STEP_CTX = {"provider": "", "attempt": 0, "mode": "", "t0": 0.0, "n": 0, "last": ""}
+
+PAGE_REPORT_JS = r"""
+var norm = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
+var vis = function (el) {
+  var r = el.getClientRects();
+  if (!(r && r.length)) { return false; }
+  var st = window.getComputedStyle(el);
+  return st.visibility !== 'hidden' && st.display !== 'none';
+};
+var txt = function (el) { return norm(el.innerText !== undefined ? el.innerText : el.textContent); };
+var pat = new RegExp(__PATTERN__, 'i');
+var btns = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'));
+var links = Array.prototype.slice.call(document.querySelectorAll('a'));
+var visBtns = btns.filter(vis);
+var cands = [];
+Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], [role="tab"], [aria-label]')).forEach(function (el) {
+  if (cands.length >= 12) { return; }
+  var label = txt(el) + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
+  if (pat.test(label)) {
+    cands.push({ tag: el.tagName.toLowerCase(), text: txt(el).slice(0, 60), aria: (el.getAttribute('aria-label') || '').slice(0, 50),
+                 visible: vis(el), disabled: !!el.disabled, id: el.id || '', cls: norm(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className).slice(0, 60) });
+  }
+});
+var overlays = [];
+Array.prototype.slice.call(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [class*="modal"], [class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')).forEach(function (el) {
+  if (overlays.length >= 8 || !vis(el)) { return; }
+  overlays.push({ tag: el.tagName.toLowerCase(), cls: norm(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className).slice(0, 50), text: txt(el).slice(0, 120) });
+});
+var pw = false;
+Array.prototype.slice.call(document.querySelectorAll('input[type="password"]')).forEach(function (el) { if (vis(el)) { pw = true; } });
+return {
+  url: location.href, title: document.title, readyState: document.readyState,
+  scrollY: Math.round(window.scrollY || 0), scrollHeight: document.documentElement.scrollHeight || 0,
+  buttons: btns.length, links: links.length, visibleButtons: visBtns.length,
+  inputs: document.querySelectorAll('input, textarea, select').length,
+  candidates: cands,
+  buttonTexts: visBtns.slice(0, 30).map(function (b) { return (txt(b) || b.getAttribute('aria-label') || '(no text)').slice(0, 40); }),
+  overlays: overlays,
+  headings: Array.prototype.slice.call(document.querySelectorAll('h1, h2, h3')).filter(vis).slice(0, 8).map(function (h) { return txt(h).slice(0, 60); }),
+  passwordField: pw,
+  bodyStart: norm(document.body ? document.body.innerText : '').slice(0, 400)
+};
+"""
+
+
+def step_begin(provider, attempt, mode):
+    """Starts a new step trace for one browser launch."""
+    _STEP_CTX.update({"provider": provider, "attempt": attempt, "mode": mode,
+                      "t0": time.monotonic(), "n": 0, "last": ""})
+
+
+def step(name, status="OK", **details):
+    """Prints one numbered STEP line. Never raises."""
+    try:
+        _STEP_CTX["n"] += 1
+        _STEP_CTX["last"] = name
+        extra = "".join(" | {}={}".format(k, v) for k, v in details.items())
+        print("🔹 STEP {} a{}/{} | {:02d} {} | {}{} | +{:.1f}s".format(
+            _STEP_CTX["provider"], _STEP_CTX["attempt"], _STEP_CTX["mode"],
+            _STEP_CTX["n"], name, status, extra, time.monotonic() - _STEP_CTX["t0"]))
+    except Exception:
+        pass
+
+
+def failure_report(sb, step_name, reason, looking_for="."):
+    """
+    Prints the standard FAILURE REPORT block for the current provider. Read-only,
+    never raises. looking_for is a regular expression for the control the step
+    wanted (e.g. "^data$" or "calculation|model|dcf").
+    """
+    provider = _STEP_CTX.get("provider") or "?"
+
+    try:
+        step(step_name, "FAIL", reason=str(reason).replace("\n", " ")[:120])
+        print("🔬 FAILURE REPORT | {} | step={} | reason={}".format(
+            provider, step_name, str(reason).replace("\n", " ")[:200]))
+
+        info = run_js(sb, PAGE_REPORT_JS.replace("__PATTERN__", json.dumps(looking_for)))
+
+        if not isinstance(info, dict):
+            print("🔬   (the page returned no readable report)")
+            return
+
+        print("🔬   where: url={} | title={!r} | readyState={} | scrollY={} of {}".format(
+            info.get("url"), (info.get("title") or "")[:80], info.get("readyState"),
+            info.get("scrollY"), info.get("scrollHeight")))
+        print("🔬   counts: buttons={} (visible {}) | links={} | inputs={} | password field showing={}".format(
+            info.get("buttons"), info.get("visibleButtons"), info.get("links"),
+            info.get("inputs"), info.get("passwordField")))
+
+        candidates = info.get("candidates") or []
+        print("🔬   controls matching /{}/: {}".format(looking_for, len(candidates)))
+
+        for number, c in enumerate(candidates, 1):
+            print("🔬     {}. <{}> {!r} | aria={!r} | visible={} | disabled={} | id={!r} | class={!r}".format(
+                number, c.get("tag"), c.get("text"), c.get("aria"), c.get("visible"),
+                c.get("disabled"), c.get("id"), c.get("cls")))
+
+        print("🔬   visible button texts: {}".format(json.dumps(info.get("buttonTexts") or [], ensure_ascii=False)[:700]))
+
+        overlays = info.get("overlays") or []
+        if overlays:
+            print("🔬   overlays/dialogs/banners showing: {}".format(json.dumps(overlays, ensure_ascii=False)[:600]))
+        else:
+            print("🔬   overlays/dialogs/banners showing: none")
+
+        print("🔬   headings: {}".format(json.dumps(info.get("headings") or [], ensure_ascii=False)[:400]))
+        print("🔬   page text starts: {}".format((info.get("bodyStart") or "")[:400]))
+
+    except Exception as report_error:
+        print("⚠️ could not build the failure report: {}".format(report_error))
+
+
 def log_sw_page_state(sb):
     """Logs a one-line snapshot of the page's state. Never raises."""
     try:
@@ -755,8 +910,10 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
 
     sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
     sb.sleep(PAGE_SETTLE_SECONDS)
+    step("open_page", "OK", url=url)
 
     if not wait_past_challenge(sb, headless):
+        step("cloudflare_check", "FAIL", reason="challenge page still showing")
         log_sw_page_state(sb)
         save_sw_diagnostics(sb, row_number, None, "blocked by Cloudflare")
         raise CloudflareBlocked(
@@ -764,6 +921,8 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
                 CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"
             )
         )
+
+    step("cloudflare_check", "OK")
 
     try:
         sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
@@ -775,8 +934,14 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
 
     if not button_count:
         log_sw_page_state(sb)
+        failure_report(
+            sb, "find_data_button",
+            "no 'Data' button appeared within {}s".format(SW_DATA_BUTTON_TIMEOUT_SECONDS),
+            looking_for="^data$|toggle-data|\\bdata\\b")
         save_sw_diagnostics(sb, row_number, None, "no Data button")
         raise RuntimeError("no 'Data' button appeared on the page")
+
+    step("find_data_button", "OK", count=button_count)
 
     dialog = None
     last_title = None
@@ -784,6 +949,7 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
     for index in range(min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY)):
         how = click_data_button(sb, index)
         print("🖱️ Clicked 'Data' button #{} ({})".format(index, how))
+        step("click_data_button", "OK" if how else "FAIL", index=index, how=how)
 
         dialog = poll_for_dialog(sb)
 
@@ -798,8 +964,10 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
                     len(dialog.get("lines") or []),
                 )
             )
+            step("read_dialog", "OK", title=repr(last_title), sections=len(dialog.get("sections") or []))
             break
 
+        step("read_dialog", "FAIL", index=index, reason="no matching dialog opened")
         print("⏩ Button #{} opened no matching dialog; trying the next.".format(index))
 
         # Close whatever may have opened, so the next click is clean.
@@ -813,6 +981,11 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
         run_js(sb, SW_TAG_DATA_BUTTONS_JS)
 
     if not dialog:
+        failure_report(
+            sb, "read_dialog",
+            "no 'Share Price vs. Fair Value' dialog opened after {} 'Data' button(s)".format(
+                min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY)),
+            looking_for="^data$|fair value|valuation")
         save_sw_diagnostics(sb, row_number, None, "dialog never appeared")
         raise RuntimeError(
             "no 'Share Price vs. Fair Value' dialog opened after trying"
@@ -901,9 +1074,14 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         print("⚠️ could not set window size: {}".format(size_error))
 
     try:
+        step("run_extractor", "INFO", abbrev=abbrev_as)
         data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
+        step("extract_table", "OK", periods=len(data.get("periods") or []),
+             sections=len(data.get("sections") or []))
 
     except Exception as error:
+        failure_report(sb, "as_dcf_" + (str(error).split(":")[0].strip().lower() or "failed")[:40],
+                       str(error), looking_for="view calculation|full model|calculation|dcf")
         log_as_page_state(sb)
         save_as_diagnostics(sb, row_number, "scrape failed")
 
@@ -924,6 +1102,10 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
 # ----------------------------------------------------------------------------
 # Posting
 # ----------------------------------------------------------------------------
+# v7: facts about the last webhook post, read by run_bot's summary
+_LAST_POST = {}
+
+
 def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data):
     """
     POSTs one provider's JSON to the Apps Script webhook (the SAME Web App
@@ -949,6 +1131,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
         )
     except Exception as post_error:
         print("❌ {}: webhook POST itself failed: {}".format(label, post_error))
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "post_failed:" + type(post_error).__name__})
         return False
 
     reply_received_at = utc_clock_text()
@@ -968,6 +1151,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
             " webhook wrote the value -- check the sheet or Apps Script"
             " Executions before assuming it failed."
         )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "reply_unreadable"})
         return False
 
     if body.get("ok") and body.get("written"):
@@ -976,6 +1160,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
                 label, body.get("chars"), body.get("column")
             )
         )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": True, "chars": body.get("chars"), "column": body.get("column")})
         return True
 
     if body.get("ok"):
@@ -984,21 +1169,57 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
                 label, body.get("reason")
             )
         )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "not_written:" + str(body.get("reason"))})
         return False
 
     print("❌ {}: webhook refused/failed ({})".format(label, body.get("reason")))
+    _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "refused:" + str(body.get("reason"))})
     return False
+
+
+# ----------------------------------------------------------------------------
+# v7: one-line machine-readable run summary
+# ----------------------------------------------------------------------------
+def print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc):
+    """Prints "📋 RUN_SUMMARY {json}" -- one line, never raises."""
+    try:
+        providers_out = {}
+
+        for target, info in trace.items():
+            entry = dict(info)
+
+            if target == "ASDCF" and as_dcf_extractor is not None:
+                entry["extractor"] = getattr(as_dcf_extractor, "VERSION", "?")
+
+            providers_out[target] = entry
+
+        summary = {
+            "v": "v8",
+            "sheet": sheet_name,
+            "row": row_number,
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "startedUtc": run_started_utc,
+            "secondsTotal": round(time.monotonic() - run_started),
+            "providers": providers_out,
+        }
+        print("📋 RUN_SUMMARY " + json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+    except Exception as summary_error:
+        print("⚠️ could not build RUN_SUMMARY: {}".format(summary_error))
 
 
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v6 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v8 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
     sheet_name = os.environ["SHEET_NAME"]
+
+    run_started = time.monotonic()
+    run_started_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    trace = {}  # v7: per provider facts for the RUN_SUMMARY line
 
     # Every provider's abbreviation is OPTIONAL (default ''), exactly like
     # insider_score_scraper.py's abbrev_is / abbrev_as: a row may have any
@@ -1024,6 +1245,7 @@ def run_bot():
             "⏩ Row {}: no provider abbreviation was provided --"
             " nothing to scrape this run.".format(row_number)
         )
+        print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
         return
 
     modes_text = os.environ.get("LAUNCH_MODES", DEFAULT_LAUNCH_MODES)
@@ -1038,7 +1260,12 @@ def run_bot():
                     row_number, target
                 )
             )
+            trace[target] = {"abbrev": "", "status": "skipped", "attempts": []}
             continue
+
+        info = {"abbrev": abbrev, "status": "error", "attempts": []}
+        trace[target] = info
+        provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
         # block another from still being attempted and posted.
@@ -1063,14 +1290,26 @@ def run_bot():
                 browser_ready = False
                 print("🚀 {}: launching {} browser{}".format(
                     target, mode, "" if attempt == 1 else " (attempt {})".format(attempt)))
+                launch_clock = time.monotonic()
+                _LAST_POST.clear()
+                step_begin(target, attempt, mode)
 
                 try:
                     with SB(uc=True, headless=headless) as sb:
                         browser_ready = True
                         data = scrape(sb, abbrev, row_number, headless)
-                        post_provider_json(
+                        posted = post_provider_json(
                             webhook_url, target, row_number, abbrev, sheet_name, data
                         )
+                        step("post_to_sheet", "OK" if posted else "FAIL",
+                             chars=_LAST_POST.get("chars"), column=_LAST_POST.get("column"),
+                             reason=_LAST_POST.get("reason"))
+                    info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "ok" if posted else "not_written"
+                    for key in ("chars", "column", "reason"):
+                        if _LAST_POST.get(key) is not None:
+                            info[key] = _LAST_POST.get(key)
                     finished = True
                     break
 
@@ -1080,6 +1319,9 @@ def run_bot():
                             row_number, abbrev, target, mode, blocked
                         )
                     )
+                    info["attempts"].append({"n": attempt, "mode": mode, "result": "blocked",
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "blocked"
                     continue
 
                 except Exception as scrape_error:
@@ -1088,6 +1330,10 @@ def run_bot():
                             row_number, abbrev, target, mode, scrape_error
                         )
                     )
+                    info["attempts"].append({"n": attempt, "mode": mode,
+                                             "result": "error:" + str(scrape_error).replace("\n", " ")[:80],
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "error"
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
@@ -1103,6 +1349,9 @@ def run_bot():
                     target, CF_RETRY_BUDGET_SECONDS))
                 break
 
+        info["seconds"] = round(time.monotonic() - provider_clock)
+
+    print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
     print("🧹 Task complete!")
 
 
