@@ -35,7 +35,14 @@ Never raises, never changes the scraper's exit code, never prints the Web App
 URL, sends at most the last MAX_LINES lines. If the upload fails it prints one
 short line to the real stdout so the Actions page shows it.
 
-VERSION: gh_log_uploader v2
+VERSION: gh_log_uploader v3
+v3 -- IMMEDIATE SAVE (requested directly): the upload now carries saveNow=true,
+      so fn_60_03 v3 writes the Drive log file during the request (draining the
+      queue in the same write) instead of queueing the entry for later. The
+      upload is the last thing a run does, so waiting for the save delays
+      nothing. GH_LOG_SAVE_NOW=0 sends the old queue-only request. Against an
+      older fn_60_03 (v2) the extra field is ignored and the entry is queued
+      as before. The result line shows the new saveNow value.
 v2 -- the result line also shows queued=: since fn_60_03 v2 the Apps Script side
       normally QUEUES the entry (reply {ok:true, saved:false, queued:true}) and
       the Drive file is written a few minutes later. saved=False with
@@ -100,6 +107,8 @@ def _build_payload():
         "runId": os.environ.get("GITHUB_RUN_ID", "").strip(),
         "lines": lines,
     }
+    if os.environ.get("GH_LOG_SAVE_NOW", "1").strip() != "0":
+        payload["saveNow"] = True
 
     if row_number.isdigit():
         payload["rowNumber"] = int(row_number)
@@ -132,7 +141,7 @@ def _upload():
             reply = {}
 
         sys.__stdout__.write(
-            "[gh_log_uploader v2] log sent: ok={} saved={} queued={} lines={}\n".format(
+            "[gh_log_uploader v3] log sent: ok={} saved={} queued={} lines={}\n".format(
                 reply.get("ok"), reply.get("saved"), reply.get("queued"),
                 len(payload["lines"])
             )
@@ -142,7 +151,7 @@ def _upload():
     except Exception as error:
         try:
             sys.__stdout__.write(
-                "[gh_log_uploader v2] log upload failed: {}\n".format(
+                "[gh_log_uploader v3] log upload failed: {}\n".format(
                     type(error).__name__
                 )
             )
