@@ -32,6 +32,22 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 6
+  Requested directly: Simply Wall St was blocked by Cloudflare in both
+  browser modes on several recent runs (Rows 34 and 30), while the same row
+  can pass minutes later. A provider that is blocked in EVERY launch mode is
+  now retried with a fresh browser: up to CF_RETRY_ATTEMPTS attempts in total
+  (default 3, env override), with a random pause of CF_RETRY_WAIT_MIN..MAX
+  seconds between attempts, and never starting a new attempt once
+  CF_RETRY_BUDGET_SECONDS (default 330) have passed since the provider
+  started, so a run stays inside the workflow timeout (raised to 20 minutes
+  in provider_json_scraper.yml v3). Only a Cloudflare block is retried: any
+  other failure (page changed, button missing, webhook error) behaves exactly
+  as before and is NOT repeated. A success on any attempt stops the retries.
+  The SW and AlphaSpread scraping code itself is unchanged.
+  NOT VERIFIED LIVE: whether a retry actually passes a challenge that blocked
+  the earlier attempt (same-row pass/fail minutes apart suggests it often does).
+
 VERSION 5
   Second provider: AlphaSpread DCF (target "ASDCF"). New optional env var
   ABBREV_AS (e.g. "nasdaq/adsk"); when set, as_dcf_extractor.py (repo root,
@@ -144,6 +160,7 @@ VERSION 1 (NEW WORK)
 
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -170,6 +187,13 @@ except ImportError:
 # both real runs, so headed goes first). Override with the env var
 # LAUNCH_MODES, e.g. "headed" or "headless,headed".
 DEFAULT_LAUNCH_MODES = "headed,headless"
+
+# --- Cloudflare retry (v6) -------------------------------------------------
+# A provider blocked in EVERY launch mode is tried again with a fresh browser.
+DEFAULT_CF_RETRY_ATTEMPTS = 3        # total attempts (env CF_RETRY_ATTEMPTS)
+CF_RETRY_WAIT_MIN_SECONDS = 15       # random pause between attempts
+CF_RETRY_WAIT_MAX_SECONDS = 40
+CF_RETRY_BUDGET_SECONDS = 330        # no new attempt after this long per provider
 
 # Seconds to wait for a Cloudflare challenge to clear on its own.
 CF_CHALLENGE_WAIT_SECONDS = 45
@@ -970,7 +994,7 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v5 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v6 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1018,38 +1042,65 @@ def run_bot():
 
         # Each provider in its OWN try/except: one failing can never
         # block another from still being attempted and posted.
-        for mode in launch_modes:
-            headless = mode != "headed"
-            browser_ready = False
-            print("🚀 {}: launching {} browser".format(target, mode))
+        try:
+            attempts = max(1, int(os.environ.get("CF_RETRY_ATTEMPTS", DEFAULT_CF_RETRY_ATTEMPTS)))
+        except ValueError:
+            attempts = DEFAULT_CF_RETRY_ATTEMPTS
 
-            try:
-                with SB(uc=True, headless=headless) as sb:
-                    browser_ready = True
-                    data = scrape(sb, abbrev, row_number, headless)
-                    post_provider_json(
-                        webhook_url, target, row_number, abbrev, sheet_name, data
+        provider_started = time.monotonic()
+
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                pause = random.uniform(CF_RETRY_WAIT_MIN_SECONDS, CF_RETRY_WAIT_MAX_SECONDS)
+                print("🔁 {}: blocked by Cloudflare in every mode -- retry {}/{} after {:.0f}s".format(
+                    target, attempt, attempts, pause))
+                time.sleep(pause)
+
+            finished = False  # True = succeeded or failed for a non-Cloudflare reason: no retry
+
+            for mode in launch_modes:
+                headless = mode != "headed"
+                browser_ready = False
+                print("🚀 {}: launching {} browser{}".format(
+                    target, mode, "" if attempt == 1 else " (attempt {})".format(attempt)))
+
+                try:
+                    with SB(uc=True, headless=headless) as sb:
+                        browser_ready = True
+                        data = scrape(sb, abbrev, row_number, headless)
+                        post_provider_json(
+                            webhook_url, target, row_number, abbrev, sheet_name, data
+                        )
+                    finished = True
+                    break
+
+                except CloudflareBlocked as blocked:
+                    print(
+                        "🛑 Row {} ({}): {} blocked in {} mode: {}".format(
+                            row_number, abbrev, target, mode, blocked
+                        )
                     )
+                    continue
+
+                except Exception as scrape_error:
+                    print(
+                        "❌ Row {} ({}): {} scrape itself failed ({} mode): {}".format(
+                            row_number, abbrev, target, mode, scrape_error
+                        )
+                    )
+                    if not browser_ready:
+                        # The browser itself could not start (e.g. no display
+                        # for headed mode) -- try the next mode.
+                        continue
+                    finished = True
+                    break
+
+            if finished:
                 break
 
-            except CloudflareBlocked as blocked:
-                print(
-                    "🛑 Row {} ({}): {} blocked in {} mode: {}".format(
-                        row_number, abbrev, target, mode, blocked
-                    )
-                )
-                continue
-
-            except Exception as scrape_error:
-                print(
-                    "❌ Row {} ({}): {} scrape itself failed ({} mode): {}".format(
-                        row_number, abbrev, target, mode, scrape_error
-                    )
-                )
-                if not browser_ready:
-                    # The browser itself could not start (e.g. no display
-                    # for headed mode) -- try the next mode.
-                    continue
+            if time.monotonic() - provider_started >= CF_RETRY_BUDGET_SECONDS:
+                print("⏹️ {}: retry time budget ({}s) used up -- giving up on this provider.".format(
+                    target, CF_RETRY_BUDGET_SECONDS))
                 break
 
     print("🧹 Task complete!")
