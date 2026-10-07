@@ -32,6 +32,26 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 9
+  Requested directly ("optimize the process further"). Changes are based on
+  the real log of 19 Simply Wall St launches (Oct 7), not on guesses:
+    * headless was blocked 7 times out of 7 and never passed; headed passed
+      5 of 12 launches. So the default LAUNCH_MODES is now just "headed"
+      (override with env LAUNCH_MODES="headed,headless"). Each wasted headless
+      launch cost about 60 s.
+    * every Cloudflare challenge that cleared did so after 7.2-8.8 s, every other
+      one was still there at 45 s. CF_CHALLENGE_WAIT_SECONDS is now 25 (about 3x
+      the slowest observed clearing; env override CF_CHALLENGE_WAIT_SECONDS).
+    * the time saved is spent on more attempts: DEFAULT_CF_RETRY_ATTEMPTS 3 -> 5
+      (one headed launch each), pause 15-40 s -> 10-25 s, per-provider budget
+      330 s -> 400 s. At the observed ~42% chance per headed attempt, 3 attempts
+      succeed about 80% of the time, 5 attempts about 93%.
+    * the 4 identical "Tried uc_gui_click_captcha()" lines per blocked launch
+      are now one line with a count.
+  Expected effect per row: a blocked launch costs about 55 s instead of about
+  120 s (two modes of 45+ s each); a row that passes first time is unchanged.
+  NOT VERIFIED LIVE beyond the log statistics above (small sample).
+
 VERSION 8
   Requested directly: a much more detailed report in the log, so a failure says
   WHICH step failed and WHAT the page looked like ("button not found" plus the
@@ -224,17 +244,20 @@ except ImportError:
 # window, which Cloudflare challenges less often (headless was blocked in
 # both real runs, so headed goes first). Override with the env var
 # LAUNCH_MODES, e.g. "headed" or "headless,headed".
-DEFAULT_LAUNCH_MODES = "headed,headless"
+DEFAULT_LAUNCH_MODES = "headed"  # v9: headless was blocked 7/7 in the real log
 
 # --- Cloudflare retry (v6) -------------------------------------------------
 # A provider blocked in EVERY launch mode is tried again with a fresh browser.
-DEFAULT_CF_RETRY_ATTEMPTS = 3        # total attempts (env CF_RETRY_ATTEMPTS)
-CF_RETRY_WAIT_MIN_SECONDS = 15       # random pause between attempts
-CF_RETRY_WAIT_MAX_SECONDS = 40
-CF_RETRY_BUDGET_SECONDS = 330        # no new attempt after this long per provider
+DEFAULT_CF_RETRY_ATTEMPTS = 5        # total attempts (env CF_RETRY_ATTEMPTS)
+CF_RETRY_WAIT_MIN_SECONDS = 10       # random pause between attempts
+CF_RETRY_WAIT_MAX_SECONDS = 25
+CF_RETRY_BUDGET_SECONDS = 400        # no new attempt after this long per provider
 
 # Seconds to wait for a Cloudflare challenge to clear on its own.
-CF_CHALLENGE_WAIT_SECONDS = 45
+try:
+    CF_CHALLENGE_WAIT_SECONDS = int(os.environ.get("CF_CHALLENGE_WAIT_SECONDS", "25"))
+except ValueError:
+    CF_CHALLENGE_WAIT_SECONDS = 25  # v9: clearing took 7-9 s whenever it cleared
 
 # Seconds given to uc_open_with_reconnect (IS script uses 4).
 CF_RECONNECT_SECONDS = 6
@@ -779,11 +802,17 @@ def wait_past_challenge(sb, headless):
     print("🛡️ Cloudflare challenge detected -- waiting for it to clear...")
     started = time.monotonic()
     last_click_at = None
+    clicks = [0]
+
+    def clicks_note():
+        if clicks[0]:
+            print("🖱️ Tried uc_gui_click_captcha() x{}".format(clicks[0]))
 
     while time.monotonic() - started < CF_CHALLENGE_WAIT_SECONDS:
         sb.sleep(2)
 
         if not is_challenge_page(sb):
+            clicks_note()
             print(
                 "🛡️ Challenge cleared after {:.1f}s".format(
                     time.monotonic() - started
@@ -797,10 +826,11 @@ def wait_past_challenge(sb, headless):
                 last_click_at = now
                 try:
                     sb.uc_gui_click_captcha()
-                    print("🖱️ Tried uc_gui_click_captcha()")
+                    clicks[0] += 1
                 except Exception as click_error:
                     print("⚠️ uc_gui_click_captcha failed: {}".format(click_error))
 
+    clicks_note()
     return not is_challenge_page(sb)
 
 
@@ -1194,7 +1224,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v8",
+            "v": "v9",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1211,7 +1241,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v8 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v9 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
