@@ -51,7 +51,31 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v3
+VERSION: as_dcf_extractor v4
+v4 -- Requested directly (another AI chat that reads the stored "AS JSON" needed the
+      exact model assumptions). New key "assumptions" in the returned data, read
+      from the page's own "Model settings" rows and header with NO extra click
+      (the rows are normal page elements, visible text only):
+        settings          every row of the panel as {label: value}, e.g.
+                          {"Revenue Growth":"9.2%", "Net Margin":"9.5%→12%",
+                           "Cash Flow Conversion":"105%", "Forecast Period":"5 years",
+                           "Template":"via FCFE", "Discount Rate":"5.1%",
+                           "Exit Multiple":"1.1x P/S"}  (whatever labels the page has)
+        discountRate, exitMultiple, terminalMethod (the label of the terminal-value
+        row: "Exit Multiple", a Terminal/Perpetual growth label ...), cashFlowConversion,
+        forecastPeriod, revenueGrowth, netMargin, template ("FCFE", without "via ")
+        price ("109.45 USD") and marketCap ("$272.1B") from the page header,
+        dcfValuePerShare ("126.93 USD"), cards (the first assumption cards' text,
+        e.g. the growth path "9.8% -> 12.0%", 160 characters each)
+        sharesApprox (e.g. "2.49B") = marketCap / price, ONLY when both parse and the
+        currency symbol matches the currency code ($-USD, EUR, GBP); it is derived,
+        the page does not show shares outstanding. sharesApproxNote says so.
+      Also: header.template is filled from the settings row when the modal header
+      did not give one (UNH showed template None although the row exists).
+      Reading the assumptions can never fail a scrape: any problem is logged as a
+      warning and "assumptions" is then an empty object. Clicks are unchanged (only
+      "View Calculation" and "Full Model"). Tested with real JavaScript (jsdom) on
+      the saved page.
 v3 -- Requested directly. REAL CONFIRMED BUG in v1 and v2 (found by reading the
       saved page of a real run, Row 34, nyse/baba, headed browser): every
       browser-side script was sent as the text  "return " + <script>  and each
@@ -107,7 +131,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v3"
+VERSION = "as_dcf_extractor v4"
 PROBE_AFTER_SECONDS = 15
 MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
@@ -313,6 +337,33 @@ _LOGIN_JS = r"""
 })()
 """
 
+
+ASSUMPTIONS_JS = r"""
+(function () { /*ASSUMPTIONS*/
+  var norm = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
+  var txt = function (el) { return norm(el.innerText !== undefined ? el.innerText : el.textContent); };
+  var settings = {};
+  var order = [];
+  Array.prototype.slice.call(document.querySelectorAll('.dcf-model-setting-row')).forEach(function (row) {
+    var l = row.querySelector('.dcf-model-setting-row__label');
+    var v = row.querySelector('.dcf-model-setting-row__value');
+    if (!l || !v) { return; }
+    var key = norm(l.textContent);
+    if (key && !Object.prototype.hasOwnProperty.call(settings, key)) {
+      settings[key] = norm(v.textContent);
+      order.push(key);
+    }
+  });
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.dcf-model-assumption-card')).slice(0, 6)
+    .map(function (c) { return txt(c).slice(0, 160); });
+  var body = norm(document.body ? (document.body.innerText !== undefined ? document.body.innerText : document.body.textContent) : '');
+  var m;
+  var price = (m = /(?:^|\s)Price:\s*([\d.,]+)\s*([A-Z]{3})/.exec(body)) ? m[1] + ' ' + m[2] : null;
+  var cap = (m = /Market Cap:\s*(\S+)/.exec(body)) ? m[1] : null;
+  var dcf = (m = /DCF Value per Share\s*([\d.,]+)\s*([A-Z]{3})/.exec(body)) ? m[1] + ' ' + m[2] : null;
+  return { settings: settings, order: order, cards: cards, price: price, marketCap: cap, dcfValuePerShare: dcf };
+})()
+"""
 
 _SCROLL_JS = r"""
 (function () { /*SCROLL*/
@@ -535,6 +586,97 @@ def _scroll_step(sb):
         pass
 
 
+_SCALE = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}
+_SYMBOL_TO_CODE = {"$": "USD", "€": "EUR", "£": "GBP"}
+
+
+def _number(text):
+    """'272.1B' -> 2.721e11, '109.45' -> 109.45, '1,033' -> 1033.0; None when unreadable."""
+    match = re.match(r"^([\d.,]+)\s*([KMBT]?)$", str(text or "").strip())
+
+    if not match:
+        return None
+
+    try:
+        return float(match.group(1).replace(",", "")) * _SCALE.get(match.group(2), 1.0)
+    except ValueError:
+        return None
+
+
+def _format_big(value):
+    for suffix, scale in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if abs(value) >= scale:
+            return "{:.3g}{}".format(value / scale, suffix)
+
+    return "{:.3g}".format(value)
+
+
+def build_assumptions(raw):
+    """
+    Turns the ASSUMPTIONS_JS result into the "assumptions" dict (see the v4 note in
+    the module docstring). Pure function, never raises: returns {} for junk.
+    """
+    if not isinstance(raw, dict):
+        return {}
+
+    settings = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+    out = {"settings": settings}
+
+    def pick(*labels):
+        for label in labels:
+            for key, value in settings.items():
+                if key.strip().lower() == label:
+                    return value
+        return None
+
+    out["discountRate"] = pick("discount rate")
+    out["cashFlowConversion"] = pick("cash flow conversion")
+    out["forecastPeriod"] = pick("forecast period")
+    out["revenueGrowth"] = pick("revenue growth")
+    out["netMargin"] = pick("net margin")
+    out["exitMultiple"] = pick("exit multiple")
+
+    for key in settings:
+        if re.search(r"exit multiple|terminal|perpetual", key, re.I):
+            out["terminalMethod"] = key
+            break
+
+    template = pick("template")
+    out["template"] = re.sub(r"^via\s+", "", template, flags=re.I) if template else None
+
+    out["price"] = raw.get("price")
+    out["marketCap"] = raw.get("marketCap")
+    out["dcfValuePerShare"] = raw.get("dcfValuePerShare")
+    out["cards"] = [str(c)[:160] for c in (raw.get("cards") or [])[:6]]
+
+    # shares are not on the page: derive them only when the currencies clearly match
+    try:
+        price_match = re.match(r"^([\d.,]+)\s+([A-Z]{3})$", str(out["price"] or ""))
+        cap_match = re.match(r"^(\D*)([\d.,]+[KMBT]?)$", str(out["marketCap"] or ""))
+
+        if price_match and cap_match:
+            code = _SYMBOL_TO_CODE.get(cap_match.group(1).strip())
+            price = _number(price_match.group(1))
+            cap = _number(cap_match.group(2))
+
+            if code and code == price_match.group(2) and price and cap:
+                out["sharesApprox"] = _format_big(cap / price)
+                out["sharesApproxNote"] = "marketCap / price (derived; the page does not show shares outstanding)"
+    except Exception:
+        pass
+
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def read_assumptions(sb):
+    """Reads the model-settings panel. Never raises: {} and a warning on any problem."""
+    try:
+        return build_assumptions(_run_js(sb, ASSUMPTIONS_JS))
+    except Exception as error:
+        _log("WARNING: could not read the model assumptions (the table is unaffected): {}".format(error))
+        return {}
+
+
 def probe_page(sb, reason):
     """
     Prints what is on the page into the log (read-only, never clicks, never
@@ -676,13 +818,26 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
     if extracted.get("shapeProblems"):
         _log("WARNING: {} row(s) have a different number of cells than periods".format(extracted["shapeProblems"]))
 
+    assumptions = read_assumptions(sb)
+    header = extracted.get("header") or {}
+
+    if assumptions.get("template") and not header.get("template"):
+        header["template"] = assumptions["template"]
+
+    if assumptions:
+        _log("read {} model settings (discountRate={}, exitMultiple={}, cashFlowConversion={}, forecastPeriod={}, price={}, sharesApprox={})".format(
+            len(assumptions.get("settings") or {}), assumptions.get("discountRate"), assumptions.get("exitMultiple"),
+            assumptions.get("cashFlowConversion"), assumptions.get("forecastPeriod"), assumptions.get("price"),
+            assumptions.get("sharesApprox")))
+
     data = {
         "source": "alphaspread",
         "page": "dcf-valuation",
         "url": url,
         "abbrevAS": abbrev,
         "scrapedAtUtc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "header": extracted.get("header") or {},
+        "header": header,
+        "assumptions": assumptions,
         "periods": periods,
         "sections": sections,
         "selectedRowKey": extracted.get("selectedRowKey") or "",
