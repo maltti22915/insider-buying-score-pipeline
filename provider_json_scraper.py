@@ -333,7 +333,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "SWP": "abbrevSW"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -1043,23 +1043,13 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
     if len(valuation_html) >= SW_PAGE_MIN_CHARS:
         _SW_PAGES["valuation"] = valuation_html
     step("page_valuation", "OK" if "valuation" in _SW_PAGES else "FAIL", chars=len(valuation_html))
-    for sub_name in SW_SUBPAGES:
-        sub_html = fetch_sw_subpage(sb, abbrev_sw, sub_name, headless)
-        if sub_html:
-            _SW_PAGES[sub_name] = sub_html
-    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
-    sb.sleep(PAGE_SETTLE_SECONDS)
-    wait_past_challenge(sb, headless)
-    try:
-        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
-    except Exception:
-        pass
-    button_count = wait_for_data_buttons(sb)
-    if not button_count:
-        failure_report(sb, "find_data_button", "no 'Data' button after reopening the valuation page",
-                       looking_for="^data$|toggle-data|\\bdata\\b")
-        save_sw_diagnostics(sb, row_number, None, "no Data button (reopen)")
-        raise RuntimeError("no 'Data' button appeared after reopening the valuation page")
+    def fetch_sw_subpages_now():
+        # v14: future and dividend are opened AFTER the dialog attempt (success or failure), so
+        # the valuation page is never reloaded before the "Data" dialog (a reload once lost the buttons).
+        for sub_name in SW_SUBPAGES:
+            sub_html = fetch_sw_subpage(sb, abbrev_sw, sub_name, headless)
+            if sub_html:
+                _SW_PAGES[sub_name] = sub_html
 
     dialog = None
     last_title = None
@@ -1105,6 +1095,7 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
                 min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY)),
             looking_for="^data$|fair value|valuation")
         save_sw_diagnostics(sb, row_number, None, "dialog never appeared")
+        fetch_sw_subpages_now()
         raise RuntimeError(
             "no 'Share Price vs. Fair Value' dialog opened after trying"
             " {} 'Data' button(s)".format(min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY))
@@ -1112,6 +1103,8 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
 
     if SAVE_DIAGNOSTICS_ALWAYS:
         save_sw_diagnostics(sb, row_number, dialog.get("html"), "always-on")
+
+    fetch_sw_subpages_now()
 
     data = {
         "source": "simplywall.st",
@@ -1205,6 +1198,75 @@ def scrape_ms_data(sb, abbrev_ms, row_number, headless=True):
         raise RuntimeError("MarketScreener page looks incomplete ({} chars, title {!r})".format(len(html), title[:60]))
     step("read_page", "OK", chars=len(html), title=title[:60])
     return {"html": html, "url": url, "title": title, "htmlChars": len(html)}
+
+
+# ----------------------------------------------------------------------------
+# v14: GuruFocus term pages (replace Scrape.do) -- posted as target "GFP"
+# ----------------------------------------------------------------------------
+GF_PAGES = (
+    ("pe", "term/pettm/"),
+    ("peForward", "term/forward-pe-ratio/"),
+    ("buyback", "term/buyback-yield/"),
+    ("roce", "term/ROCE/"),
+    ("roe", "term/ROE/"),
+    ("pfcf", "term/price-to-free-cash-flow/"),
+    ("pocf", "term/price-to-operating-cash-flow/"),
+    ("gfValue", "term/gf_value/"),
+    ("gfScore", "term/gf_score/"),
+    ("netMargin", "term/netmargin/"),
+    ("revenue", "term/Revenue/"),
+    ("moat", "term/moat-score/"),
+)
+GF_PAGE_MIN_CHARS = 1500
+
+
+def text_only_page(html):
+    """Title + visible text only (the Apps Script GF parser reads nothing else); keeps the post small."""
+    html = html or ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.S | re.I)
+    title = title_match.group(1).strip() if title_match else ""
+    body = slim_html(html)
+    body = re.sub(r"<title[^>]*>.*?</title>", " ", body, flags=re.S | re.I)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return "<html><head><title>{}</title></head><body>{}</body></html>".format(title, body)
+
+
+def scrape_gf_data(sb, abbrev_gf, row_number, headless=True):
+    """
+    v14: opens each GuruFocus term page for abbrev_gf in the same browser session and returns
+    {"pages": {subpage: html}}. Parsing happens in Apps Script (fn_22_30, target GF).
+    A Cloudflare block on the FIRST page raises CloudflareBlocked (retried by run_bot);
+    a later page that fails is just left out.
+    """
+    pages = {}
+    for index, (name, path) in enumerate(GF_PAGES):
+        url = "https://www.gurufocus.com/{}{}".format(path, abbrev_gf)
+        print("🌐 Navigating to: {}".format(url))
+        try:
+            sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(PAGE_SETTLE_SECONDS)
+            if not wait_past_challenge(sb, headless):
+                step("page_" + name, "FAIL", reason="challenge page still showing")
+                if index == 0:
+                    raise CloudflareBlocked("GuruFocus page is still a challenge ({} browser)".format(
+                        "headless" if headless else "headed"))
+                continue
+            sb.sleep(2)
+            html = text_only_page(sb.get_page_source() or "")
+            ok = len(html) >= GF_PAGE_MIN_CHARS
+            step("page_" + name, "OK" if ok else "FAIL", chars=len(html))
+            if ok:
+                pages[name] = html
+        except CloudflareBlocked:
+            raise
+        except Exception as page_error:
+            print("⚠️ GF {} page failed: {}".format(name, page_error))
+            step("page_" + name, "FAIL", reason=str(page_error).replace("\n", " ")[:80])
+    if not pages:
+        raise RuntimeError("no GuruFocus page could be read")
+    print("📄 GF pages collected: {}".format(", ".join(sorted(pages.keys()))))
+    return {"pages": pages}
 
 
 def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
@@ -1389,7 +1451,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v11",
+            "v": "v14",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1426,7 +1488,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v13 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v14 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1442,11 +1504,11 @@ def run_bot():
     abbrev_sw = os.environ.get("ABBREV_SW", "").strip()
     abbrev_as = os.environ.get("ABBREV_AS", "").strip()  # v5
     abbrev_ms = os.environ.get("ABBREV_MS", "").strip()  # v11
-    # Future: abbrev_gf = os.environ.get("ABBREV_GF", "").strip()
+    abbrev_gf = os.environ.get("ABBREV_GF", "").strip()  # v14
 
     print(
-        "🎯 Sheet={} | Row={} | SW={} | AS={} | MS={}".format(
-            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)", abbrev_ms or "(none)"
+        "🎯 Sheet={} | Row={} | SW={} | AS={} | MS={} | GF={}".format(
+            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)", abbrev_ms or "(none)", abbrev_gf or "(none)"
         )
     )
 
@@ -1455,6 +1517,7 @@ def run_bot():
         ("SW", abbrev_sw, scrape_sw_data),
         ("ASDCF", abbrev_as, scrape_as_dcf),
         ("MS", abbrev_ms, scrape_ms_data),
+        ("GFP", abbrev_gf, scrape_gf_data),  # v14: trace/summary key GFP, webhook target GFP
     ]
 
     if not any(abbrev for _, abbrev, _ in providers):
