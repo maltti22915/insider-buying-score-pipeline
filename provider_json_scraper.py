@@ -32,6 +32,19 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 11
+  Requested directly: get MarketScreener (MS) data through GitHub instead of
+  Scrape.do. A probe (ms_probe.py) showed a headed browser loads the MS page in
+  about 7 s with the price and consensus blocks present, and fn_22_30's MS parser
+  extracts every field from that HTML. New third provider "MS" (env ABBREV_MS,
+  workflow input abbrev_ms): scrape_ms_data opens
+  https://www.marketscreener.com/quote/stock/<abbrevMS>/, waits for any
+  challenge to clear and posts the page HTML as data.html (target "MS", payload key
+  abbrevMS) to the same webhook; Apps Script (fn_91_04) parses it with fn_22_30.
+  Uses the same Cloudflare retry, step log, RUN_SUMMARY and re-post logic as SW.
+  The Apps Script side starts in SHADOW mode (compares, writes nothing).
+  NOT VERIFIED LIVE.
+
 VERSION 10
   Requested directly ("fix first"). Log 84 had 3 unreadable webhook replies in
   13 runs (Rows 10 SW/AS: HTTP 200 text/html; Row 36 SW: HTTP 404 text/html)
@@ -1095,6 +1108,40 @@ def log_as_page_state(sb):
         print("⚠️ AS page-state probe failed: {}".format(info_error))
 
 
+MS_MIN_HTML_CHARS = 30000
+
+
+def scrape_ms_data(sb, abbrev_ms, row_number, headless=True):
+    """
+    v11: opens the MarketScreener quote page for abbrev_ms, waits for any
+    challenge to clear and returns {"html", "url", "title", "htmlChars"}.
+    The parsing happens in Apps Script (fn_22_30, target MS), not here.
+    """
+    url = "https://www.marketscreener.com/quote/stock/{}/".format(abbrev_ms)
+    print("🌐 Navigating to: {}".format(url))
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    step("open_page", "OK", url=url)
+
+    if not wait_past_challenge(sb, headless):
+        step("challenge_check", "FAIL", reason="challenge page still showing")
+        raise CloudflareBlocked(
+            "MarketScreener page is still a challenge after {}s ({} browser)".format(
+                CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"))
+    step("challenge_check", "OK")
+
+    html = sb.get_page_source() or ""
+    title = sb.get_title() or ""
+    if len(html) < MS_MIN_HTML_CHARS or not any(
+            m in html for m in ("Last Close", "Consensus", "Capitalization")):
+        step("read_page", "FAIL", chars=len(html), title=title[:60])
+        failure_report(sb, "read_page", "page too small or without price/consensus blocks ({} chars)".format(len(html)),
+                       looking_for="Last Close|Consensus|Capitalization")
+        raise RuntimeError("MarketScreener page looks incomplete ({} chars, title {!r})".format(len(html), title[:60]))
+    step("read_page", "OK", chars=len(html), title=title[:60])
+    return {"html": html, "url": url, "title": title, "htmlChars": len(html)}
+
+
 def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
     """
     Opens AlphaSpread's DCF page for abbrev_as, opens View Calculation ->
@@ -1223,6 +1270,12 @@ def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name
         _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "reply_unreadable"})
         return False
 
+    if body.get("ok") and body.get("shadow"):
+        # v11: MS shadow mode -- the webhook parsed and compared, wrote nothing, on purpose.
+        print("✅ {}: parsed in SHADOW mode (nothing written): {}".format(label, json.dumps(body.get("summary"), ensure_ascii=False)[:400]))
+        _LAST_POST.clear(); _LAST_POST.update({"ok": True, "chars": body.get("chars"), "column": "shadow"})
+        return True
+
     if body.get("ok") and body.get("written"):
         print(
             "✅ {}: JSON written ({} chars, column {})".format(
@@ -1263,7 +1316,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v10",
+            "v": "v11",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1280,7 +1333,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 # Entry point
 # ----------------------------------------------------------------------------
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v10 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v11 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1295,11 +1348,12 @@ def run_bot():
     # subset of them, and an empty one just skips that provider.
     abbrev_sw = os.environ.get("ABBREV_SW", "").strip()
     abbrev_as = os.environ.get("ABBREV_AS", "").strip()  # v5
+    abbrev_ms = os.environ.get("ABBREV_MS", "").strip()  # v11
     # Future: abbrev_gf = os.environ.get("ABBREV_GF", "").strip()
 
     print(
-        "🎯 Sheet={} | Row={} | SW={} | AS={}".format(
-            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)"
+        "🎯 Sheet={} | Row={} | SW={} | AS={} | MS={}".format(
+            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)", abbrev_ms or "(none)"
         )
     )
 
@@ -1307,6 +1361,7 @@ def run_bot():
     providers = [
         ("SW", abbrev_sw, scrape_sw_data),
         ("ASDCF", abbrev_as, scrape_as_dcf),
+        ("MS", abbrev_ms, scrape_ms_data),
     ]
 
     if not any(abbrev for _, abbrev, _ in providers):
