@@ -333,7 +333,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "SWP": "abbrevSW"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -948,6 +948,45 @@ def poll_for_dialog(sb):
     return last if (last and last.get("found")) else None
 
 
+
+# ----------------------------------------------------------------------------
+# v13: Simply Wall St future / dividend / valuation pages (replace Scrape.do)
+# ----------------------------------------------------------------------------
+_SW_PAGES = {}
+SW_PAGE_MIN_CHARS = 20000
+SW_SUBPAGES = ("future", "dividend")
+
+
+def slim_html(html):
+    """Drops script/style/noscript/svg blocks: the Apps Script parser only reads the text."""
+    html = re.sub(r"<script\b[^>]*>.*?</script>", " ", html or "", flags=re.S | re.I)
+    html = re.sub(r"<style\b[^>]*>.*?</style>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<noscript\b[^>]*>.*?</noscript>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<svg\b[^>]*>.*?</svg>", " ", html, flags=re.S | re.I)
+    return html
+
+
+def fetch_sw_subpage(sb, abbrev_sw, name, headless):
+    """Opens https://simplywall.st/stocks/<abbrev>/<name> and returns its slimmed HTML ('' on failure)."""
+    url = "https://simplywall.st/stocks/{}/{}".format(abbrev_sw, name)
+    try:
+        print("🌐 Navigating to: {}".format(url))
+        sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+        sb.sleep(PAGE_SETTLE_SECONDS)
+        if not wait_past_challenge(sb, headless):
+            step("page_" + name, "FAIL", reason="challenge page still showing")
+            return ""
+        sb.sleep(2)
+        html = slim_html(sb.get_page_source() or "")
+        ok = len(html) >= SW_PAGE_MIN_CHARS
+        step("page_" + name, "OK" if ok else "FAIL", chars=len(html))
+        return html if ok else ""
+    except Exception as page_error:
+        print("⚠️ SW {} page failed: {}".format(name, page_error))
+        step("page_" + name, "FAIL", reason=str(page_error).replace("\n", " ")[:80])
+        return ""
+
+
 def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
     """
     Opens the Simply Wall St valuation page for abbrev_sw, clicks the
@@ -995,6 +1034,32 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
         raise RuntimeError("no 'Data' button appeared on the page")
 
     step("find_data_button", "OK", count=button_count)
+
+    # v13: the three pages the Apps Script SW parser reads. The valuation page is the one open
+    # right now (taken before any dialog is opened); future and dividend are opened afterwards
+    # and the valuation page is then opened again for the "Data" dialog.
+    _SW_PAGES.clear()
+    valuation_html = slim_html(sb.get_page_source() or "")
+    if len(valuation_html) >= SW_PAGE_MIN_CHARS:
+        _SW_PAGES["valuation"] = valuation_html
+    step("page_valuation", "OK" if "valuation" in _SW_PAGES else "FAIL", chars=len(valuation_html))
+    for sub_name in SW_SUBPAGES:
+        sub_html = fetch_sw_subpage(sb, abbrev_sw, sub_name, headless)
+        if sub_html:
+            _SW_PAGES[sub_name] = sub_html
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    wait_past_challenge(sb, headless)
+    try:
+        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    except Exception:
+        pass
+    button_count = wait_for_data_buttons(sb)
+    if not button_count:
+        failure_report(sb, "find_data_button", "no 'Data' button after reopening the valuation page",
+                       looking_for="^data$|toggle-data|\\bdata\\b")
+        save_sw_diagnostics(sb, row_number, None, "no Data button (reopen)")
+        raise RuntimeError("no 'Data' button appeared after reopening the valuation page")
 
     dialog = None
     last_title = None
@@ -1196,8 +1261,9 @@ _LAST_POST = {}
 # v10: an unreadable reply (Google HTML error page although Apps Script
 # succeeded) or a failed/timed-out POST is retried: the write goes to a fixed
 # cell, so posting the same payload again only overwrites it with the same value.
-POST_UNREADABLE_RETRIES = int(os.environ.get("POST_UNREADABLE_RETRIES", "2"))
+POST_UNREADABLE_RETRIES = int(os.environ.get("POST_UNREADABLE_RETRIES", "5"))
 POST_RETRY_PAUSE_SECONDS = 6
+POST_LOCK_RETRY_PAUSE_SECONDS = 20  # v12: base pause after LOCK_TIMEOUT (plus jitter)
 
 
 def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data):
@@ -1210,14 +1276,21 @@ def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data
     for post_try in range(1, POST_UNREADABLE_RETRIES + 2):
         posted = _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name, data)
         reason = str(_LAST_POST.get("reason") or "")
-        if posted or not (reason == "reply_unreadable" or reason.startswith("post_failed")):
+        # v12: a LOCK_TIMEOUT refusal (another row held the document lock for 60 s
+        # while several rows ran at once) wrote nothing, so re-posting is safe.
+        retryable = (reason == "reply_unreadable" or reason.startswith("post_failed")
+                     or reason == "refused:LOCK_TIMEOUT")
+        if posted or not retryable:
             if posted and post_try > 1:
                 print("   (v10) confirmed on post try {}".format(post_try))
             return posted
         if post_try <= POST_UNREADABLE_RETRIES:
             print("🔁 Row {} {}: reply unreadable/POST failed ({}) -- re-posting the same payload in {} s (try {} of {})".format(
                 row_number, target, reason, POST_RETRY_PAUSE_SECONDS, post_try + 1, POST_UNREADABLE_RETRIES + 1))
-            time.sleep(POST_RETRY_PAUSE_SECONDS)
+            if reason == "refused:LOCK_TIMEOUT":
+                time.sleep(POST_LOCK_RETRY_PAUSE_SECONDS + random.uniform(0, 25))
+            else:
+                time.sleep(POST_RETRY_PAUSE_SECONDS)
     _LAST_POST["reason"] = reason + "_after_retries"
     return posted
 
@@ -1332,8 +1405,28 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
+def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v13: posts the collected SW pages (target SWP) once; never touches the SW JSON result."""
+    if not _SW_PAGES:
+        return
+    pages = dict(_SW_PAGES)
+    _SW_PAGES.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "SWP", row_number, abbrev, sheet_name, {"pages": pages})
+        info["pages"] = {"posted": bool(posted), "got": sorted(pages.keys()),
+                         "reason": None if posted else _LAST_POST.get("reason"),
+                         "column": _LAST_POST.get("column")}
+    except Exception as pages_error:
+        print("❌ SW pages post failed: {}".format(pages_error))
+        info["pages"] = {"posted": False, "got": sorted(pages.keys()), "reason": str(pages_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v11 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v13 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1389,6 +1482,8 @@ def run_bot():
 
         info = {"abbrev": abbrev, "status": "error", "attempts": []}
         trace[target] = info
+        if target == "SW":
+            _SW_PAGES.clear()
         provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
@@ -1428,6 +1523,8 @@ def run_bot():
                         step("post_to_sheet", "OK" if posted else "FAIL",
                              chars=_LAST_POST.get("chars"), column=_LAST_POST.get("column"),
                              reason=_LAST_POST.get("reason"))
+                        if target == "SW":
+                            post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "ok" if posted else "not_written"
@@ -1446,6 +1543,8 @@ def run_bot():
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "blocked",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "blocked"
+                    if target == "SW":
+                        post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     continue
 
                 except Exception as scrape_error:
@@ -1458,6 +1557,8 @@ def run_bot():
                                              "result": "error:" + str(scrape_error).replace("\n", " ")[:80],
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "error"
+                    if target == "SW":
+                        post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
