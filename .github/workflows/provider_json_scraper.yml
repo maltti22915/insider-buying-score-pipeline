@@ -10,7 +10,11 @@
 # (Insider Buying Score + AlphaSpread), so this new functionality can be
 # tested on its own and can never affect that already-working chain.
 #
-# VERSION 5: new optional input abbrev_gf (GuruFocus) and env ABBREV_GF for provider_json_scraper.py v14.
+# VERSION 7: new optional input as_quality ("1" = read the AlphaSpread statement pages, "0" = skip them); env AS_QUALITY for provider_json_scraper.py v18. Sent by fn_24_73 v5.
+#
+# VERSION 6: env SCRAPE_DO_TOKEN from the repository secret SCRAPE_DO_TOKEN (GuruFocus pages are fetched through Scrape.do, provider_json_scraper.py v16).
+#
+# VERSION 5: new optional input abbrev_gf (GuruFocus) and env ABBREV_GF for provider_json_scraper.py v14/v15.
 #
 # VERSION 4: new optional input abbrev_ms (MarketScreener) and env ABBREV_MS for
 # provider_json_scraper.py v11. Nothing else changed.
@@ -79,6 +83,11 @@ name: Provider JSON Scraper
         required: false
         type: string
         default: ''
+      as_quality:
+        description: "1 = read the AlphaSpread statement pages for the quality metrics, 0 = skip them"
+        required: false
+        default: "1"
+        type: string
 
 jobs:
   scrape-provider-json:
@@ -109,6 +118,8 @@ jobs:
           ABBREV_AS: ${{ inputs.abbrev_as }}
           ABBREV_MS: ${{ inputs.abbrev_ms }}
           ABBREV_GF: ${{ inputs.abbrev_gf }}
+          AS_QUALITY: ${{ inputs.as_quality }}
+          SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
         run: python provider_json_scraper.py
 
       - name: Upload diagnostics
