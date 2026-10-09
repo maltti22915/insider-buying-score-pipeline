@@ -1,40 +1,29 @@
-# gf_probe.yml v1 -- manual test: which route gets GuruFocus past Cloudflare?
+# gf_probe.yml v2 -- manual test: do other GitHub runner types get GuruFocus past Cloudflare?
 name: GF Probe
 on:
   workflow_dispatch:
     inputs:
       abbrev_gf:
-        description: "GuruFocus ticker path, e.g. NOW or NAS:ADSK"
+        description: "GuruFocus ticker path, e.g. NOW"
         default: "NOW"
 jobs:
-  direct:
-    runs-on: ubuntu-latest
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - uses: actions/checkout@v4
-      - run: pip install curl_cffi seleniumbase && sudo apt-get install -y xvfb
-      - run: xvfb-run -a python gf_probe.py
-        env: { ABBREV_GF: "${{ inputs.abbrev_gf }}", PROBE_LABEL: direct }
-  warp:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - uses: actions/checkout@v4
-      - name: Install Cloudflare WARP (SOCKS5 proxy mode, runner network untouched)
+      - name: Show the runner's public IP
+        run: curl -s https://ipinfo.io/json | head -20 || true
+      - run: pip install curl_cffi seleniumbase
+      - name: Probe (Linux needs a virtual display)
+        env: { ABBREV_GF: "${{ inputs.abbrev_gf }}", PROBE_LABEL: "${{ matrix.os }}" }
         run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp xvfb
-          sudo systemctl start warp-svc || (sudo warp-svc > /tmp/warp-svc.log 2>&1 &)
-          sleep 5
-          warp-cli --accept-tos registration new
-          warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos connect
-          sleep 8
-          warp-cli --accept-tos status
-          curl -s --proxy socks5h://127.0.0.1:40000 https://www.cloudflare.com/cdn-cgi/trace | head -12
-      - run: pip install curl_cffi seleniumbase pysocks
-      - run: xvfb-run -a python gf_probe.py
-        env: { ABBREV_GF: "${{ inputs.abbrev_gf }}", PROBE_LABEL: warp, PROBE_PROXY: "socks5://127.0.0.1:40000" }
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get install -y xvfb >/dev/null; xvfb-run -a python gf_probe.py; else python gf_probe.py; fi
