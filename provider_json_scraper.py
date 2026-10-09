@@ -1500,11 +1500,6 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
     except Exception as size_error:
         print("⚠️ could not set window size: {}".format(size_error))
 
-    if os.environ.get("AS_RATIOS", "1") != "0":
-        fetch_as_ratios(sb, abbrev_as)  # v17: before the DCF, so a DCF failure still keeps them
-    if os.environ.get("AS_QUALITY", "1") != "0":
-        fetch_as_quality(sb, abbrev_as)  # v18: structural quality metrics, also before the DCF
-
     try:
         step("run_extractor", "INFO", abbrev=abbrev_as)
         data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
@@ -1524,6 +1519,15 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
             )
 
         raise
+
+    finally:
+        # v19: the DCF goes FIRST (AlphaSpread showed a login wall on the DCF
+        # modal when 7 other pages had been opened before it). Ratios and
+        # quality run afterwards, also when the DCF failed, so they are kept.
+        if os.environ.get("AS_RATIOS", "1") != "0":
+            fetch_as_ratios(sb, abbrev_as)
+        if os.environ.get("AS_QUALITY", "1") != "0":
+            fetch_as_quality(sb, abbrev_as)
 
     if SAVE_DIAGNOSTICS_ALWAYS:
         save_as_diagnostics(sb, row_number, "always-on")
@@ -1669,7 +1673,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v18",
+            "v": "v19",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1706,7 +1710,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v18 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v19 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
