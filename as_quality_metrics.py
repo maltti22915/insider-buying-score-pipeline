@@ -1,8 +1,9 @@
 """
-as_quality_metrics.py v3 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
+as_quality_metrics.py v4 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
 
   Q1 ROIC 3Y average      profitability page text ("3Y Average ROIC"); falls back to the computed value
   Q2 Worst-year ROIC      second-lowest yearly ROIC of the last 5 FY (ROIC_MIN_RANK = 2; 1 = the very worst), computed from the statements
+                          and scaled so the last-3-year average equals the page value (v4, ROIC_CALIBRATE_TO_PAGE)
   Q6 Cash conversion      sum(cash from operations) / sum(net income), last 5 FY (both from the cash-flow page)
   Q8 Net debt / EBITDA    latest FY; EBITDA = operating income + D&A (cash-flow page)
   Q10 FCF-positive years  of the last 5 FY (FCF = cash from operations - |capex|)
@@ -23,6 +24,7 @@ from html.parser import HTMLParser
 
 STRIP_LONG_TERM_INVESTMENTS = False
 ROIC_SUBTRACT_CASH = False   # v2: same basis as AlphaSpread's own ROIC (see docstring)
+ROIC_CALIBRATE_TO_PAGE = True  # v4: scale the computed ROIC series so its last-3-year average equals the page value
 ROIC_MIN_RANK = 2            # v3: 1 = worst year of the last 5, 2 = second-worst (robust to one shock year such as COVID); chosen by the user
 TAX_MIN, TAX_MAX, TAX_DEFAULT = 0.15, 0.30, 0.21
 SHARE_JUMP_LIMIT = 0.30
@@ -216,7 +218,6 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     diag["roic_by_year"] = {y: round(v, 1) for y, v in roic_by_year.items()}
     diag["roic_by_year_net_of_cash"] = {y: round(v, 1) for y, v in roic_net_cash.items()}
     window = [roic_by_year[y] for y in last5 if y in roic_by_year]
-    roic_min5 = sorted(window)[ROIC_MIN_RANK - 1] if len(window) >= max(3, ROIC_MIN_RANK + 1) else None
     last3 = [roic_by_year[y] for y in last5[-3:] if y in roic_by_year]
     roic3_computed = sum(last3) / len(last3) if len(last3) == 3 else None
     diag["roic3y_computed"] = None if roic3_computed is None else round(roic3_computed, 1)
@@ -225,6 +226,18 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     diag["roic3y_page_note"] = note
     roic3y = roic3_page if roic3_page is not None else roic3_computed
     diag["roic3y_source"] = "page" if roic3_page is not None else ("computed" if roic3_computed is not None else None)
+
+    # v4: calibrate the computed yearly series to the page's 3Y average, so that Q2 (worst year) sits on the same
+    # basis as Q1. Without it Q2 could exceed Q1 (Autodesk: page 15.0, computed worst year 20.7). The factor is
+    # skipped when either average is <= 0 (a ratio of such values is meaningless) and clamped to 0.3 - 3.
+    roic_scale = None
+    if ROIC_CALIBRATE_TO_PAGE and roic3_page is not None and roic3_computed is not None \
+            and roic3_page > 0 and roic3_computed > 0:
+        roic_scale = min(3.0, max(0.3, roic3_page / roic3_computed))
+        window = [v * roic_scale for v in window]
+    diag["roic_scale"] = None if roic_scale is None else round(roic_scale, 3)
+    diag["roic_by_year_calibrated"] = None if roic_scale is None else {y: round(v * roic_scale, 1) for y, v in roic_by_year.items()}
+    roic_min5 = sorted(window)[ROIC_MIN_RANK - 1] if len(window) >= max(3, ROIC_MIN_RANK + 1) else None
 
     # --- cash conversion (cash-flow page only: same consolidated net income as CFO starts from)
     cfo = [_g(cfs, "Cash from Operating Activities", y) for y in last5]
