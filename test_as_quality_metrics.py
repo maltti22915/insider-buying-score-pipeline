@@ -35,9 +35,10 @@ cfs = table({"Net Income": [80e9] * n, "Depreciation & Amortization": [50e9] * n
 prof = "<div>8% Low 3Y Average ROIC</div><div>Low ROIC 3%</div>"
 r = q.compute_metrics(prof, inc, bal, cfs)
 m = r["metrics"]
-# tax 20%; NOPAT 80B; IC = 350 + 200 - 50 = 500 -> ROIC 16%
-assert abs(r["diagnostics"]["roic_by_year"][2026] - 16.0) < 0.1, r["diagnostics"]
-assert abs(m["roic_min5"] - 16.0) < 0.1
+# tax 20%; NOPAT 80B; IC (cash not netted) = 350 + 200 = 550 -> 14.5%; net of cash = 500 -> 16%
+assert abs(r["diagnostics"]["roic_by_year"][2026] - 14.5) < 0.1, r["diagnostics"]
+assert abs(r["diagnostics"]["roic_by_year_net_of_cash"][2026] - 16.0) < 0.1
+assert abs(m["roic_min5"] - 14.5) < 0.1
 assert m["roic3y"] == 8.0 and r["diagnostics"]["roic3y_source"] == "page", r["diagnostics"]["roic3y_page_note"]
 assert abs(m["cfo_ni"] - 1.5) < 1e-6
 assert abs(m["nd_ebitda"] - (150 / 150)) < 1e-6          # net debt 150B, EBITDA 150B
