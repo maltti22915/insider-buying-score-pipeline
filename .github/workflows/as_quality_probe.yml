@@ -5,7 +5,7 @@ on:
     inputs:
       as_path:
         description: "AlphaSpread exchange/ticker, e.g. nyse/baba"
-        default: "nyse/nke"
+        default: "xetra/evd"
 jobs:
   probe:
     runs-on: ubuntu-latest
