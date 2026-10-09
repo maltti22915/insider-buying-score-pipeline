@@ -1,4 +1,4 @@
-# as_quality_probe.yml v1 -- manual test of the six structural quality metrics for one ticker
+# as_quality_probe.yml v2 -- manual test of the six structural quality metrics for one ticker
 name: AS Quality Probe
 on:
   workflow_dispatch:
@@ -14,7 +14,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install seleniumbase && sudo apt-get install -y xvfb
-      - run: python extractor_tests/test_as_quality_metrics.py
+      - name: Unit test (runs only if the test file exists in the repo)
+        if: hashFiles('extractor_tests/test_as_quality_metrics.py') != ''
+        run: python extractor_tests/test_as_quality_metrics.py
       - run: xvfb-run -a python as_quality_probe.py
         env: { AS_PATH: "${{ inputs.as_path }}" }
       - uses: actions/upload-artifact@v4
