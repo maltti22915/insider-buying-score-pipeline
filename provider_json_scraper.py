@@ -334,7 +334,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -1409,6 +1409,79 @@ def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
         _LAST_POST.update(saved_post)
 
 
+# ----------------------------------------------------------------------------
+# v18: structural quality metrics (as_quality_metrics.py) from the AlphaSpread statement pages
+# ----------------------------------------------------------------------------
+_AS_QUALITY = {}
+AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/income-statement"),
+                    ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
+
+
+def fetch_as_quality(sb, abbrev_as):
+    """Never raises: the DCF must not depend on it. Fills _AS_QUALITY with the metrics dict (see as_quality_metrics)."""
+    _AS_QUALITY.clear()
+    try:
+        import as_quality_metrics
+    except Exception as import_error:
+        step("quality", "FAIL", reason="as_quality_metrics.py missing: " + type(import_error).__name__)
+        return
+    base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
+    pages = {}
+    for name, path in AS_QUALITY_PAGES:
+        try:
+            sb.uc_open_with_reconnect(base + path, 4)
+            source = ""
+            for _ in range(14):
+                source = sb.get_page_source()
+                ready = ("3Y Average ROIC" in source) if name == "profitability" else bool(re.search(r"FY\s*20\d\d", source))
+                if ready:
+                    break
+                sb.sleep(1.5)
+            if "just a moment" in (sb.get_title() or "").lower():
+                step("quality_" + name, "FAIL", reason="blocked")
+                continue
+            pages[name] = source
+            step("quality_" + name, "OK", chars=len(source))
+        except Exception as page_error:
+            step("quality_" + name, "FAIL", reason=type(page_error).__name__)
+    if not all(k in pages for k in ("income", "balance", "cashflow")):
+        step("quality", "FAIL", reason="statement pages missing: " + ",".join(sorted(pages.keys())))
+        return
+    try:
+        result = as_quality_metrics.compute_metrics(pages.get("profitability", ""), pages["income"], pages["balance"], pages["cashflow"])
+    except Exception as compute_error:
+        step("quality", "FAIL", reason="compute " + type(compute_error).__name__ + ": " + str(compute_error)[:60])
+        return
+    diag = result.get("diagnostics", {})
+    _AS_QUALITY.update({
+        "metrics": result["metrics"], "scores": result["scores"], "partial_structural": result["partial_structural"],
+        "coverage_pct": result["coverage_pct"], "display": result["display"], "flags": result["flags"],
+        "scrapedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "diag": {"roic3y_source": diag.get("roic3y_source"), "last5": diag.get("last5"), "notes": diag.get("notes"),
+                 "income_cols": (diag.get("income") or {}).get("columns"), "warnings": [v.get("warning") for v in (diag.get("income"), diag.get("balance"), diag.get("cashflow")) if v and v.get("warning")]},
+    })
+    step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none")
+
+
+def post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """Posts the computed quality metrics once (target ASQ); never touches the DCF result."""
+    if not _AS_QUALITY:
+        return
+    quality = dict(_AS_QUALITY)
+    _AS_QUALITY.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASQ", row_number, abbrev, sheet_name, {"quality": quality})
+        info["quality"] = {"posted": bool(posted), "struct": quality.get("partial_structural"), "cov": quality.get("coverage_pct"),
+                           "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as quality_error:
+        print("❌ AS quality post failed: {}".format(quality_error))
+        info["quality"] = {"posted": False, "reason": str(quality_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
 def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
     """
     Opens AlphaSpread's DCF page for abbrev_as, opens View Calculation ->
@@ -1429,6 +1502,8 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
 
     if os.environ.get("AS_RATIOS", "1") != "0":
         fetch_as_ratios(sb, abbrev_as)  # v17: before the DCF, so a DCF failure still keeps them
+    if os.environ.get("AS_QUALITY", "1") != "0":
+        fetch_as_quality(sb, abbrev_as)  # v18: structural quality metrics, also before the DCF
 
     try:
         step("run_extractor", "INFO", abbrev=abbrev_as)
@@ -1594,7 +1669,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v17",
+            "v": "v18",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1631,7 +1706,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v17 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v18 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1692,6 +1767,7 @@ def run_bot():
             _SW_PAGES.clear()
         if target == "ASDCF":
             _AS_RATIOS.clear()
+            _AS_QUALITY.clear()
         provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
@@ -1737,6 +1813,7 @@ def run_bot():
                             post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         elif target == "ASDCF":
                             post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                            post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "ok" if posted else "not_written"
@@ -1759,6 +1836,7 @@ def run_bot():
                         post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     continue
 
                 except Exception as scrape_error:
@@ -1775,6 +1853,7 @@ def run_bot():
                         post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
