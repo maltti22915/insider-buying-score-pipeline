@@ -1,5 +1,5 @@
 """
-as_quality_metrics.py v1 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
+as_quality_metrics.py v2 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
 
   Q1 ROIC 3Y average      profitability page text ("3Y Average ROIC"); falls back to the computed value
   Q2 Worst-year ROIC      min of yearly ROIC over the last 5 FY, computed from the statements
@@ -12,13 +12,17 @@ Pure functions, no browser. Input = the HTML of 5 pages (profitability, income-s
 cash-flow-statement). Output = a dict with raw metrics, 0-100 scores, coverage, flags and diagnostics.
 ROIC rule (ONE rule, change the constants below to change it everywhere):
   NOPAT = operating income * (1 - tax rate), tax rate = |tax provision| / pre-tax income clamped to 15-30%
-  invested capital (year end) = total equity + minority interest + debt + leases - cash - short-term investments
+  invested capital (year end) = total equity + minority interest + debt + leases (cash is NOT subtracted)
+  v2: cash is no longer netted (ROIC_SUBTRACT_CASH = False). AlphaSpread's own ROIC appears to be built that way
+  (Alibaba page ROIC 3% vs ~3% from equity+debt; Nike page 12% vs ~14%), and Q1 uses the page value, so Q2 must
+  use the same basis. The net-of-cash series is still reported in diagnostics ('roic_by_year_net_of_cash').
   goodwill is KEPT, long-term investments are NOT stripped (STRIP_LONG_TERM_INVESTMENTS = False).
 """
 import re
 from html.parser import HTMLParser
 
 STRIP_LONG_TERM_INVESTMENTS = False
+ROIC_SUBTRACT_CASH = False   # v2: same basis as AlphaSpread's own ROIC (see docstring)
 TAX_MIN, TAX_MAX, TAX_DEFAULT = 0.15, 0.30, 0.21
 SHARE_JUMP_LIMIT = 0.30
 
@@ -184,8 +188,8 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     latest = common[-1] if common else None
     diag["last5"] = last5
 
-    # --- yearly ROIC
-    roic_by_year = {}
+    # --- yearly ROIC (chosen basis in roic_by_year, the other one only for diagnostics)
+    roic_by_year, roic_net_cash = {}, {}
     for y in last5 + ([common[-6]] if len(common) >= 6 else []):
         op = _g(inc, "Operating Income", y)
         pre = _g(inc, "Pre-Tax Income", y)
@@ -198,12 +202,18 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
             continue
         rate = abs(tax) / pre if (tax is not None and pre and pre > 0) else TAX_DEFAULT
         rate = max(TAX_MIN, min(TAX_MAX, rate))
-        invested = equity + minority + debt + _lease_total(bal, y) - cash
+        gross = equity + minority + debt + _lease_total(bal, y)
         if STRIP_LONG_TERM_INVESTMENTS:
-            invested -= _g(bal, "Long-Term Investments", y) or 0.0
-        if invested > 0:
-            roic_by_year[y] = op * (1 - rate) / invested * 100.0
+            gross -= _g(bal, "Long-Term Investments", y) or 0.0
+        nopat = op * (1 - rate)
+        if gross > 0:
+            roic_by_year[y] = nopat / gross * 100.0
+        if gross - cash > 0:
+            roic_net_cash[y] = nopat / (gross - cash) * 100.0
+    if ROIC_SUBTRACT_CASH:
+        roic_by_year = roic_net_cash
     diag["roic_by_year"] = {y: round(v, 1) for y, v in roic_by_year.items()}
+    diag["roic_by_year_net_of_cash"] = {y: round(v, 1) for y, v in roic_net_cash.items()}
     window = [roic_by_year[y] for y in last5 if y in roic_by_year]
     roic_min5 = min(window) if len(window) >= 3 else None
     last3 = [roic_by_year[y] for y in last5[-3:] if y in roic_by_year]
