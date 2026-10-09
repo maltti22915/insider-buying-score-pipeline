@@ -239,6 +239,7 @@ VERSION 1 (NEW WORK)
   extraction after the first real run, then flip that constant to False.
 """
 
+import html
 import json
 import os
 import random
@@ -333,7 +334,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -1218,6 +1219,7 @@ GF_PAGES = (
     ("moat", "term/moat-score/"),
 )
 GF_PAGE_MIN_CHARS = 1500
+GF_MAX_ATTEMPTS = int(os.environ.get("GF_MAX_ATTEMPTS", "2"))  # v15
 
 
 def text_only_page(html):
@@ -1232,6 +1234,48 @@ def text_only_page(html):
     return "<html><head><title>{}</title></head><body>{}</body></html>".format(title, body)
 
 
+def fetch_gf_pages_via_scrapedo(abbrev_gf):
+    """
+    v16: GuruFocus sits behind a Cloudflare check that blocks GitHub's browser, but the project's
+    other GitHub scraper reads GuruFocus through Scrape.do (render=true) with the token in the
+    repository secret. Same here: one request per term page, in parallel (max 4 at a time).
+    Returns {subpage: text_only_html}; empty when no token is set or everything failed.
+    """
+    token = (os.environ.get("SCRAPE_DO_TOKEN") or os.environ.get("SCRAPEDO_TOKEN") or "").strip()
+    if not token:
+        print("ℹ️ GF: no SCRAPE_DO_TOKEN in the environment -- Scrape.do route skipped.")
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import quote_plus
+
+    def one(item):
+        name, path = item
+        target = "https://www.gurufocus.com/{}{}".format(path, abbrev_gf)
+        api = "https://api.scrape.do?token={}&url={}&render=true".format(token, quote_plus(target))
+        for attempt in (1, 2):
+            try:
+                response = requests.get(api, timeout=90)
+                if response.status_code == 200 and len(response.text) > 5000:
+                    page = text_only_page(response.text)
+                    if len(page) >= GF_PAGE_MIN_CHARS:
+                        return name, page, "ok", len(page)
+                    return name, "", "too_small", len(page)
+                status = "http{}".format(response.status_code)
+            except Exception as request_error:
+                status = type(request_error).__name__
+            time.sleep(3 * attempt)
+        return name, "", status, 0
+
+    pages = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for name, page, status, chars in pool.map(one, GF_PAGES):
+            step("page_" + name, "OK" if page else "FAIL", via="scrape.do", result=status, chars=chars)
+            if page:
+                pages[name] = page
+    return pages
+
+
 def scrape_gf_data(sb, abbrev_gf, row_number, headless=True):
     """
     v14: opens each GuruFocus term page for abbrev_gf in the same browser session and returns
@@ -1239,14 +1283,39 @@ def scrape_gf_data(sb, abbrev_gf, row_number, headless=True):
     A Cloudflare block on the FIRST page raises CloudflareBlocked (retried by run_bot);
     a later page that fails is just left out.
     """
-    pages = {}
+    pages = fetch_gf_pages_via_scrapedo(abbrev_gf)
+    if len(pages) >= 6:
+        print("📄 GF pages via Scrape.do: {}".format(", ".join(sorted(pages.keys()))))
+        return {"pages": pages}
+    if pages:
+        print("⚠️ GF: only {} page(s) via Scrape.do -- the browser tries the rest.".format(len(pages)))
+
     for index, (name, path) in enumerate(GF_PAGES):
+        if name in pages:
+            continue
         url = "https://www.gurufocus.com/{}{}".format(path, abbrev_gf)
         print("🌐 Navigating to: {}".format(url))
         try:
             sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
             sb.sleep(PAGE_SETTLE_SECONDS)
-            if not wait_past_challenge(sb, headless):
+            cleared = wait_past_challenge(sb, headless)
+            if not cleared and not headless:
+                # v15: GuruFocus' Cloudflare check is stricter than Simply Wall St's: try SeleniumBase's
+                # newer Turnstile handler (when this version has it) before giving up.
+                for handler_name in ("uc_gui_handle_captcha", "uc_gui_handle_cf"):
+                    handler = getattr(sb, handler_name, None)
+                    if handler is None:
+                        continue
+                    try:
+                        print("🖱️ GF: trying sb.{}()".format(handler_name))
+                        handler()
+                        sb.sleep(4)
+                        if not is_challenge_page(sb):
+                            cleared = True
+                            break
+                    except Exception as handler_error:
+                        print("⚠️ sb.{} failed: {}".format(handler_name, handler_error))
+            if not cleared:
                 step("page_" + name, "FAIL", reason="challenge page still showing")
                 if index == 0:
                     raise CloudflareBlocked("GuruFocus page is still a challenge ({} browser)".format(
@@ -1269,6 +1338,77 @@ def scrape_gf_data(sb, abbrev_gf, row_number, headless=True):
     return {"pages": pages}
 
 
+# ----------------------------------------------------------------------------
+# v17: AlphaSpread ratio pages (P/E, P/OCF, P/FCFE) read in the SAME browser as the DCF
+# ----------------------------------------------------------------------------
+_AS_RATIOS = {}
+AS_RATIO_PAGES = (("pe", "price-to-earnings"), ("pocf", "price-to-ocf"), ("pfcf", "price-to-fcfe"))
+
+
+def _as_strip_text(page_source):
+    page_source = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", page_source)
+    page_source = re.sub(r"(?s)<[^>]+>", " ", page_source)
+    return re.sub(r"\s+", " ", html.unescape(page_source)).strip()
+
+
+def _as_num(text):
+    found = re.search(r"-?\d[\d,]*\.?\d*", text or "")
+    return float(found.group(0).replace(",", "")) if found else None
+
+
+def _as_extract_ratio(text):
+    """Headline numbers of one AlphaSpread ratio page (verified on the real page text in as_probe v1)."""
+    out = {}
+    found = re.search(r"([\d.,]+)\s*Current\b", text) or re.search(r"Current\s*([\d.,]+)", text)
+    if found:
+        out["current"] = _as_num(found.group(1))
+    for label, key in (("3-y average", "avg3y"), ("5-y average", "avg5y"), ("10-y average", "avg10y"),
+                       ("3-Year Average", "avg3y"), ("5-Year Average", "avg5y"), ("10-Year Average", "avg10y"),
+                       ("Industry Average", "industry"), ("Country Average", "country")):
+        found = re.search(re.escape(label) + r"\s*(?:of\s*)?(-?[\d.,]+)", text, re.I)
+        if found and key not in out:
+            out[key] = _as_num(found.group(1))
+    return out
+
+
+def fetch_as_ratios(sb, abbrev_as):
+    """Never raises: the DCF must not depend on it. Fills _AS_RATIOS = {pe|pocf|pfcf: {current, avg3y, ...}}."""
+    _AS_RATIOS.clear()
+    base = "https://www.alphaspread.com/security/{}/relative-valuation/ratio/".format(str(abbrev_as).strip().strip("/"))
+    for name, slug in AS_RATIO_PAGES:
+        try:
+            sb.uc_open_with_reconnect(base + slug, 4)
+            source = sb.get_page_source()
+            if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
+                step("ratio_" + name, "FAIL", reason="blocked")
+                continue
+            values = _as_extract_ratio(_as_strip_text(source))
+            if values.get("current") is not None:
+                _AS_RATIOS[name] = values
+            step("ratio_" + name, "OK" if values.get("current") is not None else "FAIL", **{k: v for k, v in values.items() if k in ("current", "avg5y", "industry")})
+        except Exception as ratio_error:
+            step("ratio_" + name, "FAIL", reason=type(ratio_error).__name__)
+
+
+def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """Posts the collected AS ratios once (target ASRP); never touches the DCF result."""
+    if not _AS_RATIOS:
+        return
+    ratios = dict(_AS_RATIOS)
+    _AS_RATIOS.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASRP", row_number, abbrev, sheet_name, {"ratios": ratios})
+        info["ratios"] = {"posted": bool(posted), "got": sorted(ratios.keys()),
+                          "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as ratios_error:
+        print("❌ AS ratios post failed: {}".format(ratios_error))
+        info["ratios"] = {"posted": False, "got": sorted(ratios.keys()), "reason": str(ratios_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
 def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
     """
     Opens AlphaSpread's DCF page for abbrev_as, opens View Calculation ->
@@ -1286,6 +1426,9 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
     except Exception as size_error:
         print("⚠️ could not set window size: {}".format(size_error))
+
+    if os.environ.get("AS_RATIOS", "1") != "0":
+        fetch_as_ratios(sb, abbrev_as)  # v17: before the DCF, so a DCF failure still keeps them
 
     try:
         step("run_extractor", "INFO", abbrev=abbrev_as)
@@ -1451,7 +1594,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v14",
+            "v": "v17",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1488,7 +1631,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v14 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v17 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1547,6 +1690,8 @@ def run_bot():
         trace[target] = info
         if target == "SW":
             _SW_PAGES.clear()
+        if target == "ASDCF":
+            _AS_RATIOS.clear()
         provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
@@ -1555,6 +1700,8 @@ def run_bot():
             attempts = max(1, int(os.environ.get("CF_RETRY_ATTEMPTS", DEFAULT_CF_RETRY_ATTEMPTS)))
         except ValueError:
             attempts = DEFAULT_CF_RETRY_ATTEMPTS
+        if target == "GFP":
+            attempts = min(attempts, GF_MAX_ATTEMPTS)  # v15: GuruFocus blocks are rarely cleared by retrying
 
         provider_started = time.monotonic()
 
@@ -1588,6 +1735,8 @@ def run_bot():
                              reason=_LAST_POST.get("reason"))
                         if target == "SW":
                             post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        elif target == "ASDCF":
+                            post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "ok" if posted else "not_written"
@@ -1608,6 +1757,8 @@ def run_bot():
                     info["status"] = "blocked"
                     if target == "SW":
                         post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    elif target == "ASDCF":
+                        post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     continue
 
                 except Exception as scrape_error:
@@ -1622,6 +1773,8 @@ def run_bot():
                     info["status"] = "error"
                     if target == "SW":
                         post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    elif target == "ASDCF":
+                        post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
