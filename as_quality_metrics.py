@@ -1,8 +1,8 @@
 """
-as_quality_metrics.py v2 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
+as_quality_metrics.py v3 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
 
   Q1 ROIC 3Y average      profitability page text ("3Y Average ROIC"); falls back to the computed value
-  Q2 Worst-year ROIC      min of yearly ROIC over the last 5 FY, computed from the statements
+  Q2 Worst-year ROIC      second-lowest yearly ROIC of the last 5 FY (ROIC_MIN_RANK = 2; 1 = the very worst), computed from the statements
   Q6 Cash conversion      sum(cash from operations) / sum(net income), last 5 FY (both from the cash-flow page)
   Q8 Net debt / EBITDA    latest FY; EBITDA = operating income + D&A (cash-flow page)
   Q10 FCF-positive years  of the last 5 FY (FCF = cash from operations - |capex|)
@@ -23,6 +23,7 @@ from html.parser import HTMLParser
 
 STRIP_LONG_TERM_INVESTMENTS = False
 ROIC_SUBTRACT_CASH = False   # v2: same basis as AlphaSpread's own ROIC (see docstring)
+ROIC_MIN_RANK = 2            # v3: 1 = worst year of the last 5, 2 = second-worst (robust to one shock year such as COVID); chosen by the user
 TAX_MIN, TAX_MAX, TAX_DEFAULT = 0.15, 0.30, 0.21
 SHARE_JUMP_LIMIT = 0.30
 
@@ -215,7 +216,7 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     diag["roic_by_year"] = {y: round(v, 1) for y, v in roic_by_year.items()}
     diag["roic_by_year_net_of_cash"] = {y: round(v, 1) for y, v in roic_net_cash.items()}
     window = [roic_by_year[y] for y in last5 if y in roic_by_year]
-    roic_min5 = min(window) if len(window) >= 3 else None
+    roic_min5 = sorted(window)[ROIC_MIN_RANK - 1] if len(window) >= max(3, ROIC_MIN_RANK + 1) else None
     last3 = [roic_by_year[y] for y in last5[-3:] if y in roic_by_year]
     roic3_computed = sum(last3) / len(last3) if len(last3) == 3 else None
     diag["roic3y_computed"] = None if roic3_computed is None else round(roic3_computed, 1)
