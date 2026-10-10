@@ -1457,6 +1457,7 @@ def fetch_as_quality(sb, abbrev_as):
         "metrics": result["metrics"], "scores": result["scores"], "partial_structural": result["partial_structural"],
         "coverage_pct": result["coverage_pct"], "display": result["display"], "flags": result["flags"],
         "scrapedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "details": result.get("details"),  # v20: the numbers behind each cell (for the cell notes)
         "diag": {"roic3y_source": diag.get("roic3y_source"), "last5": diag.get("last5"), "notes": diag.get("notes"),
                  "income_cols": (diag.get("income") or {}).get("columns"), "warnings": [v.get("warning") for v in (diag.get("income"), diag.get("balance"), diag.get("cashflow")) if v and v.get("warning")]},
     })
@@ -1673,7 +1674,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v19",
+            "v": "v20",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1710,7 +1711,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v19 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v20 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
