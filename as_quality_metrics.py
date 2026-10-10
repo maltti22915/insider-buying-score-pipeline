@@ -1,5 +1,5 @@
 """
-as_quality_metrics.py v4 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
+as_quality_metrics.py v5 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
 
   Q1 ROIC 3Y average      profitability page text ("3Y Average ROIC"); falls back to the computed value
   Q2 Worst-year ROIC      second-lowest yearly ROIC of the last 5 FY (ROIC_MIN_RANK = 2; 1 = the very worst), computed from the statements
@@ -190,9 +190,10 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     last5 = common[-5:]
     latest = common[-1] if common else None
     diag["last5"] = last5
+    details = {}   # v5: the numbers behind every cell, for the cell notes
 
     # --- yearly ROIC (chosen basis in roic_by_year, the other one only for diagnostics)
-    roic_by_year, roic_net_cash = {}, {}
+    roic_by_year, roic_net_cash, roic_inputs = {}, {}, {}
     for y in last5 + ([common[-6]] if len(common) >= 6 else []):
         op = _g(inc, "Operating Income", y)
         pre = _g(inc, "Pre-Tax Income", y)
@@ -209,6 +210,7 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
         if STRIP_LONG_TERM_INVESTMENTS:
             gross -= _g(bal, "Long-Term Investments", y) or 0.0
         nopat = op * (1 - rate)
+        roic_inputs[y] = {"op": op, "tax_rate": round(rate, 4), "capital": gross}
         if gross > 0:
             roic_by_year[y] = nopat / gross * 100.0
         if gross - cash > 0:
@@ -238,6 +240,17 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     diag["roic_scale"] = None if roic_scale is None else round(roic_scale, 3)
     diag["roic_by_year_calibrated"] = None if roic_scale is None else {y: round(v * roic_scale, 1) for y, v in roic_by_year.items()}
     roic_min5 = sorted(window)[ROIC_MIN_RANK - 1] if len(window) >= max(3, ROIC_MIN_RANK + 1) else None
+    _sc = roic_scale if roic_scale is not None else 1.0
+    _years5 = [y for y in last5 if y in roic_by_year]
+    details["roic"] = {
+        "years": _years5,
+        "inputs": {str(y): roic_inputs.get(y) for y in _years5},
+        "raw": {str(y): round(roic_by_year[y], 2) for y in _years5},
+        "scaled": {str(y): round(roic_by_year[y] * _sc, 2) for y in _years5},
+        "scale": roic_scale, "page3y": roic3_page, "computed3y": roic3_computed,
+        "rank": ROIC_MIN_RANK,
+        "pick_year": None if roic_min5 is None else next((y for y in _years5 if abs(roic_by_year[y] * _sc - roic_min5) < 1e-9), None),
+    }
 
     # --- cash conversion (cash-flow page only: same consolidated net income as CFO starts from)
     cfo = [_g(cfs, "Cash from Operating Activities", y) for y in last5]
@@ -245,6 +258,7 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     cfo_ni = None
     if len(last5) == 5 and None not in cfo and None not in ni and sum(ni) > 0:
         cfo_ni = sum(cfo) / sum(ni)
+        details["cfo_ni"] = {"years": list(last5), "cfo": list(cfo), "ni": list(ni), "cfo_sum": sum(cfo), "ni_sum": sum(ni)}
 
     # --- net debt / EBITDA, latest FY
     nd_ebitda, nd_note = None, None
@@ -254,9 +268,11 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
         op = _g(inc, "Operating Income", latest)
         da = _g(cfs, "Depreciation & Amortization", latest)
         net_debt = debt - cash
+        details["nd_ebitda"] = {"year": latest, "debt": debt, "leases": _lease_total(bal, latest), "cash": cash, "net_debt": net_debt, "op": op, "da": da}
         diag["net_debt"] = net_debt
         if op is not None and da is not None:
             ebitda = op + da
+            details["nd_ebitda"]["ebitda"] = ebitda
             diag["ebitda"] = ebitda
             if net_debt <= 0:
                 nd_ebitda, nd_note = net_debt / ebitda if ebitda > 0 else -1.0, "net cash"
@@ -267,14 +283,17 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
 
     # --- FCF-positive years
     positives, known = 0, 0
+    fcf_rows = []
     for y in last5:
         c, cap = _g(cfs, "Cash from Operating Activities", y), _g(cfs, "Capital Expenditures", y)
         if c is None or cap is None:
             continue
         known += 1
         positives += 1 if c - abs(cap) > 0 else 0
+        fcf_rows.append({"year": y, "cfo": c, "capex": abs(cap), "fcf": c - abs(cap)})
     fcf_years = positives if (len(last5) == 5 and known >= 4) else None
     diag["fcf_years_known"] = known
+    details["fcf_years"] = {"rows": fcf_rows, "known": known}
 
     # --- share count CAGR (restarts after a break)
     shr_cagr, shares_used = None, []
@@ -291,6 +310,9 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
         n = segment[-1][0] - segment[0][0]
         shr_cagr = ((segment[-1][1] / segment[0][1]) ** (1.0 / n) - 1.0) * 100.0
     diag["shares_years"] = shares_used
+    details["shr_cagr"] = {"first_year": segment[0][0] if segment else None, "last_year": segment[-1][0] if segment else None,
+                           "first": segment[0][1] if segment else None, "last": segment[-1][1] if segment else None,
+                           "points": len(segment), "restarted": any("share count jump" in n_ for n_ in diag["notes"])}
 
     metrics = {"roic3y": roic3y, "roic_min5": roic_min5, "cfo_ni": cfo_ni,
                "nd_ebitda": nd_ebitda, "fcf_years": fcf_years, "shr_cagr": shr_cagr}
@@ -307,6 +329,8 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
     avail_w = sum(SCORE_SPEC[k]["w"] for k, v in scores.items() if v is not None)
     structural = (sum(SCORE_SPEC[k]["w"] * v for k, v in scores.items() if v is not None) / avail_w) if avail_w else None
     coverage = avail_w / total_w
+    details["struct"] = {"weights": {k: v["w"] for k, v in SCORE_SPEC.items()}, "avail_w": avail_w, "total_w": total_w,
+                         "points": {k: (None if scores[k] is None else round(SCORE_SPEC[k]["w"] * scores[k] / avail_w, 2)) for k in SCORE_SPEC} if avail_w else {}}
 
     flags = []
     if nd_ebitda is not None and nd_ebitda > 4: flags.append("ND/EBITDA>4")
@@ -323,5 +347,6 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
         "display": "n/a (cov %d%%)" % round(coverage * 100) if (coverage < 0.7 or not returns_available or structural is None)
                    else "%d | cov %d%% | flags: %s" % (round(min(structural, 50) if flags else structural), round(coverage * 100), ", ".join(flags) or "none"),
         "flags": flags,
+        "details": details,
         "diagnostics": diag,
     }
