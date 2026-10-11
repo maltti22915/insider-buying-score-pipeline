@@ -1,5 +1,5 @@
 """
-as_ttm_metrics.py v1 -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
+as_ttm_metrics.py v1.1 (cell parts joined with a space: "TTM<br>Mar 2024" is read as "TTM Mar 2024") -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
 
 Pure functions, no browser. Input = page HTML after the toggle was clicked:
   income statement  -> TTM       (header cells "TTM Jun 2026")
@@ -45,7 +45,7 @@ class _Tables(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag in ("td", "th") and self._c is not None and self._r is not None:
-            self._r.append(re.sub(r"\s+", " ", "".join(self._c)).strip())
+            self._r.append(re.sub(r"\s+", " ", " ".join(self._c)).strip())
             self._c = None
         elif tag == "tr" and self._r is not None and self._t is not None:
             if self._r:
@@ -75,7 +75,7 @@ def parse_value(text):
 def _period_of(cell, kind):
     """(year, month) of a header cell of the wanted kind, else None."""
     c = cell or ""
-    if kind == "ttm" and not re.match(r"\s*TTM\b", c):
+    if kind == "ttm" and not re.match(r"\s*TTM", c):
         return None
     if kind == "q" and not re.match(r"\s*Q\d\s*FY", c):
         return None
