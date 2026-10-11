@@ -32,6 +32,10 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
+VERSION 22
+  Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
+  rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
+  profile (financials skip FCF and gross margin). Needs as_quality_v4.py, as_moat.py, as_ttm_metrics.py in the repo root.
 VERSION 11
   Requested directly: get MarketScreener (MS) data through GitHub instead of
   Scrape.do. A probe (ms_probe.py) showed a headed browser loads the MS page in
@@ -1478,6 +1482,17 @@ def fetch_as_quality(sb, abbrev_as):
                 ttm_pages[name] = _as_click_view(sb, AS_TTM_TOGGLE[name])
         except Exception as page_error:
             step("quality_" + name, "FAIL", reason=type(page_error).__name__)
+    moat_source = ""
+    try:  # v22: AlphaSpread "Economic Moat" page (rating + advantage tags); never blocks the metrics
+        sb.uc_open_with_reconnect(base + "qualitative/block/economic-moat", 4)
+        for _ in range(12):
+            moat_source = sb.get_page_source()
+            if "What is Economic Moat?" in moat_source:
+                break
+            sb.sleep(1.5)
+        step("quality_moat_page", "OK", chars=len(moat_source))
+    except Exception as moat_page_error:
+        step("quality_moat_page", "FAIL", reason=type(moat_page_error).__name__)
     if not all(k in pages for k in ("income", "balance", "cashflow")):
         step("quality", "FAIL", reason="statement pages missing: " + ",".join(sorted(pages.keys())))
         return
@@ -1495,11 +1510,32 @@ def fetch_as_quality(sb, abbrev_as):
         "diag": {"roic3y_source": diag.get("roic3y_source"), "last5": diag.get("last5"), "notes": diag.get("notes"),
                  "income_cols": (diag.get("income") or {}).get("columns"), "warnings": [v.get("warning") for v in (diag.get("income"), diag.get("balance"), diag.get("cashflow")) if v and v.get("warning")]},
     })
+    v4_block = None
+    try:  # v22: Q v4 (as_quality_v4.py) next to the old Struct; the sheet shows both until the old columns are removed
+        import as_quality_v4
+        v4_full = as_quality_v4.compute_v4(pages.get("profitability", ""), pages["income"], pages["balance"], pages["cashflow"])
+        det = v4_full.get("details") or {}
+        v4_block = {k: v4_full.get(k) for k in ("v", "profile", "metrics", "scores", "weights", "q", "q_capped", "coverage_pct", "flags", "warnings", "display")}
+        v4_block["diag"] = {k: det.get(k) for k in ("profile_reason", "diag_roic_sbc_med5", "diag_sbc_pct_rev", "diag_roic_netcash_med5", "diag_nii_share_pretax",
+                                                     "goodwill_pct", "interest_cover", "rev_cagr_long")}
+        _AS_QUALITY["v4"] = v4_block
+        step("quality_v4", "OK", q=v4_full.get("q_capped"), profile=v4_full.get("profile"), cov=v4_full.get("coverage_pct"), flags=",".join(v4_full.get("flags") or []) or "none")
+    except Exception as v4_error:
+        step("quality_v4", "FAIL", reason=type(v4_error).__name__ + ": " + str(v4_error)[:60])
+    try:
+        import as_moat
+        if moat_source:
+            moat_block = as_moat.parse_moat(moat_source)
+            _AS_QUALITY["moat"] = moat_block
+            step("quality_moat", "OK", rating=moat_block.get("rating"), tags=",".join(moat_block.get("advantages") or []) or "none", warnings=";".join(moat_block.get("warnings") or []) or "none")
+    except Exception as moat_error:
+        step("quality_moat", "FAIL", reason=type(moat_error).__name__ + ": " + str(moat_error)[:60])
     now_block = None
     if all(ttm_pages.get(k) for k in ("income", "cashflow")):
         try:
             import as_ttm_metrics
-            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages["cashflow"], ttm_pages.get("balance", ""))
+            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages["cashflow"], ttm_pages.get("balance", ""),
+                                                   profile=(v4_block or {}).get("profile") or "NF")
             _AS_QUALITY["now"] = now_block
             step("quality_now", "OK", now=now_block.get("now"), signals=now_block.get("signals"), warnings=";".join(now_block.get("warnings") or []) or "none")
         except Exception as now_error:
