@@ -1,69 +1,78 @@
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import as_quality_metrics as q
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import as_ttm_metrics as T
 
-YEARS = list(range(2017, 2027))
+MON = ["Mar 2024","Jun 2024","Sep 2024","Dec 2024","Mar 2025","Jun 2025","Sep 2025","Dec 2025","Mar 2026","Jun 2026"]
 
-def fmt(v):
-    if v is None: return "—"
-    a = abs(v)
-    for div, suf in ((1e12, "T"), (1e9, "B"), (1e6, "m")):
-        if a >= div:
-            s = "%g%s" % (round(a / div, 3), suf); break
-    else:
-        s = "%g" % a
-    return "(%s)" % s if v < 0 else s
+def table(header_cells, rows):
+    h = "<table><tr>" + "".join("<th>%s</th>" % c for c in header_cells) + "</tr>"
+    for r in rows:
+        h += "<tr>" + "".join("<td>%s</td>" % c for c in r) + "</tr>"
+    return h + "</table>"
 
-def table(rows):
-    head = "<tr><th>Metric</th>" + "".join("<th>%sFY%d (Mar %d)</th>" % ("Earlier " if y == 2017 else "", y, y) for y in YEARS) + "</tr>"
-    body = "".join("<tr><td>%s</td>%s</tr>" % (k, "".join("<td>%s</td>" % fmt(v) for v in vals)) for k, vals in rows.items())
-    return "<html><body><table>%s%s</table></body></html>" % (head, body)
+def ttm_header():
+    return ["Metric", "Earlier"] + ["TTM %s" % m for m in MON]
 
-# company: ROIC ~ 20%, net debt 1x EBITDA, shares shrinking 1%/yr, FCF positive every year
-n = len(YEARS)
-op = [100e9] * n
-inc = table({"Operating Income": op, "Pre-Tax Income": [100e9] * n, "Tax Provision": [-20e9] * n})
-bal = table({
-    "Cash & Cash Equivalents": [50e9] * n, "Short-Term Investments": [0] * n,
-    "Short-Term Debt": [0] * n, "Current Portion of Long-Term Debt": [10e9] * n, "Long-Term Debt": [190e9] * n,
-    "Minority Interest": [0] * n, "Total Equity": [350e9] * n,
-    "Common Shares Outstanding": [1000e6 * (0.99 ** i) for i in range(n)],
-})
-cfo = [120e9] * n
-cfs = table({"Net Income": [80e9] * n, "Depreciation & Amortization": [50e9] * n,
-             "Cash from Operating Activities": cfo, "Capital Expenditures": [-30e9] * n})
-prof = "<div>8% Low 3Y Average ROIC</div><div>Low ROIC 3%</div>"
-r = q.compute_metrics(prof, inc, bal, cfs)
-m = r["metrics"]
-# tax 20%; NOPAT 80B; IC (cash not netted) = 350 + 200 = 550 -> 14.5%; net of cash = 500 -> 16%
-assert abs(r["diagnostics"]["roic_by_year"][2026] - 14.5) < 0.1, r["diagnostics"]
-assert abs(r["diagnostics"]["roic_by_year_net_of_cash"][2026] - 16.0) < 0.1
-assert abs(m["roic_min5"] - 14.5) < 0.1
-assert m["roic3y"] == 8.0 and r["diagnostics"]["roic3y_source"] == "page", r["diagnostics"]["roic3y_page_note"]
-assert abs(m["cfo_ni"] - 1.5) < 1e-6
-assert abs(m["nd_ebitda"] - (150 / 150)) < 1e-6          # net debt 150B, EBITDA 150B
-assert m["fcf_years"] == 5
-assert abs(m["shr_cagr"] - (-1.0)) < 0.05, m["shr_cagr"]
-assert r["coverage_pct"] == 100 and r["flags"] == []
-print("display:", r["display"], "| scores:", r["scores"])
+# MELI values read from the AlphaSpread screenshots (TTM view)
+INC = table(ttm_header(), [
+    ["Revenue", ""] + ["16.3B","17.7B","19.1B","20.8B","22.4B","24.1B","26.2B","28.9B","31.8B","35.2B"],
+    ["Gross Profit", ""] + ["8B","8.5B","8.9B","9.6B","10.3B","11.1B","11.8B","12.9B","13.9B","15B"],
+    ["Operating Income", ""] + ["2.3B","2.4B","2.1B","2.6B","2.9B","3B","3.1B","3.2B","3B","2.9B"],
+    ["Interest Expense", ""] + ["178m","168m","155m","165m","166m","163m","158m","160m","186m","212m"],
+])
+CFS = table(ttm_header(), [
+    ["Depreciation & Amortization", ""] + ["552m","578m","600m","617m","635m","680m","732m","818m","892m","985m"],
+    ["Stock-Based Compensation", ""] + ["188m","152m","235m","261m","193m","193m","193m","303m","399m","468m"],
+    ["Cash from Operating Activities", ""] + ["5.8B","6.3B","6.9B","7.9B","7.4B","8.5B","9.8B","12.1B","13.2B","13.9B"],
+    ["Capital Expenditures", ""] + ["(568m)","(638m)","(735m)","(860m)","(984m)","(1.1B)","(1.2B)","(1.3B)","(1.3B)","(1.5B)"],
+])
+QH = ["Metric", "Earlier"] + ["Q%d FY%d %s" % ((i % 4) + 1, 2024 + i // 4, m) for i, m in enumerate(MON)]
+BAL = table(QH, [
+    ["Cash & Cash Equivalents", ""] + ["2.6B","2.8B","2.2B","2.6B","3B","3B","2.6B","3.7B","3.7B","3.6B"],
+    ["Short-Term Investments", ""] + ["3.7B","4.1B","4.5B","4.5B","5.1B","4.6B","3.7B","2.6B","2B","2.1B"],
+    ["Long-Term Debt", ""] + ["1B"] * 10,
+])
 
-# share-count unit break (8:1 in FY2022) -> segment restarts, still computed from >=3 points
-bal2 = table({**{k: [None] * n for k in ()}, "Cash & Cash Equivalents": [50e9]*n, "Short-Term Debt": [0]*n,
-              "Current Portion of Long-Term Debt": [10e9]*n, "Long-Term Debt": [190e9]*n, "Total Equity": [350e9]*n,
-              "Common Shares Outstanding": [2.6e9]*5 + [20e9, 19.8e9, 19.6e9, 19.4e9, 19.2e9]})
-r2 = q.compute_metrics(prof, inc, bal2, cfs)
-assert r2["diagnostics"]["notes"], "jump should be noted"
-assert r2["metrics"]["shr_cagr"] is not None and r2["metrics"]["shr_cagr"] < 0
-# negative FCF years + net cash
-cfs3 = table({"Net Income": [80e9]*n, "Depreciation & Amortization": [50e9]*n,
-              "Cash from Operating Activities": [20e9]*n, "Capital Expenditures": [-30e9]*n})
-bal3 = table({"Cash & Cash Equivalents": [400e9]*n, "Short-Term Debt": [0]*n, "Current Portion of Long-Term Debt": [0]*n,
-              "Long-Term Debt": [100e9]*n, "Total Equity": [350e9]*n, "Common Shares Outstanding": [1e9]*n})
-r3 = q.compute_metrics("", inc, bal3, cfs3)
-assert r3["metrics"]["fcf_years"] == 0 and r3["scores"]["nd_ebitda"] == 100.0 and "CFO/NI<0.6" in r3["flags"]
-assert r3["diagnostics"]["roic3y_source"] == "computed"
-# missing page / empty inputs never crash
-r4 = q.compute_metrics("", "", "", "")
-assert r4["display"].startswith("n/a") and r4["coverage_pct"] == 0
-assert q.parse_value("(86B)") == -86e9 and q.parse_value("1m") == 1e6 and q.parse_value("—") is None and q.parse_value("1.1T") == 1.1e12
-print("all tests passed")
+assert T.parse_value("(1.5B)") == -1.5e9 and T.parse_value("468m") == 468e6 and T.parse_value("—") is None
+rows, periods, info = T.parse_period_table(INC, "ttm")
+assert periods[-1] == (2026, 6) and len(periods) == 10 and rows["Revenue"][(2026, 6)] == 35.2e9
+# annual / quarterly tables must not be mistaken for TTM
+assert T.parse_period_table(BAL, "ttm")[1] == []
+q_rows, q_periods, _ = T.parse_period_table(BAL, "q")
+assert q_periods[-1] == (2026, 6) and q_rows["Cash & Cash Equivalents"][(2026, 6)] == 3.6e9
+
+r = T.compute_now(INC, CFS, BAL)
+s = r["signals"]
+assert abs(s["rev_growth"] - 46.06) < 0.1, s          # 35.2 / 24.1
+assert abs(s["gm_delta"] - (15 / 35.2 * 100 - 11.1 / 24.1 * 100)) < 1e-6   # about -3.4pp
+assert abs(s["om_delta"] - (2.9 / 35.2 * 100 - 3.0 / 24.1 * 100)) < 1e-6   # about -4.2pp
+# growth a year earlier: 24.1 / 16.3? no -> prev2 is Jun 2024 = 17.7: 24.1/17.7 = +36.2%
+assert abs(s["rev_accel"] - (46.06 - 36.16)) < 0.2, s
+assert r["details"]["rev_accel_vs"] == "growth one year earlier"
+fcfm_now = (13.9 - 1.5 - 0.468) / 35.2 * 100
+fcfm_prev = (8.5 - 1.1 - 0.193) / 24.1 * 100
+assert abs(s["fcfm_delta"] - (fcfm_now - fcfm_prev)) < 0.05, s
+assert r["scores"]["om_delta"] == 0.0 and 0 < r["scores"]["gm_delta"] < 60
+assert 0 < r["now"] < 100
+assert abs(r["levels"]["interest_cover_ttm"] - 2.9 / 0.212) < 0.01
+# net cash: debt 1B - cash 3.6B - STI 2.1B < 0 -> ND/EBITDA reported as negative
+assert r["levels"]["nd_ebitda_ttm"] < 0
+# with a 5y CAGR given it is used as the base
+r2 = T.compute_now(INC, CFS, BAL, rev_cagr5_pct=30.0)
+assert abs(r2["signals"]["rev_accel"] - (46.06 - 30.0)) < 0.1 and r2["details"]["rev_accel_vs"] == "5y CAGR"
+# missing pages degrade, never raise
+r3 = T.compute_now("", CFS, BAL)
+assert r3["now"] is None and r3["warnings"]
+# scoring anchors
+assert T.score_signal(-4, -4, 3) == 0 and T.score_signal(0, -4, 3) == 60 and T.score_signal(3, -4, 3) == 100
+assert abs(T.score_signal(-2, -4, 3) - 30) < 1e-9
+print("all ttm tests passed")
+
+# v1.2: financial profile skips FCF / gross margin; implausible margin swings are ignored
+rf = T.compute_now(INC, CFS, BAL, profile="FIN")
+assert "fcfm_delta" not in rf["signals"] and "gm_delta" not in rf["signals"] and "om_delta" in rf["signals"]
+CFS_BAD = CFS.replace("<td>13.9B</td>", "<td>-300B</td>")
+rb = T.compute_now(INC, CFS_BAD, BAL)
+assert "fcfm_delta" not in rb["signals"] and any("implausible" in w for w in rb["warnings"])
+print("ttm v1.2 tests passed")
