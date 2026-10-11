@@ -27,7 +27,7 @@ ni = [0.8 * o for o in op]
 eps = [a / s for a, s in zip(ni, shares)]
 inc = table({"Revenue": rev, "Cost of Revenue": [-0.4 * r for r in rev], "Gross Profit": [0.6 * r for r in rev],
              "Operating Income": op, "Interest Expense": [5e9] * n, "Pre-Tax Income": op, "Tax Provision": [-0.2 * o for o in op],
-             "Net Income": ni, "EPS Diluted": eps})
+             "Net Income": ni, "EPS (Diluted)": eps})
 bal = table({"Cash & Cash Equivalents": [50e9] * n, "Short-Term Debt": [0] * n, "Current Portion of Long-Term Debt": [10e9] * n,
              "Long-Term Debt": [190e9] * n, "Total Equity": [350e9] * n, "Total Assets": [700e9] * n, "Goodwill": [100e9] * n,
              "Common Shares Outstanding": shares})
@@ -52,7 +52,7 @@ assert r["v1"]["struct"] is not None
 assert abs(sum(r["weights"].values()) - 100) < 1e-9
 
 # financial: no gross profit / cost of revenue rows
-finc = table({"Revenue": rev, "Pre-Tax Income": [0.3 * x for x in rev], "Net Income": [0.2 * x for x in rev], "EPS Diluted": eps})
+finc = table({"Revenue": rev, "Pre-Tax Income": [0.3 * x for x in rev], "Net Income": [0.2 * x for x in rev], "EPS (Diluted)": eps})
 fbal = table({"Total Equity": [20e9 * 1.08 ** i for i in range(n)], "Total Assets": [200e9 * 1.08 ** i for i in range(n)],
               "Common Shares Outstanding": shares})
 rf = v3.compute_v3("", finc, fbal, cfs)
@@ -66,7 +66,7 @@ ni_loss = list(ni); ni_loss[-1] = -1e9; ni_loss[-2] = -2e9
 rev_down = [300e9 * 0.95 ** i for i in range(n)]
 inc2 = table({"Revenue": rev_down, "Cost of Revenue": [-0.4 * x for x in rev_down], "Gross Profit": [0.6 * x for x in rev_down],
               "Operating Income": [0.2 * x for x in rev_down], "Pre-Tax Income": [0.2 * x for x in rev_down],
-              "Tax Provision": [-0.04 * x for x in rev_down], "Net Income": ni_loss, "EPS Diluted": eps})
+              "Tax Provision": [-0.04 * x for x in rev_down], "Net Income": ni_loss, "EPS (Diluted)": eps})
 r2 = v3.compute_v3("", inc2, bal, cfs)
 assert any(f.startswith("net loss") for f in r2["flags"]) and "revenue CAGR<0" in r2["flags"]
 assert r2["q_capped"] <= 50
@@ -74,7 +74,7 @@ assert r2["q_capped"] <= 50
 # negative EPS endpoint -> unavailable, never zero
 eps_neg = list(eps); eps_neg[-3:] = [-0.5, -0.5, -0.5]
 inc3 = table({"Revenue": rev, "Cost of Revenue": [-0.4 * x for x in rev], "Gross Profit": [0.6 * x for x in rev],
-              "Operating Income": op, "Pre-Tax Income": op, "Tax Provision": [-0.2 * o for o in op], "Net Income": ni, "EPS Diluted": eps_neg})
+              "Operating Income": op, "Pre-Tax Income": op, "Tax Provision": [-0.2 * o for o in op], "Net Income": ni, "EPS (Diluted)": eps_neg})
 r3 = v3.compute_v3("", inc3, bal, cfs)
 assert r3["metrics"].get("eps_cagr5") is None and r3["scores"]["eps_cagr5"] is None and r3["coverage_pct"] == 86, r3["coverage_pct"]
 
