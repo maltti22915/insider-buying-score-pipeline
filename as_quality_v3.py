@@ -1,5 +1,5 @@
 """
-as_quality_v3.py v1 -- "Q v3": seven (non-financial) or eight (financial) past-quality metrics from the same four AlphaSpread pages.
+as_quality_v3.py v1.1 (EPS label "EPS (Diluted)", profile detection by balance-sheet cash share, revenue base-effect warning) -- "Q v3": seven (non-financial) or eight (financial) past-quality metrics from the same four AlphaSpread pages.
 Pure functions, no browser. Reuses the parsers and the ROIC rule of as_quality_metrics.py (v1 "Struct" is computed alongside for comparison).
 
 Non-financial profile (weights sum to 100; score = linear lo -> 0 pts, hi -> 100 pts):
@@ -27,23 +27,34 @@ SPEC_NF = [("roic_med5", 26, 8.0, 25.0), ("roic_persist", 8, 25.0, 100.0), ("op_
 SPEC_FIN = [("roe3", 24, 8.0, 20.0), ("roe_persist", 8, 25.0, 100.0), ("pt_margin3", 10, 15.0, 40.0), ("rev_cagr5", 16, 2.0, 14.0),
             ("rev_worst", 10, -8.0, 4.0), ("eps_cagr5", 14, 3.0, 15.0), ("shr_cagr", 10, 3.0, -2.0), ("eq_assets", 8, 3.0, 15.0)]
 PERSIST_HURDLE = 10.0
-FIN_NAME_HINTS = ("loan", "deposit", "premium", "insurance", "claims")
+FIN_NAME_HINTS = ("loan", "deposit")
 
 
 def _years_ok(table, label, years):
     return [y for y in years if (table.get(label) or {}).get(y) is not None]
 
 
-def detect_profile(inc):
-    gross = inc.get("Gross Profit") or {}
-    cost = inc.get("Cost of Revenue") or {}
-    has_gross = any(v is not None for v in gross.values()) and any(v is not None for v in cost.values())
+def detect_profile(inc, bal=None, year=None):
+    """FIN when the statements look like a bank / broker / insurer, else NF.
+    - no Gross Profit / Cost of Revenue values AND no Operating Income values  (banks, pure insurers)
+    - cash + short-term investments >= 50% of total assets                      (brokers such as flatexDEGIRO: client cash)
+    - a row name containing loan / deposit
+    Managed-care style statements (insurance rows but an Operating Income line, e.g. UnitedHealth) stay NF; pass profile= to override."""
+    def has(table, label):
+        return any(v is not None for v in (table.get(label) or {}).values())
+    has_gross = has(inc, "Gross Profit") and has(inc, "Cost of Revenue")
+    has_op = has(inc, "Operating Income")
     hint = next((l for l in inc if any(h in l.lower() for h in FIN_NAME_HINTS)), None)
-    if not has_gross:
-        return "FIN", "no Gross Profit / Cost of Revenue values"
     if hint:
         return "FIN", "row '{}'".format(hint)
-    return "NF", "gross profit present"
+    if not has_gross and not has_op:
+        return "FIN", "no Gross Profit and no Operating Income values"
+    if bal is not None and year is not None:
+        ta = (bal.get("Total Assets") or {}).get(year)
+        cash = ((bal.get("Cash & Cash Equivalents") or {}).get(year) or 0.0) + ((bal.get("Short-Term Investments") or {}).get(year) or 0.0)
+        if ta and cash / ta >= 0.5:
+            return "FIN", "cash and short-term investments {:.0f}% of total assets".format(100.0 * cash / ta)
+    return "NF", "operating statements"
 
 
 def _roic_series(inc, bal, years):
@@ -84,7 +95,7 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
     if len(years) < 5:
         out["warnings"].append("history too short: {} common FY".format(len(years)))
         return out
-    detected, reason = detect_profile(inc)
+    detected, reason = detect_profile(inc, bal, years[-1])
     prof = profile or detected
     out["profile"], out["details"]["profile_reason"] = prof, reason
     last = years[-1]
@@ -103,8 +114,15 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
             m["rev_worst"] = yoy[worst_year]
             det["rev_worst"] = {"yoy": {str(k): round(v, 1) for k, v in yoy.items()}, "year": worst_year}
 
+    long_years = [y for y in years if rev.get(y)]
+    if m.get("rev_cagr5") is not None and len(long_years) >= 8:
+        long_cagr = _cagr(rev[long_years[0]], rev[long_years[-1]], long_years[-1] - long_years[0])
+        det["rev_cagr_long"] = {"first_year": long_years[0], "last_year": long_years[-1], "cagr": long_cagr}
+        if long_cagr is not None and abs(m["rev_cagr5"] - long_cagr) > 10:
+            out["warnings"].append("revenue base effect: 5y {:.0f}% vs {}y {:.0f}%".format(m["rev_cagr5"], long_years[-1] - long_years[0], long_cagr))
+
     # --- EPS CAGR (3Y-averaged endpoints, else single years), both endpoints must be positive
-    eps = {y: q1._g(inc, "EPS Diluted", y) for y in years}
+    eps = {y: q1._first(inc, ["EPS (Diluted)", "EPS Diluted"], y) for y in years}
     e_end = [eps[y] for y in years[-3:] if eps.get(y) is not None]
     start_years = [last - 7, last - 6, last - 5]
     e_start = [eps[y] for y in start_years if eps.get(y) is not None]
@@ -188,7 +206,7 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
         flags.append("margin<0")
 
     # --- warnings (never change the score)
-    warns = []
+    warns = list(out["warnings"])   # keep the base-effect warning added earlier
     v1m = v1["metrics"]
     if prof == "NF":
         if v1m.get("nd_ebitda") is not None and v1m["nd_ebitda"] > 4:
