@@ -5,8 +5,9 @@
 import json, os, re, time
 from seleniumbase import SB
 import as_quality_metrics as q1
-import as_quality_v3 as v3
+import as_quality_v4 as v3
 import as_ttm_metrics as ttm
+import as_moat
 
 DEFAULT = ("tsx/csu nasdaq/adsk nyse/now xetra/evd nasdaq/app nyse/uber xetra/ftk xetra/sap nasdaq/meta nasdaq/amzn "
            "nasdaq/meli nyse/unh nyse/msci nyse/baba cse/chemm")
@@ -104,7 +105,19 @@ def run_one(path):
                 print("  page {:<13} {:.0f}s".format(name, time.time() - started), flush=True)
             except Exception as e:
                 notes.append("{}: {}".format(name, type(e).__name__))
-    rec = {"path": path, "notes": notes}
+        try:   # Economic Moat page (rating + advantages)
+            sb.uc_open_with_reconnect(base + "qualitative/block/economic-moat", 5)
+            msrc = ""
+            for _ in range(15):
+                msrc = sb.get_page_source()
+                if re.search(r"Economic\s*Moat", re.sub(r"<[^>]+>", " ", msrc), re.I) and re.search(r"COMPETITIVE\s+ADVANTAGES|Wide|Narrow", re.sub(r"<[^>]+>", " ", msrc)):
+                    break
+                sb.sleep(1.5)
+            open(os.path.join(folder, "moat.html"), "w", encoding="utf-8").write(msrc)
+            moat = as_moat.parse_moat(msrc)
+        except Exception as e:
+            moat = {"rating": None, "warnings": ["moat page: " + type(e).__name__]}
+    rec = {"path": path, "notes": notes, "moat": moat}
     if all(k in pages for k in ("income", "balance", "cashflow")):
         res = v3.compute_v3(pages.get("profitability", ""), pages["income"], pages["balance"], pages["cashflow"])
         rec["v3"] = res
@@ -156,3 +169,8 @@ print("NOTES:", {r["path"]: r["notes"] for r in results if r.get("notes")})
 print("SUMMARY_JSON " + json.dumps([{"path": r["path"], "profile": (r.get("v3") or {}).get("profile"), "q": (r.get("v3") or {}).get("q_capped"),
       "v1": ((r.get("v3") or {}).get("v1") or {}).get("struct"), "metrics": (r.get("v3") or {}).get("metrics"),
       "now": (r.get("now") or {}).get("now"), "signals": (r.get("now") or {}).get("signals")} for r in results], default=str))
+
+print("\n==== MOAT (AlphaSpread Economic Moat page) ====")
+for r in results:
+    mo = r.get("moat") or {}
+    print("{:<14} {:<7} {:<45} {}".format(r["path"], mo.get("rating") or "-", ", ".join(mo.get("advantages") or []), "; ".join(mo.get("warnings") or [])))
