@@ -111,7 +111,7 @@ def run_one(path):
     else:
         rec["error"] = "annual pages missing: " + ",".join(sorted(pages))
     if all(views.get(k) for k in ("income", "cashflow")):
-        rec["now"] = ttm.compute_now(views["income"], views["cashflow"], views.get("balance", ""))
+        rec["now"] = ttm.compute_now(views["income"], views["cashflow"], views.get("balance", ""), profile=(rec.get("v3") or {}).get("profile") or "NF")
     return rec
 
 
