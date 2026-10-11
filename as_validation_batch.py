@@ -5,7 +5,11 @@
 import json, os, re, time
 from seleniumbase import SB
 import as_quality_metrics as q1
-import as_quality_v4 as v3
+try:
+    import as_quality_v4 as v3
+except ImportError:   # as_quality_v4.py was not added to the repo; v3 file may hold the v4 code
+    import as_quality_v3 as v3
+print("quality module:", v3.__name__, "| compute function:", v3.compute_v3.__name__, flush=True)
 import as_ttm_metrics as ttm
 import as_moat
 
