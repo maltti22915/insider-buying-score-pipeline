@@ -1,4 +1,4 @@
-# as_validation_batch.yml v2 (tests run from the repo root, a failing test no longer blocks the data run) -- scores a list of AlphaSpread tickers with v1 and Q v3 + Now, one browser per ticker
+# as_validation_batch.yml v3 -- tests run from the repo root and never block the data run; YAML syntax fixed
 name: AS Validation Batch
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install seleniumbase && sudo apt-get install -y xvfb
-      - name: Unit tests (informational: a failure here does not stop the data run)
+      - name: "Unit tests (informational, a failure here does not stop the data run)"
         continue-on-error: true
         run: |
           for t in test_as_quality_metrics.py test_as_ttm_metrics.py test_as_quality_v3.py; do
