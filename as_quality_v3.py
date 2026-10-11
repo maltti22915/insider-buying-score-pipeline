@@ -18,14 +18,20 @@ Caps (Q <= 50): net loss in >= 2 of the last 5 FY, dilution > 5%/yr, revenue CAG
 Warnings (never change the score): ND/EBITDA > 4, interest cover < 2x (non-financials), CFO/NI < 0.6 or > 3, goodwill > 50% of assets,
 share-count discontinuity, financial company (rate-sensitive earnings, no regulatory capital data).
 Missing metrics are dropped and the weights rescaled; Q shows n/a when coverage < 70% or the return metric is missing.
+
+v4 changes vs v3 (second-opinion review, Oct 2026): rev_cagr9 added (base effects), roic_persist weight 8->5, revenue CAGR<0 is a warning (no cap),
+financial profile: ni_resil (net-income volatility, 15) added and Q capped at 60 (FIN_CAP), net-interest-income share of pre-tax income as diagnostic,
+diagnostics for every profile: ROIC with SBC added back, SBC / revenue, ROIC net of cash (roic_mode="cash" scores that variant instead of GAAP).
 """
 import statistics
 import as_quality_metrics as q1
 
-SPEC_NF = [("roic_med5", 26, 8.0, 25.0), ("roic_persist", 8, 25.0, 100.0), ("op_margin3", 12, 5.0, 25.0),
-           ("rev_cagr5", 18, 2.0, 14.0), ("rev_worst", 10, -8.0, 4.0), ("eps_cagr5", 14, 3.0, 15.0), ("shr_cagr", 12, 3.0, -2.0)]
-SPEC_FIN = [("roe3", 24, 8.0, 20.0), ("roe_persist", 8, 25.0, 100.0), ("pt_margin3", 10, 15.0, 40.0), ("rev_cagr5", 16, 2.0, 14.0),
-            ("rev_worst", 10, -8.0, 4.0), ("eps_cagr5", 14, 3.0, 15.0), ("shr_cagr", 10, 3.0, -2.0), ("eq_assets", 8, 3.0, 15.0)]
+SPEC_NF = [("roic_med5", 25, 8.0, 25.0), ("roic_persist", 5, 25.0, 100.0), ("op_margin3", 12, 5.0, 25.0),
+           ("rev_cagr5", 16, 2.0, 14.0), ("rev_cagr9", 6, 0.0, 10.0), ("rev_worst", 10, -8.0, 4.0), ("eps_cagr5", 14, 3.0, 15.0), ("shr_cagr", 12, 3.0, -2.0)]
+SPEC_FIN = [("roe3", 20, 8.0, 20.0), ("roe_persist", 5, 25.0, 100.0), ("pt_margin3", 10, 15.0, 40.0), ("rev_cagr5", 12, 2.0, 14.0),
+            ("rev_worst", 8, -8.0, 4.0), ("eps_cagr5", 12, 3.0, 15.0), ("shr_cagr", 10, 3.0, -2.0), ("eq_assets", 8, 3.0, 15.0),
+            ("ni_resil", 15, 1.0, 0.1)]
+FIN_CAP = 60.0
 PERSIST_HURDLE = 10.0
 FIN_NAME_HINTS = ("loan", "deposit")
 
@@ -57,7 +63,7 @@ def detect_profile(inc, bal=None, year=None):
     return "NF", "operating statements"
 
 
-def _roic_series(inc, bal, years):
+def _roic_series(inc, bal, years, add_sbc=None, net_cash=False):
     out, inputs = {}, {}
     for y in years:
         op, eq = q1._g(inc, "Operating Income", y), q1._g(bal, "Total Equity", y)
@@ -69,6 +75,10 @@ def _roic_series(inc, bal, years):
         minority = q1._g(bal, "Minority Interest", y) or 0.0
         debt = sum(q1._g(bal, l, y) or 0.0 for l in ("Short-Term Debt", "Current Portion of Long-Term Debt", "Long-Term Debt"))
         capital = eq + minority + debt + q1._lease_total(bal, y)
+        if net_cash:
+            capital -= (q1._first(bal, ["Cash & Cash Equivalents", "Cash Equivalents"], y) or 0.0) + (q1._g(bal, "Short-Term Investments", y) or 0.0)
+        if add_sbc:
+            op = op + abs(add_sbc.get(y) or 0.0)
         if capital > 0:
             out[y] = op * (1 - rate) / capital * 100.0
             inputs[y] = {"op": op, "tax_rate": round(rate, 4), "capital": capital}
@@ -85,12 +95,12 @@ def _avg(values):
     return sum(values) / len(values) if values else None
 
 
-def compute_v3(profitability_html, income_html, balance_html, cashflow_html, profile=None):
+def compute_v4(profitability_html, income_html, balance_html, cashflow_html, profile=None, roic_mode="gaap"):
     inc, iy, iinfo = q1.parse_financial_table(income_html)
     bal, by, binfo = q1.parse_financial_table(balance_html)
     cfs, cy, cinfo = q1.parse_financial_table(cashflow_html)
     years = sorted(set(iy) & set(by))
-    out = {"v": "v3.1", "profile": None, "metrics": {}, "scores": {}, "q": None, "coverage_pct": 0, "flags": [], "warnings": [],
+    out = {"v": "v4.0", "profile": None, "metrics": {}, "scores": {}, "q": None, "coverage_pct": 0, "flags": [], "warnings": [],
            "display": "n/a", "details": {}}
     if len(years) < 5:
         out["warnings"].append("history too short: {} common FY".format(len(years)))
@@ -121,6 +131,10 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
         if long_cagr is not None and abs(m["rev_cagr5"] - long_cagr) > 10:
             out["warnings"].append("revenue base effect: 5y {:.0f}% vs {}y {:.0f}%".format(m["rev_cagr5"], long_years[-1] - long_years[0], long_cagr))
 
+    if len(long_years) >= 9 and long_years[-1] - long_years[0] >= 8:
+        m["rev_cagr9"] = _cagr(rev[long_years[0]], rev[long_years[-1]], long_years[-1] - long_years[0])
+        det["rev_cagr9"] = {"first_year": long_years[0], "last_year": long_years[-1]}
+
     # --- EPS CAGR (3Y-averaged endpoints, else single years), both endpoints must be positive
     eps = {y: q1._first(inc, ["EPS (Diluted)", "EPS Diluted"], y) for y in years}
     e_end = [eps[y] for y in years[-3:] if eps.get(y) is not None]
@@ -138,7 +152,7 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
     # --- returns
     ni = {y: q1._g(inc, "Net Income", y) for y in years}
     if prof == "NF":
-        raw, inputs = _roic_series(inc, bal, last8)
+        raw, inputs = _roic_series(inc, bal, last8, net_cash=(roic_mode == "cash"))
         page3, _ = q1.roic3y_from_page(profitability_html)
         last3_vals = [raw[y] for y in last3 if y in raw]
         comp3 = _avg(last3_vals) if len(last3_vals) == 3 else None
@@ -155,6 +169,18 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
             m["roic_persist"] = 100.0 * sum(1 for v in vals8 if v >= PERSIST_HURDLE) / len(vals8)
         det["roic"] = {"series": {str(y): round(v, 1) for y, v in series.items()}, "scale": scale, "page3y": page3, "computed3y": comp3,
                        "years_med": [y for y in last5 if y in series], "years_persist": [y for y in last8 if y in series]}
+        sbc = {y: q1._g(cfs, "Stock-Based Compensation", y) for y in years}
+        if any(v is not None for v in sbc.values()):
+            rs, _ = _roic_series(inc, bal, last5, add_sbc=sbc)
+            rg, _ = _roic_series(inc, bal, last5)
+            if len(rs) >= 4:
+                det["diag_roic_sbc_med5"] = round(statistics.median(rs.values()), 1)
+                det["diag_roic_gaap_unscaled_med5"] = round(statistics.median(rg.values()), 1) if rg else None
+            if sbc.get(last) is not None and rev.get(last):
+                det["diag_sbc_pct_rev"] = round(100.0 * abs(sbc[last]) / rev[last], 1)
+        rc, _ = _roic_series(inc, bal, last5, net_cash=True)
+        if len(rc) >= 4:
+            det["diag_roic_netcash_med5"] = round(statistics.median(rc.values()), 1)
         om = [100.0 * q1._g(inc, "Operating Income", y) / rev[y] for y in last3 if q1._g(inc, "Operating Income", y) is not None and rev.get(y)]
         if len(om) == 3:
             m["op_margin3"] = _avg(om)
@@ -170,6 +196,18 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
         if len(roe) >= 5:
             m["roe_persist"] = 100.0 * sum(1 for v in roe.values() if v >= PERSIST_HURDLE) / len(roe)
         det["roe"] = {"series": {str(y): round(v, 1) for y, v in roe.items()}}
+        nis = [ni[y] for y in last8 if ni.get(y) is not None]
+        if len(nis) >= 5:
+            mean_abs = _avg([abs(v) for v in nis])
+            if mean_abs > 0:
+                m["ni_resil"] = statistics.pstdev(nis) / mean_abs
+        nii_hits = []
+        for y in last5:
+            n_, p_ = q1._g(inc, "Net Interest Income (Expense)", y), q1._g(inc, "Pre-Tax Income", y)
+            if n_ is not None and p_ and p_ > 0:
+                nii_hits.append(abs(n_) / p_)
+        if nii_hits:
+            det["diag_nii_share_pretax"] = {"avg": round(_avg(nii_hits), 2), "years_over_50pct": sum(1 for v in nii_hits if v > 0.5), "n": len(nii_hits)}
         pm = [100.0 * q1._g(inc, "Pre-Tax Income", y) / rev[y] for y in last3 if q1._g(inc, "Pre-Tax Income", y) is not None and rev.get(y)]
         if len(pm) == 3:
             m["pt_margin3"] = _avg(pm)
@@ -200,7 +238,7 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
     if m.get("shr_cagr") is not None and m["shr_cagr"] > 5:
         flags.append("dilution>5%/yr")
     if m.get("rev_cagr5") is not None and m["rev_cagr5"] < 0:
-        flags.append("revenue CAGR<0")
+        out["warnings"].append("revenue CAGR<0")
     mg = m.get("op_margin3") if prof == "NF" else m.get("pt_margin3")
     if mg is not None and mg < 0:
         flags.append("margin<0")
@@ -221,6 +259,8 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
                 warns.append("interest cover<2x")
     else:
         warns.append("financial: rate-sensitive earnings, no regulatory capital data")
+    if det.get("diag_sbc_pct_rev") is not None and det["diag_sbc_pct_rev"] >= 8:
+        warns.append("SBC {:.0f}% of revenue".format(det["diag_sbc_pct_rev"]))
     cn = v1m.get("cfo_ni")
     if cn is not None and (cn < 0.6 or cn > 3):
         warns.append("CFO/NI {:.1f}".format(cn))
@@ -233,6 +273,9 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
         warns.append("share-count jump>30% (split or issuance?)")
 
     shown = None if q is None else (min(q, 50.0) if flags else q)
+    if shown is not None and prof == "FIN" and shown > FIN_CAP:
+        flags.append("financial cap {:.0f}".format(FIN_CAP))
+        shown = FIN_CAP
     out.update({
         "metrics": {k: (None if v is None else round(v, 2)) for k, v in m.items()},
         "scores": {k: (None if v is None else round(v, 1)) for k, v in scores.items()},
@@ -243,3 +286,6 @@ def compute_v3(profitability_html, income_html, balance_html, cashflow_html, pro
                    else "%d | cov %d%%" % (round(shown), round(coverage * 100)),
     })
     return out
+
+
+compute_v3 = compute_v4  # alias for callers
