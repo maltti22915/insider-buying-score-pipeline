@@ -1,0 +1,36 @@
+# as_validation_batch.yml v1 -- scores a list of AlphaSpread tickers with v1 and Q v3 + Now, one browser per ticker
+name: AS Validation Batch
+on:
+  workflow_dispatch:
+    inputs:
+      as_paths:
+        description: "AlphaSpread paths separated by space or comma (empty = the 15 watchlist names)"
+        default: ""
+      user_tiers:
+        description: "Optional reference tiers, e.g. nyse/msci=A nasdaq/app=B nyse/baba=C"
+        default: ""
+jobs:
+  batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install seleniumbase && sudo apt-get install -y xvfb
+      - name: Unit tests
+        run: |
+          python extractor_tests/test_as_quality_metrics.py
+          python extractor_tests/test_as_ttm_metrics.py
+          python extractor_tests/test_as_quality_v3.py
+      - run: xvfb-run -a python as_validation_batch.py
+        env:
+          AS_PATHS: ${{ inputs.as_paths }}
+          USER_TIERS: ${{ inputs.user_tiers }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation_results
+          path: |
+            results.json
+            as_pages/
