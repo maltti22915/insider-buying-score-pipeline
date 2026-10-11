@@ -1,5 +1,6 @@
 """
-as_ttm_metrics.py v1.1 (cell parts joined with a space: "TTM<br>Mar 2024" is read as "TTM Mar 2024") -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
+as_ttm_metrics.py v1.2 (profile argument; FIN skips FCF and gross-margin signals; implausible >40pp margin changes ignored)
+v1.1 (cell parts joined with a space: "TTM<br>Mar 2024" is read as "TTM Mar 2024") -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
 
 Pure functions, no browser. Input = page HTML after the toggle was clicked:
   income statement  -> TTM       (header cells "TTM Jun 2026")
@@ -175,7 +176,7 @@ def _window(inc, cfs, p):
             "gm": _margin(gp, rev), "om": _margin(op, rev), "fcfm": _margin(_fcf_sbc(cfs, p), rev)}
 
 
-def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pct=None):
+def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pct=None, profile="NF"):
     out = {"signals": {}, "scores": {}, "levels": {}, "now": None, "warnings": [], "details": {}}
     inc, ip, iinfo = parse_period_table(income_ttm_html, "ttm")
     cfs, cp, cinfo = parse_period_table(cashflow_ttm_html, "ttm")
@@ -213,8 +214,13 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
             sig["rev_accel"] = growth - base
             out["details"]["rev_accel_vs"] = how
     for key, name in (("om_delta", "om"), ("gm_delta", "gm"), ("fcfm_delta", "fcfm")):
+        if profile == "FIN" and name in ("fcfm", "gm"):
+            continue   # client cash flows (brokers, banks) make FCF meaningless; no gross profit concept
         a, b = now_w[name], prev_w[name]
         if a is not None and b is not None:
+            if abs(a - b) > 40:   # a change of more than 40pp in a margin is a data artefact, not a signal
+                out["warnings"].append("{} change {:.0f}pp ignored (implausible)".format(key, a - b))
+                continue
             sig[key] = a - b
     for key, (weak, strong) in NOW_SPEC.items():
         s = score_signal(sig.get(key), weak, strong)
