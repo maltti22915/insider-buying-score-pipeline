@@ -41,7 +41,7 @@ def click_view(sb, toggle):
         for _ in range(10):
             sb.sleep(1.0)
             src = sb.get_page_source()
-            if re.search(pattern, src):
+            if re.search(pattern, re.sub(r"<[^>]+>", " ", src)):
                 return src, ""
         return "", "header did not change"
     except Exception as e:
