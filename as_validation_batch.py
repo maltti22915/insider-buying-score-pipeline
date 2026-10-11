@@ -119,6 +119,7 @@ def run_one(path):
                 sb.sleep(1.5)
             open(os.path.join(folder, "moat.html"), "w", encoding="utf-8").write(msrc)
             moat = as_moat.parse_moat(msrc)
+            print("  page moat          rating={} adv={}".format(moat.get("rating"), moat.get("advantages")), flush=True)
         except Exception as e:
             moat = {"rating": None, "warnings": ["moat page: " + type(e).__name__]}
     rec = {"path": path, "notes": notes, "moat": moat}
@@ -170,7 +171,7 @@ for r in results:
         x1.append(v["v1"]["struct"]); x3.append(v["q_capped"]); xj.append(JUDGMENT[r["path"]])
 print("\nSPEARMAN vs reference ranking (n={}): v1 Struct={}  Q v3={}".format(len(xj), f(spearman(x1, xj), 2), f(spearman(x3, xj), 2)))
 print("NOTES:", {r["path"]: r["notes"] for r in results if r.get("notes")})
-print("SUMMARY_JSON " + json.dumps([{"path": r["path"], "profile": (r.get("v3") or {}).get("profile"), "q": (r.get("v3") or {}).get("q_capped"),
+print("SUMMARY_JSON " + json.dumps([{"moat": (r.get("moat") or {}).get("rating"), "moat_adv": (r.get("moat") or {}).get("advantages"), "path": r["path"], "profile": (r.get("v3") or {}).get("profile"), "q": (r.get("v3") or {}).get("q_capped"),
       "v1": ((r.get("v3") or {}).get("v1") or {}).get("struct"), "metrics": (r.get("v3") or {}).get("metrics"),
       "now": (r.get("now") or {}).get("now"), "signals": (r.get("now") or {}).get("signals")} for r in results], default=str))
 
