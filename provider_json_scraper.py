@@ -1417,6 +1417,38 @@ AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/i
                     ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
 
 
+# v21: the statement pages have an Annual / Quarterly / TTM switch. Income + cash flow -> TTM, balance sheet -> Quarterly.
+AS_TTM_TOGGLE = {"income": ("TTM", r"TTM\s+[A-Z][a-z]{2}\s+\d{4}"), "cashflow": ("TTM", r"TTM\s+[A-Z][a-z]{2}\s+\d{4}"),
+                 "balance": ("Quarterly", r"Q\d\s*FY\d{4}")}
+
+
+def _as_click_view(sb, toggle):
+    """Clicks the view switch by its visible text and returns the page source once the new header shows; '' on any failure."""
+    label, ready_pattern = toggle
+    try:
+        clicked = sb.execute_script(
+            "var want = arguments[0], best = null;"
+            "document.querySelectorAll('button, a, label, li, span, div').forEach(function (e) {"
+            "  if (e.children.length === 0 && (e.textContent || '').trim() === want) { best = best || e; } });"
+            "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';", label)
+        if clicked != "clicked":
+            step("quality_view_" + label.lower(), "FAIL", reason="toggle not found")
+            return ""
+        source = ""
+        for _ in range(10):
+            sb.sleep(1.0)
+            source = sb.get_page_source()
+            if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
+                step("quality_view_" + label.lower(), "OK", chars=len(source))
+                return source
+        step("quality_view_" + label.lower(), "FAIL", reason="header did not change")
+        return ""
+    except Exception as view_error:
+        step("quality_view_" + label.lower(), "FAIL", reason=type(view_error).__name__)
+        return ""
+
+
+
 def fetch_as_quality(sb, abbrev_as):
     """Never raises: the DCF must not depend on it. Fills _AS_QUALITY with the metrics dict (see as_quality_metrics)."""
     _AS_QUALITY.clear()
@@ -1426,7 +1458,7 @@ def fetch_as_quality(sb, abbrev_as):
         step("quality", "FAIL", reason="as_quality_metrics.py missing: " + type(import_error).__name__)
         return
     base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
-    pages = {}
+    pages, ttm_pages = {}, {}
     for name, path in AS_QUALITY_PAGES:
         try:
             sb.uc_open_with_reconnect(base + path, 4)
@@ -1442,6 +1474,8 @@ def fetch_as_quality(sb, abbrev_as):
                 continue
             pages[name] = source
             step("quality_" + name, "OK", chars=len(source))
+            if name in AS_TTM_TOGGLE:  # v21: same page, other view (TTM / Quarterly); never blocks the annual metrics
+                ttm_pages[name] = _as_click_view(sb, AS_TTM_TOGGLE[name])
         except Exception as page_error:
             step("quality_" + name, "FAIL", reason=type(page_error).__name__)
     if not all(k in pages for k in ("income", "balance", "cashflow")):
@@ -1461,6 +1495,17 @@ def fetch_as_quality(sb, abbrev_as):
         "diag": {"roic3y_source": diag.get("roic3y_source"), "last5": diag.get("last5"), "notes": diag.get("notes"),
                  "income_cols": (diag.get("income") or {}).get("columns"), "warnings": [v.get("warning") for v in (diag.get("income"), diag.get("balance"), diag.get("cashflow")) if v and v.get("warning")]},
     })
+    now_block = None
+    if all(ttm_pages.get(k) for k in ("income", "cashflow")):
+        try:
+            import as_ttm_metrics
+            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages["cashflow"], ttm_pages.get("balance", ""))
+            _AS_QUALITY["now"] = now_block
+            step("quality_now", "OK", now=now_block.get("now"), signals=now_block.get("signals"), warnings=";".join(now_block.get("warnings") or []) or "none")
+        except Exception as now_error:
+            step("quality_now", "FAIL", reason=type(now_error).__name__ + ": " + str(now_error)[:60])
+    else:
+        step("quality_now", "FAIL", reason="TTM views missing")
     step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none", roic_scale=diag.get("roic_scale"), roic_min5=(result["metrics"].get("roic_min5") if result.get("metrics") else None))
 
 
@@ -1674,7 +1719,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v20",
+            "v": "v21",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
