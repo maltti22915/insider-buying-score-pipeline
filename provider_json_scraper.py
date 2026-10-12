@@ -33,7 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
-  v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
+  v24: GuruFocus off by default (GF_ENABLED=1); providers run in parallel child processes (PARALLEL=0 = old sequential run), webhook posts serialised by a file lock. v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
   rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
   profile (financials skip FCF and gross margin). Needs as_quality_v4.py, as_moat.py, as_ttm_metrics.py in the repo root.
 VERSION 11
@@ -244,6 +244,11 @@ VERSION 1 (NEW WORK)
 """
 
 import html
+import fcntl
+import sys
+import threading
+import tempfile
+import subprocess
 import json
 import os
 import random
@@ -1224,6 +1229,12 @@ GF_PAGES = (
 )
 GF_PAGE_MIN_CHARS = 1500
 GF_MAX_ATTEMPTS = int(os.environ.get("GF_MAX_ATTEMPTS", "2"))  # v15
+# v24: GuruFocus is switched off by default (GF_ENABLED=1 turns it back on). The AlphaSpread ratio pages already give P/E, P/OCF, P/FCF.
+GF_ENABLED = os.environ.get("GF_ENABLED", "0").strip() == "1"
+# v24: providers run in parallel, one browser process each (PARALLEL=0 restores the old one-after-the-other run).
+PARALLEL_PROVIDERS = os.environ.get("PARALLEL", "1").strip() != "0"
+PARALLEL_START_GAP_SECONDS = float(os.environ.get("PARALLEL_START_GAP", "8"))   # staggered browser starts (undetected-chromedriver patches a shared driver file)
+POST_LOCK_PATH = os.path.join(tempfile.gettempdir(), "provider_json_post.lock")
 
 
 def text_only_page(html):
@@ -1681,9 +1692,16 @@ def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name
     label = "Row {} ({}) {}".format(row_number, abbrev, target)
 
     try:
-        response = requests.post(
-            webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT_SECONDS
-        )
+        # v24: providers run in parallel processes, but their webhooks go one at a time (each handler holds the sheet's
+        # document lock; overlapping posts caused LOCK_TIMEOUT refusals). The file lock is released when the reply is back.
+        with open(POST_LOCK_PATH, "a") as post_lock_file:
+            fcntl.flock(post_lock_file, fcntl.LOCK_EX)
+            try:
+                response = requests.post(
+                    webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT_SECONDS
+                )
+            finally:
+                fcntl.flock(post_lock_file, fcntl.LOCK_UN)
     except Exception as post_error:
         print("❌ {}: webhook POST itself failed: {}".format(label, post_error))
         _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "post_failed:" + type(post_error).__name__})
@@ -1755,7 +1773,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v23",
+            "v": "v24",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1791,8 +1809,57 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
         _LAST_POST.update(saved_post)
 
 
+def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_name, run_started, run_started_utc):
+    """
+    v24: one child process per provider (same script, env ONLY_TARGET), each with its own browser, started a few
+    seconds apart. Tabs in one browser would not help: a WebDriver runs one command at a time and background tabs are
+    throttled, so the real gain is separate browsers. Webhook posts are serialised by POST_LOCK_PATH. Child output is
+    streamed with a [TARGET] prefix; their traces are merged into one RUN_SUMMARY.
+    """
+    children = []
+    ordered = [p for p in providers if p[1]]
+    # slowest first: Simply Wall St, then AlphaSpread, then MarketScreener
+    rank = {"SW": 0, "ASDCF": 1, "MS": 2, "GFP": 3}
+    ordered.sort(key=lambda p: rank.get(p[0], 9))
+    for target, abbrev, _ in providers:
+        if not abbrev:
+            print("⏩ Row {}: no abbreviation for {} -- skipping.".format(row_number, target))
+            trace[target] = {"abbrev": "", "status": "skipped", "attempts": []}
+    print("🧵 v24: running {} providers in parallel ({})".format(len(ordered), ", ".join(p[0] for p in ordered)))
+
+    def pump(target, process):
+        for line in process.stdout:
+            print("[{}] {}".format(target, line.rstrip("\n")), flush=True)
+
+    for index, (target, abbrev, _) in enumerate(ordered):
+        trace_path = os.path.join(tempfile.gettempdir(), "trace_{}_{}.json".format(target, os.getpid()))
+        if os.path.exists(trace_path):
+            os.remove(trace_path)
+        child_env = dict(os.environ, ONLY_TARGET=target, TRACE_OUT=trace_path, PYTHONUNBUFFERED="1", GH_LOG_UPLOAD="0")  # the parent uploads the combined log once
+        process = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=child_env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        reader = threading.Thread(target=pump, args=(target, process), daemon=True)
+        reader.start()
+        children.append((target, abbrev, process, reader, trace_path))
+        if index < len(ordered) - 1:
+            time.sleep(PARALLEL_START_GAP_SECONDS)
+
+    for target, abbrev, process, reader, trace_path in children:
+        process.wait()
+        reader.join(timeout=5)
+        try:
+            with open(trace_path) as trace_file:
+                trace.update(json.load(trace_file))
+        except Exception as trace_error:
+            print("⚠️ {}: child ended without a trace ({}); exit code {}".format(target, trace_error, process.returncode))
+            trace[target] = {"abbrev": abbrev, "status": "error", "attempts": [], "reason": "child_no_trace_rc{}".format(process.returncode)}
+
+    print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
+    print("🧹 Task complete!")
+
+
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v23 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v24 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1821,8 +1888,16 @@ def run_bot():
         ("SW", abbrev_sw, scrape_sw_data),
         ("ASDCF", abbrev_as, scrape_as_dcf),
         ("MS", abbrev_ms, scrape_ms_data),
-        ("GFP", abbrev_gf, scrape_gf_data),  # v14: trace/summary key GFP, webhook target GFP
     ]
+    if GF_ENABLED:
+        providers.append(("GFP", abbrev_gf, scrape_gf_data))  # v14: trace/summary key GFP, webhook target GFP (v24: only when GF_ENABLED=1)
+    elif abbrev_gf:
+        print("⏩ GuruFocus is switched off (GF_ENABLED=0) -- ABBREV_GF ignored.")
+
+    only_target = os.environ.get("ONLY_TARGET", "").strip()
+    child_mode = bool(only_target)
+    if child_mode:
+        providers = [p for p in providers if p[0] == only_target]
 
     if not any(abbrev for _, abbrev, _ in providers):
         print(
@@ -1830,6 +1905,11 @@ def run_bot():
             " nothing to scrape this run.".format(row_number)
         )
         print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
+        return
+
+    active = [p for p in providers if p[1]]
+    if PARALLEL_PROVIDERS and not child_mode and len(active) > 1:
+        run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_name, run_started, run_started_utc)
         return
 
     modes_text = os.environ.get("LAUNCH_MODES", DEFAULT_LAUNCH_MODES)
@@ -1957,6 +2037,10 @@ def run_bot():
 
         info["seconds"] = round(time.monotonic() - provider_clock)
 
+    if child_mode and os.environ.get("TRACE_OUT"):
+        with open(os.environ["TRACE_OUT"], "w") as trace_file:
+            json.dump(trace, trace_file)
+        return
     print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
     print("🧹 Task complete!")
 
