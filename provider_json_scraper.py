@@ -33,7 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
-  Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
+  v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
   rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
   profile (financials skip FCF and gross margin). Needs as_quality_v4.py, as_moat.py, as_ttm_metrics.py in the repo root.
 VERSION 11
@@ -1519,7 +1519,7 @@ def fetch_as_quality(sb, abbrev_as):
         v4_block["diag"] = {k: det.get(k) for k in ("profile_reason", "diag_roic_sbc_med5", "diag_sbc_pct_rev", "diag_roic_netcash_med5", "diag_nii_share_pretax",
                                                      "goodwill_pct", "interest_cover", "rev_cagr_long")}
         _AS_QUALITY["v4"] = v4_block
-        step("quality_v4", "OK", q=v4_full.get("q_capped"), profile=v4_full.get("profile"), cov=v4_full.get("coverage_pct"), flags=",".join(v4_full.get("flags") or []) or "none")
+        step("quality_v4", "OK", scorer=v4_full.get("v"), q=v4_full.get("q_capped"), profile=v4_full.get("profile"), cov=v4_full.get("coverage_pct"), flags=",".join(v4_full.get("flags") or []) or "none")
     except Exception as v4_error:
         step("quality_v4", "FAIL", reason=type(v4_error).__name__ + ": " + str(v4_error)[:60])
     try:
@@ -1755,7 +1755,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v22",
+            "v": "v23",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1792,7 +1792,7 @@ def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v22 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v23 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
