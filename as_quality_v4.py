@@ -3,7 +3,7 @@ as_quality_v3.py v1.1 (EPS label "EPS (Diluted)", profile detection by balance-s
 Pure functions, no browser. Reuses the parsers and the ROIC rule of as_quality_metrics.py (v1 "Struct" is computed alongside for comparison).
 
 Non-financial profile (weights sum to 100; score = linear lo -> 0 pts, hi -> 100 pts):
-  roic_med5     ROIC, median of the last 5 FY (own yearly series scaled to the page's 3Y average)   8% -> 25%     w26
+  roic_med5     ROIC, median of the last 5 FY (own yearly series, NOT scaled in v5)                 8% -> 25%     w25
   roic_persist  share of the last 8 FY (>= 5 valid) with ROIC >= 10%                                 25% -> 100%   w8
   op_margin3    operating income / revenue, 3Y average                                               5% -> 25%     w12
   rev_cagr5     revenue CAGR over the last 5 FY                                                      2% -> 14%     w18
@@ -22,6 +22,12 @@ Missing metrics are dropped and the weights rescaled; Q shows n/a when coverage 
 v4 changes vs v3 (second-opinion review, Oct 2026): rev_cagr9 added (base effects), roic_persist weight 8->5, revenue CAGR<0 is a warning (no cap),
 financial profile: ni_resil (net-income volatility, 15) added and Q capped at 60 (FIN_CAP), net-interest-income share of pre-tax income as diagnostic,
 diagnostics for every profile: ROIC with SBC added back, SBC / revenue, ROIC net of cash (roic_mode="cash" scores that variant instead of GAAP).
+
+v5 changes vs v4 (review of Oct 12 2026): (1) ROIC series is no longer multiplied by page 3Y ROIC / computed 3Y ROIC (the factor was 0.7-2.2 and went in
+different directions per company); the page value stays as a comparison in details.roic.page3y and page_ratio. (2) rev_cagr9 needs nine elapsed years
+(FY first -> FY last >= 9), otherwise it is missing and the weights are rescaled. (3) Capital = equity + minority interest + debt + lease rows ONLY if the
+balance sheet has a lease line; AlphaSpread's balance sheets for the 15 test companies have none, so leases are NOT included and ROIC is somewhat overstated
+for lease-heavy companies.
 """
 import statistics
 import as_quality_metrics as q1
@@ -100,7 +106,7 @@ def compute_v4(profitability_html, income_html, balance_html, cashflow_html, pro
     bal, by, binfo = q1.parse_financial_table(balance_html)
     cfs, cy, cinfo = q1.parse_financial_table(cashflow_html)
     years = sorted(set(iy) & set(by))
-    out = {"v": "v4.0", "profile": None, "metrics": {}, "scores": {}, "q": None, "coverage_pct": 0, "flags": [], "warnings": [],
+    out = {"v": "v5.0", "profile": None, "metrics": {}, "scores": {}, "q": None, "coverage_pct": 0, "flags": [], "warnings": [],
            "display": "n/a", "details": {}}
     if len(years) < 5:
         out["warnings"].append("history too short: {} common FY".format(len(years)))
@@ -131,7 +137,7 @@ def compute_v4(profitability_html, income_html, balance_html, cashflow_html, pro
         if long_cagr is not None and abs(m["rev_cagr5"] - long_cagr) > 10:
             out["warnings"].append("revenue base effect: 5y {:.0f}% vs {}y {:.0f}%".format(m["rev_cagr5"], long_years[-1] - long_years[0], long_cagr))
 
-    if len(long_years) >= 9 and long_years[-1] - long_years[0] >= 8:
+    if len(long_years) >= 9 and long_years[-1] - long_years[0] >= 9:   # v5: nine ELAPSED years (10 fiscal years), else n/a
         m["rev_cagr9"] = _cagr(rev[long_years[0]], rev[long_years[-1]], long_years[-1] - long_years[0])
         det["rev_cagr9"] = {"first_year": long_years[0], "last_year": long_years[-1]}
 
@@ -156,10 +162,11 @@ def compute_v4(profitability_html, income_html, balance_html, cashflow_html, pro
         page3, _ = q1.roic3y_from_page(profitability_html)
         last3_vals = [raw[y] for y in last3 if y in raw]
         comp3 = _avg(last3_vals) if len(last3_vals) == 3 else None
+        # v5: the series is NOT scaled to the page's 3Y ROIC any more (the factor differed in size and direction per company and
+        # could not be explained). The page value is kept as a comparison only: details.roic.page3y / computed3y / page_ratio.
         scale = None
-        if page3 is not None and comp3 is not None and page3 > 0 and comp3 > 0:
-            scale = min(3.0, max(0.3, page3 / comp3))
-        sc = scale if scale is not None else 1.0
+        page_ratio = (page3 / comp3) if (page3 is not None and comp3 is not None and page3 > 0 and comp3 > 0) else None
+        sc = 1.0
         series = {y: v * sc for y, v in raw.items()}
         vals5 = [series[y] for y in last5 if y in series]
         if len(vals5) >= 4:
@@ -167,7 +174,7 @@ def compute_v4(profitability_html, income_html, balance_html, cashflow_html, pro
         vals8 = [series[y] for y in last8 if y in series]
         if len(vals8) >= 5:
             m["roic_persist"] = 100.0 * sum(1 for v in vals8 if v >= PERSIST_HURDLE) / len(vals8)
-        det["roic"] = {"series": {str(y): round(v, 1) for y, v in series.items()}, "scale": scale, "page3y": page3, "computed3y": comp3,
+        det["roic"] = {"series": {str(y): round(v, 1) for y, v in series.items()}, "scale": None, "page_ratio": (round(page_ratio, 2) if page_ratio else None), "page3y": page3, "computed3y": comp3,
                        "years_med": [y for y in last5 if y in series], "years_persist": [y for y in last8 if y in series]}
         sbc = {y: q1._g(cfs, "Stock-Based Compensation", y) for y in years}
         if any(v is not None for v in sbc.values()):
