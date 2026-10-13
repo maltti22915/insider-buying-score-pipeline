@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v25: MarketScreener 'Access Denied' (Akamai block of the runner address) is no longer final: home-page warm-up, then Scrape.do fallback (steps ms_warmup / ms_scrapedo); SW retries capped at SW_MAX_ATTEMPTS (3; blocks come in clusters per runner address, later tries rarely pass).
   v24: GuruFocus off by default (GF_ENABLED=1); providers run in parallel child processes (PARALLEL=0 = old sequential run), webhook posts serialised by a file lock. v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
   rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
   profile (financials skip FCF and gross margin). Needs as_quality_v4.py, as_moat.py, as_ttm_metrics.py in the repo root.
@@ -1179,6 +1180,24 @@ def log_as_page_state(sb):
 MS_MIN_HTML_CHARS = 30000
 
 
+def fetch_ms_via_scrapedo(url):
+    """v25: MarketScreener fallback when the runner's browser gets Akamai 'Access Denied'. Returns the page HTML, or '' on failure / no token."""
+    token = (os.environ.get("SCRAPE_DO_TOKEN") or os.environ.get("SCRAPEDO_TOKEN") or "").strip()
+    if not token:
+        print("ℹ️ MS: no SCRAPE_DO_TOKEN in the environment -- Scrape.do route skipped.")
+        return ""
+    from urllib.parse import quote_plus
+    for extra in ("&render=true", "&render=true&super=true"):
+        try:
+            response = requests.get("https://api.scrape.do?token={}&url={}{}".format(token, quote_plus(url), extra), timeout=120)
+            if response.status_code == 200 and len(response.text) >= MS_MIN_HTML_CHARS and any(m in response.text for m in ("Last Close", "Consensus", "Capitalization")):
+                return response.text
+            print("ℹ️ MS Scrape.do ({}): http {} / {} chars -- not usable.".format(extra, response.status_code, len(response.text)))
+        except Exception as request_error:
+            print("ℹ️ MS Scrape.do ({}): {}".format(extra, type(request_error).__name__))
+    return ""
+
+
 def scrape_ms_data(sb, abbrev_ms, row_number, headless=True):
     """
     v11: opens the MarketScreener quote page for abbrev_ms, waits for any
@@ -1198,10 +1217,34 @@ def scrape_ms_data(sb, abbrev_ms, row_number, headless=True):
                 CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"))
     step("challenge_check", "OK")
 
+    def ms_page_ok(page_html):
+        return len(page_html) >= MS_MIN_HTML_CHARS and any(m in page_html for m in ("Last Close", "Consensus", "Capitalization"))
+
     html = sb.get_page_source() or ""
     title = sb.get_title() or ""
-    if len(html) < MS_MIN_HTML_CHARS or not any(
-            m in html for m in ("Last Close", "Consensus", "Capitalization")):
+    if not ms_page_ok(html):
+        step("read_page", "FAIL", chars=len(html), title=title[:60])
+        # v25: "Access Denied" (reference #18.xxx, errors.edgesuite.net) is an Akamai block of the runner's address, not a Cloudflare challenge.
+        # 1) warm-up: open the home page first (Akamai sets its cookies there), then the quote page again.
+        # 2) if still denied: fetch the quote page through Scrape.do (residential address, only used on this failure).
+        try:
+            sb.uc_open_with_reconnect("https://www.marketscreener.com/", reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(3)
+            sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(PAGE_SETTLE_SECONDS)
+            html = sb.get_page_source() or ""
+            title = sb.get_title() or ""
+            step("ms_warmup", "OK" if ms_page_ok(html) else "FAIL", chars=len(html), title=title[:60])
+        except Exception as warm_error:
+            step("ms_warmup", "FAIL", reason=type(warm_error).__name__)
+    if not ms_page_ok(html):
+        via_html = fetch_ms_via_scrapedo(url)
+        if via_html:
+            html, title = via_html, "MarketScreener (via Scrape.do)"
+            step("ms_scrapedo", "OK", chars=len(html))
+        else:
+            step("ms_scrapedo", "FAIL", reason="no token, or the page was incomplete")
+    if not ms_page_ok(html):
         step("read_page", "FAIL", chars=len(html), title=title[:60])
         failure_report(sb, "read_page", "page too small or without price/consensus blocks ({} chars)".format(len(html)),
                        looking_for="Last Close|Consensus|Capitalization")
@@ -1773,7 +1816,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v24",
+            "v": "v25",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1859,7 +1902,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v24 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v25 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1942,6 +1985,8 @@ def run_bot():
             attempts = max(1, int(os.environ.get("CF_RETRY_ATTEMPTS", DEFAULT_CF_RETRY_ATTEMPTS)))
         except ValueError:
             attempts = DEFAULT_CF_RETRY_ATTEMPTS
+        if target == "SW":
+            attempts = min(attempts, int(os.environ.get("SW_MAX_ATTEMPTS", "3")))  # v25: blocks come in clusters per runner address
         if target == "GFP":
             attempts = min(attempts, GF_MAX_ATTEMPTS)  # v15: GuruFocus blocks are rarely cleared by retrying
 
