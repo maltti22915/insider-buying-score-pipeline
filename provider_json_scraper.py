@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v26: one final row recalculation per parallel run instead of four (handlers get skipRecalc; the parent sends ASRP recalcOnly last). SINGLE_RECALC=0 restores the old behaviour.
   v25: MarketScreener 'Access Denied' (Akamai block of the runner address) is no longer final: home-page warm-up, then Scrape.do fallback (steps ms_warmup / ms_scrapedo); SW retries capped at SW_MAX_ATTEMPTS (3; blocks come in clusters per runner address, later tries rarely pass).
   v24: GuruFocus off by default (GF_ENABLED=1); providers run in parallel child processes (PARALLEL=0 = old sequential run), webhook posts serialised by a file lock. v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
   rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
@@ -1276,6 +1277,11 @@ GF_MAX_ATTEMPTS = int(os.environ.get("GF_MAX_ATTEMPTS", "2"))  # v15
 GF_ENABLED = os.environ.get("GF_ENABLED", "0").strip() == "1"
 # v24: providers run in parallel, one browser process each (PARALLEL=0 restores the old one-after-the-other run).
 PARALLEL_PROVIDERS = os.environ.get("PARALLEL", "1").strip() != "0"
+# v26: in a parallel run the four recalculating handlers (MS, SW, SWP, ASRP) each re-did the whole row calculation (20-25 s apiece, under the
+# sheet lock). Now they only write their cells (payload skipRecalc) and ONE recalculation (target ASRP, recalcOnly) runs after all providers finished.
+# Needs the AlphaSpread abbreviation (the recalc request goes through the ASRP handler) and Apps Script fn_91_01 v5, fn_91_04 v6, fn_91_05 v2, fn_91_07 v2.
+SINGLE_RECALC = os.environ.get("SINGLE_RECALC", "1").strip() != "0"
+_POST_FLAGS = {}   # extra payload keys for every post of this process (set in child processes / for the final recalc)
 PARALLEL_START_GAP_SECONDS = float(os.environ.get("PARALLEL_START_GAP", "8"))   # staggered browser starts (undetected-chromedriver patches a shared driver file)
 POST_LOCK_PATH = os.path.join(tempfile.gettempdir(), "provider_json_post.lock")
 
@@ -1731,6 +1737,10 @@ def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name
         ABBREV_KEY_BY_TARGET.get(target.upper(), "abbrev" + target.upper()): abbrev,
         "data": data,
     }
+    if _POST_FLAGS.get("skipRecalc") and target.upper() in ("MS", "SW", "SWP", "ASRP"):
+        payload["skipRecalc"] = True
+    if _POST_FLAGS.get("recalcOnly") and target.upper() == "ASRP":
+        payload["recalcOnly"] = True
 
     label = "Row {} ({}) {}".format(row_number, abbrev, target)
 
@@ -1816,7 +1826,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v25",
+            "v": "v26",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1874,11 +1884,18 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
         for line in process.stdout:
             print("[{}] {}".format(target, line.rstrip("\n")), flush=True)
 
+    as_abbrev = next((p[1] for p in providers if p[0] == "ASDCF" and p[1]), "")
+    single_recalc = SINGLE_RECALC and bool(as_abbrev)
+    if single_recalc:
+        print("🧮 v26: MS / SW handlers skip their own recalculation; one final recalculation follows the last provider.")
+
     for index, (target, abbrev, _) in enumerate(ordered):
         trace_path = os.path.join(tempfile.gettempdir(), "trace_{}_{}.json".format(target, os.getpid()))
         if os.path.exists(trace_path):
             os.remove(trace_path)
         child_env = dict(os.environ, ONLY_TARGET=target, TRACE_OUT=trace_path, PYTHONUNBUFFERED="1", GH_LOG_UPLOAD="0")  # the parent uploads the combined log once
+        if single_recalc:
+            child_env["SKIP_RECALC"] = "1"
         process = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=child_env,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         reader = threading.Thread(target=pump, args=(target, process), daemon=True)
@@ -1897,16 +1914,33 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
             print("⚠️ {}: child ended without a trace ({}); exit code {}".format(target, trace_error, process.returncode))
             trace[target] = {"abbrev": abbrev, "status": "error", "attempts": [], "reason": "child_no_trace_rc{}".format(process.returncode)}
 
+    if single_recalc and any((trace.get(t) or {}).get("status") in ("ok", "not_written") for t in ("MS", "SW", "ASDCF")):
+        try:
+            _POST_FLAGS["recalcOnly"] = True
+            final_started = time.monotonic()
+            with_lock_posted = post_provider_json(webhook_url, "ASRP", row_number, as_abbrev, sheet_name, {})
+            trace["RECALC"] = {"abbrev": as_abbrev, "status": "ok" if with_lock_posted else "error", "attempts": [],
+                               "seconds": round(time.monotonic() - final_started), "reason": None if with_lock_posted else _LAST_POST.get("reason")}
+            print("🧮 v26: final single recalculation {} ({} s)".format("done" if with_lock_posted else "FAILED: {}".format(_LAST_POST.get("reason")),
+                                                                      round(time.monotonic() - final_started)))
+        except Exception as recalc_error:
+            print("❌ v26: final recalculation failed: {}".format(recalc_error))
+        finally:
+            _POST_FLAGS.pop("recalcOnly", None)
+
     print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
     print("🧹 Task complete!")
 
 
 def run_bot():
-    print("🤖 Booting up the provider-JSON scraper v25 (single-row mode)...")
+    print("🤖 Booting up the provider-JSON scraper v26 (single-row mode)...")
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
     sheet_name = os.environ["SHEET_NAME"]
+
+    if os.environ.get("SKIP_RECALC") == "1":
+        _POST_FLAGS["skipRecalc"] = True   # v26 (child process of a parallel run)
 
     run_started = time.monotonic()
     run_started_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
