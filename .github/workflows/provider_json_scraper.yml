@@ -10,6 +10,9 @@
 # (Insider Buying Score + AlphaSpread), so this new functionality can be
 # tested on its own and can never affect that already-working chain.
 #
+# VERSION 8: inputs only_target / retry_left and a last step: when SW was blocked on every attempt (sw_retry.flag from provider_json_scraper.py v27)
+# a SW-only follow-up run is started after 90 s on a fresh runner (up to retry_left times, default 2). Needs permissions actions: write.
+#
 # VERSION 7: new optional input as_quality ("1" = read the AlphaSpread statement pages, "0" = skip them); env AS_QUALITY for provider_json_scraper.py v18. Sent by fn_24_73 v5.
 #
 # VERSION 6: env SCRAPE_DO_TOKEN from the repository secret SCRAPE_DO_TOKEN (GuruFocus pages are fetched through Scrape.do, provider_json_scraper.py v16).
@@ -52,6 +55,10 @@
 
 name: Provider JSON Scraper
 
+permissions:
+  contents: read
+  actions: write
+
 "on":
   workflow_dispatch:
     inputs:
@@ -88,6 +95,22 @@ name: Provider JSON Scraper
         required: false
         default: "1"
         type: string
+      parallel:
+        description: "1 = providers run side by side (fast), 0 = one after the other (old behaviour; use it to test whether a block is caused by the parallel run)"
+        required: false
+        default: "1"
+        type: string
+
+      only_target:
+        description: "OPTIONAL: run only this provider (SW). Used by the automatic SW follow-up run."
+        required: false
+        default: ''
+        type: string
+      retry_left:
+        description: "How many SW-only follow-up runs may still be started if SW is blocked"
+        required: false
+        default: "2"
+        type: string
 
 jobs:
   scrape-provider-json:
@@ -119,6 +142,8 @@ jobs:
           ABBREV_MS: ${{ inputs.abbrev_ms }}
           ABBREV_GF: ${{ inputs.abbrev_gf }}
           AS_QUALITY: ${{ inputs.as_quality }}
+          PARALLEL: ${{ inputs.parallel || '1' }}
+          ONLY_TARGET: ${{ inputs.only_target }}
           SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
         run: python provider_json_scraper.py
 
@@ -130,3 +155,19 @@ jobs:
           path: diagnostics/
           if-no-files-found: ignore
           retention-days: 3
+
+      - name: Start a SW-only follow-up run when SW was blocked
+        if: always() && hashFiles('sw_retry.flag') != '' && inputs.retry_left != '0' && inputs.abbrev_sw != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RETRY_LEFT: ${{ inputs.retry_left || '2' }}
+        run: |
+          sleep 90
+          NEXT=$((RETRY_LEFT - 1))
+          gh workflow run provider_json_scraper.yml \
+            -f row_number="${{ inputs.row_number }}" \
+            -f sheet_name="${{ inputs.sheet_name }}" \
+            -f abbrev_sw="${{ inputs.abbrev_sw }}" \
+            -f only_target=SW \
+            -f as_quality=0 \
+            -f retry_left="$NEXT"
