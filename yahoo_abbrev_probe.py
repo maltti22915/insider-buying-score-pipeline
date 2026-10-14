@@ -1,5 +1,6 @@
 """
-yahoo_abbrev_probe.py v1 -- READ-ONLY feasibility test: can Yahoo Search, opened from a GitHub Actions
+yahoo_abbrev_probe.py v2 (v1 result: the first browser query returned results, the next ones HTTP 500 = Yahoo throttling;
+v2 waits longer between queries, retries a 500 after a pause with a fresh browser session, and also tests ONE combined query per stock) -- READ-ONLY feasibility test: can Yahoo Search, opened from a GitHub Actions
 runner, replace the Google/Scrape.do search that finds the stock abbreviations (Task 20)?
 Posts NOTHING to the sheet.
 
@@ -40,6 +41,14 @@ PROVIDERS = [
      re.compile(r"https?://(?:www\.)?gurufocus\.com/stock/([A-Za-z0-9.:-]+)", re.I)),
 ]
 MAX_RESULTS = 5
+DELAY = float(os.environ.get("DELAY", "12"))          # seconds between queries
+RETRY_PAUSE = float(os.environ.get("RETRY_PAUSE", "45"))  # pause before a retry after an HTTP 500 / empty page
+RETRIES = int(os.environ.get("RETRIES", "2"))
+
+
+def is_error_page(page):
+    low = (page or "")[:200000].lower()
+    return ("http error 500" in low) or ("isn\u2019t working" in low) or ("isn't working" in low) or ("algo-sr" not in low and "no results" not in low)
 
 
 def decode_links(page):
@@ -101,49 +110,82 @@ def main():
 
     sb_ctx = None
     sb = None
-    try:
-        from seleniumbase import SB
-        sb_ctx = SB(uc=True, headed=True, xvfb=True)
-        sb = sb_ctx.__enter__()
-    except Exception as err:  # noqa: BLE001
-        print("YAHOO_PROBE browser unavailable: {}".format(err))
 
-    try:
-        for company, ticker, country in stocks:
-            for key, domain, pattern in PROVIDERS:
-                query = "site:{} {} {}".format(domain, company, ticker).strip()
-                url = "https://search.yahoo.com/search?" + urllib.parse.urlencode({"p": query, "ei": "UTF-8"})
-                t0 = time.monotonic()
-                mode, status, page = "plain", 0, ""
-                status, page = fetch_plain(url)
-                links = decode_links(page) if status == 200 and not blocked(page) else []
-                hits = [u for u in links if pattern.search(u)]
-                if not hits and sb is not None:
-                    mode = "browser"
-                    try:
-                        page = fetch_browser(sb, url)
-                        links = decode_links(page)
-                        hits = [u for u in links if pattern.search(u)]
-                    except Exception as err:  # noqa: BLE001
-                        page = "ERR {}".format(err)
-                sec = round(time.monotonic() - t0, 1)
-                safe = re.sub(r"[^A-Za-z0-9_-]", "_", "{}_{}".format(company, key))[:60]
-                open("{}/yahoo_{}_{}.html".format(OUT, safe, mode), "w", encoding="utf-8").write(page)
-                abbrevs = []
-                for u in hits:
-                    a = pattern.search(u).group(1)
-                    if a not in abbrevs:
-                        abbrevs.append(a)
-                print("YAHOO_PROBE {} | {} | {} | mode={} http={} {}s | results={} | provider hits={} | abbrevs={}{}".format(
-                    company, ticker or "-", key, mode, status, sec, len(links), len(hits), abbrevs[:MAX_RESULTS],
-                    " | BLOCKED" if blocked(page) else ""))
-                time.sleep(2)
-    finally:
+    def start_browser():
+        nonlocal sb_ctx, sb
+        stop_browser()
+        try:
+            from seleniumbase import SB
+            sb_ctx = SB(uc=True, headed=True, xvfb=True)
+            sb = sb_ctx.__enter__()
+        except Exception as err:  # noqa: BLE001
+            sb_ctx, sb = None, None
+            print("YAHOO_PROBE browser unavailable: {}".format(err))
+
+    def stop_browser():
+        nonlocal sb_ctx, sb
         if sb_ctx is not None:
             try:
                 sb_ctx.__exit__(None, None, None)
             except Exception:  # noqa: BLE001
                 pass
+        sb_ctx, sb = None, None
+
+    start_browser()
+
+    def search(query):
+        """plain HTTP first, then the browser; a 500 / empty page is retried after a pause with a fresh browser."""
+        url = "https://search.yahoo.com/search?" + urllib.parse.urlencode({"p": query, "ei": "UTF-8"})
+        status, page = fetch_plain(url)
+        mode = "plain"
+        if status == 200 and not blocked(page) and decode_links(page) and not is_error_page(page):
+            return mode, status, page, 0
+        mode = "browser"
+        for attempt in range(RETRIES + 1):
+            if sb is None:
+                start_browser()
+            if sb is not None:
+                try:
+                    page = fetch_browser(sb, url)
+                except Exception as err:  # noqa: BLE001
+                    page = "ERR {}".format(err)
+                if not is_error_page(page):
+                    return mode, status, page, attempt
+            if attempt < RETRIES:
+                time.sleep(RETRY_PAUSE)
+                start_browser()
+        return mode, status, page, RETRIES
+
+    try:
+        for company, ticker, country in stocks:
+            queries = []
+            if os.environ.get("COMBINED", "1") == "1":
+                queries.append(("ALL", "{} {} (simplywall.st OR alphaspread.com OR marketscreener.com)".format(company, ticker).strip()))
+            for key, domain, pattern in PROVIDERS:
+                queries.append((key, "site:{} {} {}".format(domain, company, ticker).strip()))
+            for key, query in queries:
+                t0 = time.monotonic()
+                mode, status, page, retries = search(query)
+                links = decode_links(page)
+                sec = round(time.monotonic() - t0, 1)
+                safe = re.sub(r"[^A-Za-z0-9_-]", "_", "{}_{}".format(company, key))[:60]
+                open("{}/yahoo_{}_{}.html".format(OUT, safe, mode), "w", encoding="utf-8").write(page)
+                found = {}
+                for pkey, domain, pattern in PROVIDERS:
+                    if key not in ("ALL", pkey):
+                        continue
+                    abbrevs = []
+                    for u in links:
+                        mm = pattern.search(u)
+                        if mm and mm.group(1) not in abbrevs:
+                            abbrevs.append(mm.group(1))
+                    found[pkey] = abbrevs[:MAX_RESULTS]
+                print("YAHOO_PROBE {} | {} | {} | mode={} http={} retries={} {}s | links={} | error_page={} | abbrevs={}{}".format(
+                    company, ticker or "-", key, mode, status, retries, sec, len(links), is_error_page(page), found,
+                    " | BLOCKED" if blocked(page) else ""), flush=True)
+                time.sleep(DELAY)
+    finally:
+        stop_browser()
     return 0
 
 
