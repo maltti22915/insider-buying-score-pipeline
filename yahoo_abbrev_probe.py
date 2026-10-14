@@ -1,4 +1,5 @@
 """
+yahoo_abbrev_probe.py v4 (speed: 3 queries per stock (SW, AS, MS), 4 s between queries, 20 s retry pause; COMBINED=1 and GF=1 switch the old extras back on)
 yahoo_abbrev_probe.py v3 (also writes entries_<stock>_<provider>.json: position/title/snippet/link as the Task 20 scorer needs)
 yahoo_abbrev_probe.py v2 (v1 result: the first browser query returned results, the next ones HTTP 500 = Yahoo throttling;
 v2 waits longer between queries, retries a 500 after a pause with a fresh browser session, and also tests ONE combined query per stock) -- READ-ONLY feasibility test: can Yahoo Search, opened from a GitHub Actions
@@ -42,8 +43,8 @@ PROVIDERS = [
      re.compile(r"https?://(?:www\.)?gurufocus\.com/stock/([A-Za-z0-9.:-]+)", re.I)),
 ]
 MAX_RESULTS = 5
-DELAY = float(os.environ.get("DELAY", "12"))          # seconds between queries
-RETRY_PAUSE = float(os.environ.get("RETRY_PAUSE", "45"))  # pause before a retry after an HTTP 500 / empty page
+DELAY = float(os.environ.get("DELAY", "4"))          # seconds between queries
+RETRY_PAUSE = float(os.environ.get("RETRY_PAUSE", "20"))  # pause before a retry after an HTTP 500 / empty page
 RETRIES = int(os.environ.get("RETRIES", "2"))
 
 
@@ -177,9 +178,11 @@ def main():
     try:
         for company, ticker, country in stocks:
             queries = []
-            if os.environ.get("COMBINED", "1") == "1":
+            if os.environ.get("COMBINED", "0") == "1":
                 queries.append(("ALL", "{} {} (simplywall.st OR alphaspread.com OR marketscreener.com)".format(company, ticker).strip()))
             for key, domain, pattern in PROVIDERS:
+                if key == "GF" and os.environ.get("GF", "0") != "1":
+                    continue  # GuruFocus is switched off in the project
                 queries.append((key, "site:{} {} {}".format(domain, company, ticker).strip()))
             for key, query in queries:
                 t0 = time.monotonic()
