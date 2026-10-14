@@ -1,3 +1,4 @@
+# yahoo_abbrev_probe.yml v2 (longer timeout: the probe now waits 12 s between queries and retries after Yahoo 500s)
 # yahoo_abbrev_probe.yml v1 -- read-only feasibility test: can Yahoo Search find the SW / AS / MS / GF
 # abbreviations from a GitHub Actions runner? Save as .github/workflows/yahoo_abbrev_probe.yml;
 # yahoo_abbrev_probe.py goes in the repository root. No secrets needed. Reuses requirements.txt (seleniumbase, requests).
@@ -18,7 +19,7 @@ name: Yahoo Abbrev Probe
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
