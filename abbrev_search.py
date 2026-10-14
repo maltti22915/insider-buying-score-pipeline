@@ -1,5 +1,5 @@
 """
-abbrev_search.py v1 -- Yahoo Search for Task 20 (stock abbreviation finder), run from GitHub Actions.
+abbrev_search.py v2 (speed: plain HTTP is skipped after 2 plain failures in the run; retry pauses are 8 s, then 20 s) / v1 -- Yahoo Search for Task 20 (stock abbreviation finder), run from GitHub Actions.
 Replaces the Scrape.do/Google search. Started by Apps Script (fn_20_21) through workflow abbrev_search.yml.
 
 INPUT (env)
@@ -161,11 +161,18 @@ def main():
             sb_ctx, sb = None, None
             print("ABBREV_SEARCH ⚠️ browser unavailable: {}".format(err), flush=True)
 
+    plain_failures = {"n": 0}
+
     def search(query):
         url = "https://search.yahoo.com/search?" + urllib.parse.urlencode({"p": query, "ei": "UTF-8"})
-        status, page = fetch_plain(url)
-        if status == 200 and not blocked(page) and decode_links(page) and not is_error_page(page):
-            return "plain", page, 0
+        if plain_failures["n"] < 2:
+            status, page = fetch_plain(url)
+            if status == 200 and not blocked(page) and decode_links(page) and not is_error_page(page):
+                plain_failures["n"] = 0
+                return "plain", page, 0
+            plain_failures["n"] += 1
+        else:
+            page = ""
         for attempt in range(RETRIES + 1):
             if sb is None:
                 start_browser()
@@ -177,8 +184,9 @@ def main():
                 if not is_error_page(page):
                     return "browser", page, attempt
             if attempt < RETRIES:
-                print("ABBREV_SEARCH ↻ retry {} after Yahoo error page | pause {}s".format(attempt + 1, RETRY_PAUSE), flush=True)
-                time.sleep(RETRY_PAUSE)
+                pause = 8 if attempt == 0 else RETRY_PAUSE
+                print("ABBREV_SEARCH ↻ retry {} after Yahoo error page | pause {}s".format(attempt + 1, pause), flush=True)
+                time.sleep(pause)
                 start_browser()
         return "browser", page, RETRIES
 
