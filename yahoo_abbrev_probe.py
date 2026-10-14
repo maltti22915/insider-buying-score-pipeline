@@ -1,4 +1,5 @@
 """
+yahoo_abbrev_probe.py v5 (plain HTTP attempt capped at 6 s: in the last run every query went to the browser anyway, and the plain attempt cost most of the 38 s per query)
 yahoo_abbrev_probe.py v4 (speed: 3 queries per stock (SW, AS, MS), 4 s between queries, 20 s retry pause; COMBINED=1 and GF=1 switch the old extras back on)
 yahoo_abbrev_probe.py v3 (also writes entries_<stock>_<provider>.json: position/title/snippet/link as the Task 20 scorer needs)
 yahoo_abbrev_probe.py v2 (v1 result: the first browser query returned results, the next ones HTTP 500 = Yahoo throttling;
@@ -96,7 +97,7 @@ def blocked(page):
 
 def fetch_plain(url):
     try:
-        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, timeout=25)
+        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, timeout=float(os.environ.get("PLAIN_TIMEOUT", "6")))
         return r.status_code, r.text
     except Exception as err:  # noqa: BLE001
         return 0, "ERR {}".format(err)
