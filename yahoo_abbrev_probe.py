@@ -1,4 +1,5 @@
 """
+yahoo_abbrev_probe.py v3 (also writes entries_<stock>_<provider>.json: position/title/snippet/link as the Task 20 scorer needs)
 yahoo_abbrev_probe.py v2 (v1 result: the first browser query returned results, the next ones HTTP 500 = Yahoo throttling;
 v2 waits longer between queries, retries a 500 after a pause with a fresh browser session, and also tests ONE combined query per stock) -- READ-ONLY feasibility test: can Yahoo Search, opened from a GitHub Actions
 runner, replace the Google/Scrape.do search that finds the stock abbreviations (Task 20)?
@@ -68,6 +69,23 @@ def decode_links(page):
             seen.add(key)
             out.append(u)
     return out
+
+
+def parse_entries(page):
+    """Organic results as the Task 20 scorer (fn_20_14) expects them: position, title, snippet, link."""
+    entries = []
+    for pos, m in enumerate(re.finditer(
+            r'<div class="dd [^"]*algo algo-sr[^"]*".*?(?=<div class="dd [^"]*algo algo-sr|</ol>)', page, re.S), start=1):
+        blk = m.group(0)
+        href = re.search(r'<a [^>]*href="(https?://[^"]+)"', blk)
+        title = re.search(r'<h3[^>]*>(.*?)</h3>', blk, re.S)
+        snip = re.search(r'<div class="compText[^"]*">(.*?)</div>', blk, re.S)
+        clean = lambda t: re.sub(r"\s+", " ", htmlmod.unescape(re.sub(r"<[^>]+>", " ", t or ""))).strip()
+        if href:
+            entries.append({"position": pos, "entryType": "organic", "link": htmlmod.unescape(href.group(1)),
+                            "title": clean(title.group(1) if title else ""),
+                            "snippet": clean(snip.group(1) if snip else "")})
+    return entries
 
 
 def blocked(page):
@@ -167,6 +185,10 @@ def main():
                 t0 = time.monotonic()
                 mode, status, page, retries = search(query)
                 links = decode_links(page)
+                entries = parse_entries(page)
+                import json as _json
+                open("{}/entries_{}_{}.json".format(OUT, re.sub(r"[^A-Za-z0-9_-]", "_", company)[:40], key), "w", encoding="utf-8").write(
+                    _json.dumps(entries, ensure_ascii=False, indent=1))
                 sec = round(time.monotonic() - t0, 1)
                 safe = re.sub(r"[^A-Za-z0-9_-]", "_", "{}_{}".format(company, key))[:60]
                 open("{}/yahoo_{}_{}.html".format(OUT, safe, mode), "w", encoding="utf-8").write(page)
@@ -180,8 +202,8 @@ def main():
                         if mm and mm.group(1) not in abbrevs:
                             abbrevs.append(mm.group(1))
                     found[pkey] = abbrevs[:MAX_RESULTS]
-                print("YAHOO_PROBE {} | {} | {} | mode={} http={} retries={} {}s | links={} | error_page={} | abbrevs={}{}".format(
-                    company, ticker or "-", key, mode, status, retries, sec, len(links), is_error_page(page), found,
+                print("YAHOO_PROBE {} | {} | {} | mode={} http={} retries={} {}s | links={} | entries={} | error_page={} | abbrevs={}{}".format(
+                    company, ticker or "-", key, mode, status, retries, sec, len(links), len(entries), is_error_page(page), found,
                     " | BLOCKED" if blocked(page) else ""), flush=True)
                 time.sleep(DELAY)
     finally:
