@@ -1,4 +1,5 @@
 """
+yahoo_abbrev_probe.py v6 (entry links of plain-HTTP pages are unwrapped from Yahoo's redirect)
 yahoo_abbrev_probe.py v5 (plain HTTP attempt capped at 6 s: in the last run every query went to the browser anyway, and the plain attempt cost most of the 38 s per query)
 yahoo_abbrev_probe.py v4 (speed: 3 queries per stock (SW, AS, MS), 4 s between queries, 20 s retry pause; COMBINED=1 and GF=1 switch the old extras back on)
 yahoo_abbrev_probe.py v3 (also writes entries_<stock>_<provider>.json: position/title/snippet/link as the Task 20 scorer needs)
@@ -84,7 +85,11 @@ def parse_entries(page):
         snip = re.search(r'<div class="compText[^"]*">(.*?)</div>', blk, re.S)
         clean = lambda t: re.sub(r"\s+", " ", htmlmod.unescape(re.sub(r"<[^>]+>", " ", t or ""))).strip()
         if href:
-            entries.append({"position": pos, "entryType": "organic", "link": htmlmod.unescape(href.group(1)),
+            link = htmlmod.unescape(href.group(1))
+            ru = re.search(r"/RU=(https?%3a[^/]+)", link, re.I)  # plain-HTTP pages wrap links in a Yahoo redirect
+            if ru:
+                link = urllib.parse.unquote(ru.group(1))
+            entries.append({"position": pos, "entryType": "organic", "link": link,
                             "title": clean(title.group(1) if title else ""),
                             "snippet": clean(snip.group(1) if snip else "")})
     return entries
