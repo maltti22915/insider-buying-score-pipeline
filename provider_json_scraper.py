@@ -1826,7 +1826,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v26",
+            "v": "v27",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1835,6 +1835,13 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             "providers": providers_out,
         }
         print("📋 RUN_SUMMARY " + json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+        # v27: tell the workflow that SW was blocked on every attempt, so it can start a SW-only follow-up
+        # run on a fresh runner (blocks come in clusters per runner address).
+        sw_info = providers_out.get("SW")
+        if sw_info is not None and sw_info.get("status") != "ok":
+            with open("sw_retry.flag", "w") as flag_file:
+                flag_file.write("blocked")
+            print("🔁 SW did not succeed -> sw_retry.flag written (the workflow may start a SW-only follow-up run)")
     except Exception as summary_error:
         print("⚠️ could not build RUN_SUMMARY: {}".format(summary_error))
 
