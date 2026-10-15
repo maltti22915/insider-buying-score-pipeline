@@ -1454,6 +1454,40 @@ def fetch_as_ratios(sb, abbrev_as):
             step("ratio_" + name, "FAIL", reason=type(ratio_error).__name__)
 
 
+def _as_extract_buyback(text):
+    """v28: headline numbers of the AlphaSpread buyback block (Current / Min / Max / Average / Median yield, % of market value, 5Y view)."""
+    out = {}
+    for label, key in (("Current Yield", "current"), ("Min Yield", "min"), ("Max Yield", "max"),
+                       ("Average Yield", "avg"), ("Median Yield", "median")):
+        found = re.search(re.escape(label) + r"\s*:?\s*(-?[\d.,]+)\s*%", text, re.I)
+        if found:
+            out[key] = _as_num(found.group(1))
+    if "current" not in out:
+        found = re.search(r"[Cc]urrent buyback yield for .{1,40}? is\s*(-?[\d.,]+)\s*%", text)
+        if found:
+            out["current"] = _as_num(found.group(1))
+    return out
+
+
+def fetch_as_buyback(sb, abbrev_as):
+    """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
+    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(str(abbrev_as).strip().strip("/"))
+    try:
+        sb.uc_open_with_reconnect(url, 5)
+        source = sb.get_page_source()
+        if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
+            step("buyback", "FAIL", reason="blocked")
+            return
+        values = _as_extract_buyback(_as_strip_text(source))
+        if values.get("current") is not None and values.get("avg") is not None:
+            _AS_RATIOS["buyback"] = values
+            step("buyback", "OK", **values)
+        else:
+            step("buyback", "FAIL", reason="no buyback numbers on the page", got=",".join(sorted(values.keys())))
+    except Exception as buyback_error:
+        step("buyback", "FAIL", reason=type(buyback_error).__name__)
+
+
 def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
     """Posts the collected AS ratios once (target ASRP); never touches the DCF result."""
     if not _AS_RATIOS:
@@ -1668,6 +1702,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         # quality run afterwards, also when the DCF failed, so they are kept.
         if os.environ.get("AS_RATIOS", "1") != "0":
             fetch_as_ratios(sb, abbrev_as)
+            fetch_as_buyback(sb, abbrev_as)
         if os.environ.get("AS_QUALITY", "1") != "0":
             fetch_as_quality(sb, abbrev_as)
 
@@ -1826,7 +1861,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v27",
+            "v": "v28",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
