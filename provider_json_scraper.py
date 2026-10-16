@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v34: SW gives up on a Cloudflare challenge after SW_CF_WAIT_SECONDS (default 15, env override) instead of 25. Log analysis of 240 SW attempts: every challenge that cleared did so within 7-11 s; the others never cleared, so the extra 10 s only delayed the next retry. Other providers still use CF_CHALLENGE_WAIT_SECONDS (25).
   v26: one final row recalculation per parallel run instead of four (handlers get skipRecalc; the parent sends ASRP recalcOnly last). SINGLE_RECALC=0 restores the old behaviour.
   v25: MarketScreener 'Access Denied' (Akamai block of the runner address) is no longer final: home-page warm-up, then Scrape.do fallback (steps ms_warmup / ms_scrapedo); SW retries capped at SW_MAX_ATTEMPTS (3; blocks come in clusters per runner address, later tries rarely pass).
   v24: GuruFocus off by default (GF_ENABLED=1); providers run in parallel child processes (PARALLEL=0 = old sequential run), webhook posts serialised by a file lock. v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
@@ -293,6 +294,12 @@ try:
     CF_CHALLENGE_WAIT_SECONDS = int(os.environ.get("CF_CHALLENGE_WAIT_SECONDS", "25"))
 except ValueError:
     CF_CHALLENGE_WAIT_SECONDS = 25  # v9: clearing took 7-9 s whenever it cleared
+
+# v34: SW only -- every challenge that cleared in the logs did so within 7-11 s.
+try:
+    SW_CF_WAIT_SECONDS = int(os.environ.get("SW_CF_WAIT_SECONDS", "15"))
+except ValueError:
+    SW_CF_WAIT_SECONDS = 15
 
 # Seconds given to uc_open_with_reconnect (IS script uses 4).
 CF_RECONNECT_SECONDS = 6
@@ -825,7 +832,7 @@ def is_challenge_page(sb):
     return any(marker in haystack for marker in CF_CHALLENGE_MARKERS)
 
 
-def wait_past_challenge(sb, headless):
+def wait_past_challenge(sb, headless, wait_seconds=None):
     """
     Waits up to CF_CHALLENGE_WAIT_SECONDS for a Cloudflare challenge to
     clear. In headed mode also tries sb.uc_gui_click_captcha() now and then.
@@ -843,7 +850,8 @@ def wait_past_challenge(sb, headless):
         if clicks[0]:
             print("🖱️ Tried uc_gui_click_captcha() x{}".format(clicks[0]))
 
-    while time.monotonic() - started < CF_CHALLENGE_WAIT_SECONDS:
+    limit = CF_CHALLENGE_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    while time.monotonic() - started < limit:
         sb.sleep(2)
 
         if not is_challenge_page(sb):
@@ -985,7 +993,7 @@ def fetch_sw_subpage(sb, abbrev_sw, name, headless):
         print("🌐 Navigating to: {}".format(url))
         sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
         sb.sleep(PAGE_SETTLE_SECONDS)
-        if not wait_past_challenge(sb, headless):
+        if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
             step("page_" + name, "FAIL", reason="challenge page still showing")
             return ""
         sb.sleep(2)
@@ -1016,13 +1024,13 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
     sb.sleep(PAGE_SETTLE_SECONDS)
     step("open_page", "OK", url=url)
 
-    if not wait_past_challenge(sb, headless):
+    if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
         step("cloudflare_check", "FAIL", reason="challenge page still showing")
         log_sw_page_state(sb)
         save_sw_diagnostics(sb, row_number, None, "blocked by Cloudflare")
         raise CloudflareBlocked(
             "page is still a Cloudflare challenge after {}s ({} browser)".format(
-                CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"
+                SW_CF_WAIT_SECONDS, "headless" if headless else "headed"
             )
         )
 
@@ -2049,7 +2057,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v33",
+            "v": "v34",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
