@@ -1519,40 +1519,148 @@ def _as_parse_hist(headline, context):
     return None, "no-rule"
 
 
+_AS_HIST_PROBE_JS = (
+    "var h = document.querySelector('.valuation-history-context__headline');"
+    "var c = document.querySelector('.valuation-history-context__headline-context');"
+    "var box = document.querySelector('.valuation-history-context');"
+    "return {headline: h ? (h.innerText || '') : '', context: c ? (c.innerText || '') : '', box: !!box,"
+    " loading: !!document.querySelector('.valuation-history-context--loading'),"
+    " y: Math.round(window.scrollY || 0), height: Math.round(document.body.scrollHeight || 0), vh: Math.round(window.innerHeight || 0)};"
+)
+
+
+def _as_hist_text_fallback(page_source):
+    """v31: no headline element -> look for the sentence in the page text ('... of days in the past 5 years')."""
+    text = _as_strip_text(page_source)
+    found = re.search(r"([^.]{0,90}\b(?:cheaper|more expensive|in line with (?:its|their)[^.]{0,20}history|valued)[^.]{0,120}\.\s*[^.]{0,200}\d{1,3}\s*%\s*of days in the past \d+ years?[^.]{0,40}\.?)", text, re.I)
+    if found:
+        return found.group(1).strip()
+    inline = re.search(r"([^.]{0,60}valued in line with (?:its|their)[^.]{0,20}history[^.]{0,200}\.)", text, re.I)
+    return inline.group(1).strip() if inline else ""
+
+
+_AS_HIST_OPEN_JS = (
+    "var want = 'more details', best = null;"
+    "document.querySelectorAll('a, button, span').forEach(function (e) {"
+    "  if (!best && (e.textContent || '').trim().toLowerCase() === want && e.offsetParent !== null) { best = e; } });"
+    "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';"
+)
+
+
+def _as_parse_hist_modal(text):
+    """v32: the 'More details' window gives the exact figure the one-line sentence often leaves out, e.g.
+    'APP is near its usual valuation / Cheaper than on 63% of days over 5 years / Today - 41% undervalued /
+     When APP was expensive -9% Typical return ... When APP was cheap +25% Typical return ...'.
+    'Cheaper than on N% of days' -> rank N (today is cheaper than on N% of the days); 'More expensive than on N%' -> 100 - N.
+    Returns a dict with whatever was found: rank, label, today (signed %: + undervalued, - overvalued), exp_return, cheap_return."""
+    text = re.sub(r"[ \t\xa0]+", " ", text or "")
+    out = {}
+    found = re.search(r"(Cheaper|More expensive|Dearer|Pricier) than on (\d{1,3})\s*%\s*of days", text, re.I)
+    if found and 0 <= int(found.group(2)) <= 100:
+        n = int(found.group(2))
+        out["rank"] = n if found.group(1).lower() == "cheaper" else 100 - n
+    found = re.search(r"\bis ((?:near|above|below|well above|well below)[^\n.]{0,40}(?:usual|history)[^\n.]{0,30}|(?:cheaper|more expensive|pricier|dearer) than usual|valued in line with[^\n.]{0,30})", text, re.I)
+    if found:
+        out["label"] = found.group(1).strip()
+    found = re.search(r"Today\s*[\u00b7\u2022\-:]?\s*(\d{1,3})\s*%\s*(undervalued|overvalued)", text, re.I)
+    if found:
+        out["today"] = int(found.group(1)) * (1 if found.group(2).lower() == "undervalued" else -1)
+    found = re.search(r"was expensive\s*([+\-\u2212]?\d{1,3})\s*%", text, re.I)
+    if found:
+        out["exp_return"] = int(found.group(1).replace("\u2212", "-"))
+    found = re.search(r"was cheap\s*([+\-\u2212]?\d{1,3})\s*%", text, re.I)
+    if found:
+        out["cheap_return"] = int(found.group(1).replace("\u2212", "-"))
+    return out
+
+
+def _as_hist_open_details(sb):
+    """v32: clicks 'More details' and returns the window's text ('' when it does not open). Never raises."""
+    try:
+        if sb.execute_script(_AS_HIST_OPEN_JS) != "clicked":
+            return ""
+        deadline = time.time() + 12
+        text = ""
+        while time.time() < deadline:
+            sb.sleep(1.0)
+            text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+            if re.search(r"\bof days\b[^\n]{0,20}\bover\b|Typical return", text, re.I):
+                return text
+        return text
+    except Exception:
+        return ""
+
+
 def fetch_as_hist(sb, abbrev_as):
-    """v30: reads the AlphaSpread 'valuation history' sentence (…/summary) and stores {rank, headline, context, url} under
-    _AS_RATIOS['hist']. The block loads lazily, so it waits for the headline element. Never raises."""
+    """v30/v31: reads the AlphaSpread 'valuation history' sentence (.../summary) and stores {rank, headline, context, url} under
+    _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
+    scrolls in steps until it appears. On failure it saves diagnostics/as_hist_row<N>.html. Never raises."""
     url = "https://www.alphaspread.com/security/{}/summary".format(str(abbrev_as).strip().strip("/"))
     try:
         sb.uc_open_with_reconnect(url, 5)
         if "just a moment" in (sb.get_title() or "").lower():
             step("hist", "FAIL", reason="blocked")
             return
-        try:
-            sb.wait_for_element_present(AS_HIST_HEADLINE_SELECTOR, timeout=int(os.environ.get("AS_HIST_WAIT", "40")))
-        except Exception:
-            step("hist", "FAIL", reason="headline did not appear")
-            return
-        sb.sleep(1.0)
-        headline = ""
-        context = ""
-        try:
-            headline = sb.get_text(AS_HIST_HEADLINE_SELECTOR) or ""
-        except Exception:
-            pass
-        try:
-            context = sb.get_text(AS_HIST_CONTEXT_SELECTOR) or ""
-        except Exception:
-            pass
-        if not headline.strip():
-            step("hist", "FAIL", reason="headline empty")
+        sb.sleep(2.0)
+        deadline = time.time() + int(os.environ.get("AS_HIST_WAIT", "45"))
+        probe = {}
+        scroll_y = 0
+        rounds = 0
+        while time.time() < deadline:
+            rounds += 1
+            try:
+                probe = sb.execute_script(_AS_HIST_PROBE_JS) or {}
+            except Exception:
+                probe = {}
+            if (probe.get("headline") or "").strip() and not probe.get("loading"):
+                break
+            try:
+                if probe.get("box"):
+                    sb.execute_script("document.querySelector('.valuation-history-context').scrollIntoView({block: 'center'});")
+                else:
+                    height = int(probe.get("height") or 0)
+                    step_px = max(500, int(probe.get("vh") or 700) - 100)
+                    scroll_y = scroll_y + step_px
+                    if height and scroll_y > height:
+                        scroll_y = 0
+                    sb.execute_script("window.scrollTo(0, {});".format(scroll_y))
+            except Exception:
+                pass
+            sb.sleep(1.5)
+        headline = (probe.get("headline") or "").strip()
+        context = (probe.get("context") or "").strip()
+        if not headline:
+            fallback = _as_hist_text_fallback(sb.get_page_source())
+            if fallback:
+                headline, context = fallback, ""
+                step("hist", "INFO", note="headline element missing, sentence found in the page text")
+        if not headline:
+            try:
+                os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                with open(os.path.join(DIAGNOSTICS_DIR, "as_hist_row{}.html".format(os.environ.get("ROW_NUMBER", "")) ), "w", encoding="utf-8") as handle:
+                    handle.write(sb.get_page_source()[:AS_PAGE_SAVE_CHARS if "AS_PAGE_SAVE_CHARS" in globals() else 400000])
+            except Exception:
+                pass
+            step("hist", "FAIL", reason="headline did not appear", rounds=rounds, box=probe.get("box"), loading=probe.get("loading"),
+                 scrollHeight=probe.get("height"), title=(sb.get_title() or "")[:60], url=(sb.get_current_url() or "")[:90])
             return
         rank, rule = _as_parse_hist(headline, context)
+        # v32: the 'More details' window has the exact figure ("Cheaper than on 63% of days over 5 years"); the one-line
+        # sentence often has none ("valued in line with its history"). The window's figure wins when it is there.
+        modal = {}
+        try:
+            modal = _as_parse_hist_modal(_as_hist_open_details(sb))
+        except Exception:
+            modal = {}
+        if modal.get("rank") is not None:
+            rank, rule = modal["rank"], "details-window"
         if rank is None:
-            step("hist", "FAIL", reason="sentence not understood", headline=headline[:90], context=context[:140])
+            step("hist", "FAIL", reason="sentence not understood", headline=headline[:90], context=context[:140], modal=",".join(sorted(modal.keys())))
             return
-        _AS_RATIOS["hist"] = {"rank": rank, "rule": rule, "headline": headline.strip()[:160], "context": context.strip()[:260], "url": url}
-        step("hist", "OK", rank=rank, rule=rule, headline=headline.strip()[:60])
+        _AS_RATIOS["hist"] = {"rank": rank, "rule": rule, "headline": headline[:160], "context": context[:260], "url": url,
+                              "label": modal.get("label"), "today": modal.get("today"),
+                              "expReturn": modal.get("exp_return"), "cheapReturn": modal.get("cheap_return")}
+        step("hist", "OK", rank=rank, rule=rule, today=modal.get("today"), rounds=rounds, headline=headline[:60])
     except Exception as hist_error:
         step("hist", "FAIL", reason=type(hist_error).__name__)
 
@@ -1934,7 +2042,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v30",
+            "v": "v32",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
