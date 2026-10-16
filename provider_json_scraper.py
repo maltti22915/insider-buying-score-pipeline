@@ -1488,6 +1488,75 @@ def fetch_as_buyback(sb, abbrev_as):
         step("buyback", "FAIL", reason=type(buyback_error).__name__)
 
 
+AS_HIST_HEADLINE_SELECTOR = ".valuation-history-context__headline"
+AS_HIST_CONTEXT_SELECTOR = ".valuation-history-context__headline-context"
+
+
+def _as_parse_hist(headline, context):
+    """v30: turns the AlphaSpread 'valuation history' sentence into a 0-100 rank = share of the past-5-year days on which the
+    stock was MORE expensive (against its AS value) than today. 100 = cheaper than on every day, 0 = dearer than on every day.
+      'It was this cheap or cheaper on just 21% of days ...'     -> 100 - 21 = 79
+      'Still overvalued, but less so than on 88% of days ...'    -> 88
+      'It was this expensive or more expensive on just 9% ...'   -> 9
+      '... more so than on 30% of days ...'                      -> 100 - 30 = 70
+      'valued in line with its history' (no percentage)          -> 50
+    Returns (rank or None, rule text)."""
+    text = re.sub(r"\s+", " ", "{} {}".format(headline or "", context or "")).strip()
+    rules = (
+        (r"this cheap or cheaper on (?:just |only |about )?(\d{1,3})\s*%", lambda n: 100 - n, "cheap-or-cheaper"),
+        (r"less so than on (\d{1,3})\s*%", lambda n: n, "less-so-than"),
+        (r"this expensive or more expensive on (?:just |only |about )?(\d{1,3})\s*%", lambda n: n, "expensive-or-more"),
+        (r"more so than on (\d{1,3})\s*%", lambda n: 100 - n, "more-so-than"),
+    )
+    for pattern, convert, name in rules:
+        found = re.search(pattern, text, re.I)
+        if found:
+            number = int(found.group(1))
+            if 0 <= number <= 100:
+                return convert(number), name
+    if re.search(r"in line with (?:its|their) (?:own )?history", text, re.I):
+        return 50, "in-line"
+    return None, "no-rule"
+
+
+def fetch_as_hist(sb, abbrev_as):
+    """v30: reads the AlphaSpread 'valuation history' sentence (…/summary) and stores {rank, headline, context, url} under
+    _AS_RATIOS['hist']. The block loads lazily, so it waits for the headline element. Never raises."""
+    url = "https://www.alphaspread.com/security/{}/summary".format(str(abbrev_as).strip().strip("/"))
+    try:
+        sb.uc_open_with_reconnect(url, 5)
+        if "just a moment" in (sb.get_title() or "").lower():
+            step("hist", "FAIL", reason="blocked")
+            return
+        try:
+            sb.wait_for_element_present(AS_HIST_HEADLINE_SELECTOR, timeout=int(os.environ.get("AS_HIST_WAIT", "40")))
+        except Exception:
+            step("hist", "FAIL", reason="headline did not appear")
+            return
+        sb.sleep(1.0)
+        headline = ""
+        context = ""
+        try:
+            headline = sb.get_text(AS_HIST_HEADLINE_SELECTOR) or ""
+        except Exception:
+            pass
+        try:
+            context = sb.get_text(AS_HIST_CONTEXT_SELECTOR) or ""
+        except Exception:
+            pass
+        if not headline.strip():
+            step("hist", "FAIL", reason="headline empty")
+            return
+        rank, rule = _as_parse_hist(headline, context)
+        if rank is None:
+            step("hist", "FAIL", reason="sentence not understood", headline=headline[:90], context=context[:140])
+            return
+        _AS_RATIOS["hist"] = {"rank": rank, "rule": rule, "headline": headline.strip()[:160], "context": context.strip()[:260], "url": url}
+        step("hist", "OK", rank=rank, rule=rule, headline=headline.strip()[:60])
+    except Exception as hist_error:
+        step("hist", "FAIL", reason=type(hist_error).__name__)
+
+
 def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
     """Posts the collected AS ratios once (target ASRP); never touches the DCF result."""
     if not _AS_RATIOS:
@@ -1703,6 +1772,8 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         if os.environ.get("AS_RATIOS", "1") != "0":
             fetch_as_ratios(sb, abbrev_as)
             fetch_as_buyback(sb, abbrev_as)
+            if os.environ.get("AS_HIST", "1") != "0":
+                fetch_as_hist(sb, abbrev_as)  # v30
         if os.environ.get("AS_QUALITY", "1") != "0":
             fetch_as_quality(sb, abbrev_as)
 
@@ -1863,7 +1934,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v29",
+            "v": "v30",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
