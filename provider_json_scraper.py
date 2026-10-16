@@ -1523,20 +1523,21 @@ _AS_HIST_PROBE_JS = (
     "var h = document.querySelector('.valuation-history-context__headline');"
     "var c = document.querySelector('.valuation-history-context__headline-context');"
     "var box = document.querySelector('.valuation-history-context');"
-    "return {headline: h ? (h.innerText || '') : '', context: c ? (c.innerText || '') : '', box: !!box,"
+    "var body = document.body ? (document.body.innerText || '') : '';"
+    "var hasText = /\\bis (valued in line with|cheaper than usual|more expensive than usual|near its usual|above its usual|below its usual)/i.test(body);"
+    "return {headline: h ? (h.innerText || '') : '', context: c ? (c.innerText || '') : '', box: !!box, hasText: hasText,"
     " loading: !!document.querySelector('.valuation-history-context--loading'),"
     " y: Math.round(window.scrollY || 0), height: Math.round(document.body.scrollHeight || 0), vh: Math.round(window.innerHeight || 0)};"
 )
 
 
-def _as_hist_text_fallback(page_source):
-    """v31: no headline element -> look for the sentence in the page text ('... of days in the past 5 years')."""
-    text = _as_strip_text(page_source)
-    found = re.search(r"([^.]{0,90}\b(?:cheaper|more expensive|in line with (?:its|their)[^.]{0,20}history|valued)[^.]{0,120}\.\s*[^.]{0,200}\d{1,3}\s*%\s*of days in the past \d+ years?[^.]{0,40}\.?)", text, re.I)
-    if found:
-        return found.group(1).strip()
-    inline = re.search(r"([^.]{0,60}valued in line with (?:its|their)[^.]{0,20}history[^.]{0,200}\.)", text, re.I)
-    return inline.group(1).strip() if inline else ""
+def _as_hist_text_fallback(text):
+    """v31/v33: no headline element -> take the sentence from the visible page text. It starts at "<TICKER> is ..." (so menu text
+    before it is not taken along) and runs through the following sentence ('APP is valued in line with its history. A discount of this
+    size has been typical over the past 5 years.')."""
+    text = re.sub(r"[ \t\xa0]+", " ", text or "")
+    found = re.search(r"\b([A-Z0-9][A-Z0-9.\-]{0,11} is (?:valued in line with (?:its|their) (?:own )?history|(?:cheaper|more expensive|pricier|dearer) than usual|(?:near|above|below|well above|well below) its usual valuation)\.?[^\n]{0,300})", text)
+    return found.group(1).strip() if found else ""
 
 
 _AS_HIST_OPEN_JS = (
@@ -1614,6 +1615,8 @@ def fetch_as_hist(sb, abbrev_as):
                 probe = {}
             if (probe.get("headline") or "").strip() and not probe.get("loading"):
                 break
+            if probe.get("hasText") and rounds >= 2:
+                break  # v33: the class name of the headline is not always there; the sentence is in the text
             try:
                 if probe.get("box"):
                     sb.execute_script("document.querySelector('.valuation-history-context').scrollIntoView({block: 'center'});")
@@ -1630,7 +1633,11 @@ def fetch_as_hist(sb, abbrev_as):
         headline = (probe.get("headline") or "").strip()
         context = (probe.get("context") or "").strip()
         if not headline:
-            fallback = _as_hist_text_fallback(sb.get_page_source())
+            try:
+                visible_text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+            except Exception:
+                visible_text = ""
+            fallback = _as_hist_text_fallback(visible_text) or _as_hist_text_fallback(_as_strip_text(sb.get_page_source()))
             if fallback:
                 headline, context = fallback, ""
                 step("hist", "INFO", note="headline element missing, sentence found in the page text")
@@ -2042,7 +2049,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v32",
+            "v": "v33",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
