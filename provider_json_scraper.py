@@ -1774,6 +1774,8 @@ def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name
     }
     if _POST_FLAGS.get("skipRecalc") and target.upper() in ("MS", "SW", "SWP", "ASRP"):
         payload["skipRecalc"] = True
+    elif target.upper() in (_POST_FLAGS.get("skipTargets") or ()):
+        payload["skipRecalc"] = True  # v29: SW-only follow-up run -- the SW webhook recalculates once, the SWP page data only writes its cells
     if _POST_FLAGS.get("recalcOnly") and target.upper() == "ASRP":
         payload["recalcOnly"] = True
 
@@ -1861,7 +1863,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v28",
+            "v": "v29",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -1983,6 +1985,8 @@ def run_bot():
 
     if os.environ.get("SKIP_RECALC") == "1":
         _POST_FLAGS["skipRecalc"] = True   # v26 (child process of a parallel run)
+    elif os.environ.get("ONLY_TARGET", "").strip().upper() == "SW":
+        _POST_FLAGS["skipTargets"] = ("SWP",)   # v29: SW-only follow-up run: one full recalculation (after SW), not two
 
     run_started = time.monotonic()
     run_started_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
