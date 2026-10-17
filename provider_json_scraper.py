@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v35: AlphaSpread 'Profitability Score' and 'Solvency Score' cards (0-100 plus the tick-mark reasons, e.g. 'Exceptional 3Y Average ROIC') are read from the same summary page visit as AS Hist and sent in the ASRP payload as ratios.scores = {profit, solv}. Columns 'AS Profit' / 'AS Solv' (fn_91_07 v6, fn_24_69). AS_SCORES=0 disables.
   v34: SW gives up on a Cloudflare challenge after SW_CF_WAIT_SECONDS (default 15, env override) instead of 25. Log analysis of 240 SW attempts: every challenge that cleared did so within 7-11 s; the others never cleared, so the extra 10 s only delayed the next retry. Other providers still use CF_CHALLENGE_WAIT_SECONDS (25).
   v26: one final row recalculation per parallel run instead of four (handlers get skipRecalc; the parent sends ASRP recalcOnly last). SINGLE_RECALC=0 restores the old behaviour.
   v25: MarketScreener 'Access Denied' (Akamai block of the runner address) is no longer final: home-page warm-up, then Scrape.do fallback (steps ms_warmup / ms_scrapedo); SW retries capped at SW_MAX_ATTEMPTS (3; blocks come in clusters per runner address, later tries rarely pass).
@@ -1600,6 +1601,159 @@ def _as_hist_open_details(sb):
         return ""
 
 
+_AS_SCORES_JS = r"""
+var res = {profit: null, solv: null, hasProfit: false, hasSolv: false};
+function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+var body = document.body ? (document.body.innerText || '') : '';
+res.hasProfit = /Profitability Score/i.test(body);
+res.hasSolv = /Solvency Score/i.test(body);
+function okState(el) {
+  var icon = null;
+  try { icon = el.querySelector('svg, i, img, [class*="icon"]'); } catch (e) {}
+  var node = icon || el;
+  var cls = '';
+  try { cls = String((node.className && node.className.baseVal !== undefined) ? node.className.baseVal : node.className) + ' ' + String(el.className || ''); } catch (e) {}
+  cls = cls.toLowerCase();
+  if (/(check|tick|success|positive|green|good)/.test(cls)) { return true; }
+  if (/(times|xmark|cross|close|danger|negative|\bred\b|bad|warning)/.test(cls)) { return false; }
+  try {
+    var st = getComputedStyle(node);
+    var c = (st.color || '') + ' ' + (st.fill || '') + ' ' + (st.stroke || '');
+    var m = c.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (m) {
+      var r = +m[1], g = +m[2], b = +m[3];
+      if (g > r + 30 && g > b) { return true; }
+      if (r > g + 30 && r > b) { return false; }
+    }
+  } catch (e) {}
+  return null;
+}
+function findCard(kind) {
+  var re = new RegExp('^.{1,25} ' + kind + ' Score$', 'i');
+  var viewRe = new RegExp('View ' + kind + ' Analysis', 'i');
+  var els = document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,a');
+  for (var i = 0; i < els.length; i++) {
+    var t = norm(els[i].textContent);
+    if (t.length < 60 && re.test(t) && els[i].children.length <= 2) {
+      var node = els[i];
+      for (var up = 0; up < 10 && node; up++) {
+        var tx = norm(node.textContent);
+        if (tx.length < 1500 && viewRe.test(tx)) { return {node: node, title: t}; }
+        node = node.parentElement;
+      }
+    }
+  }
+  return null;
+}
+function readCard(kind) {
+  var found = findCard(kind);
+  if (!found) { return null; }
+  var card = found.node;
+  var out = {title: found.title, score: null, items: [], href: ''};
+  var leaves = [];
+  card.querySelectorAll('*').forEach(function (e) { if (e.children.length === 0 && norm(e.textContent)) { leaves.push(e); } });
+  var scoreIdx = -1;
+  for (var i = 0; i < leaves.length; i++) {
+    if (/^\d{1,3}$/.test(norm(leaves[i].textContent))) { out.score = parseInt(norm(leaves[i].textContent), 10); scoreIdx = i; break; }
+  }
+  var skip = /(Score$|Due Diligence$|^View |^\/ ?100$|^(PROFITABILITY|SOLVENCY)$)/i;
+  var lis = card.querySelectorAll('li');
+  var seen = {};
+  if (lis.length) {
+    lis.forEach(function (li) {
+      var t = norm(li.textContent);
+      if (t && !seen[t] && !skip.test(t)) { seen[t] = 1; out.items.push({t: t.slice(0, 90), ok: okState(li)}); }
+    });
+  }
+  if (!out.items.length) {
+    for (var j = 0; j < leaves.length && (scoreIdx < 0 || j < scoreIdx); j++) {
+      var t2 = norm(leaves[j].textContent);
+      if (t2.length >= 8 && t2.length <= 90 && !skip.test(t2) && t2 !== found.title && !seen[t2]) {
+        seen[t2] = 1;
+        out.items.push({t: t2, ok: okState(leaves[j].parentElement || leaves[j])});
+      }
+    }
+  }
+  var links = card.querySelectorAll('a[href]');
+  for (var k = 0; k < links.length; k++) {
+    if (/view/i.test(norm(links[k].textContent))) { out.href = links[k].href || ''; break; }
+  }
+  return out;
+}
+res.profit = readCard('Profitability');
+res.solv = readCard('Solvency');
+return res;
+"""
+
+
+def _as_scores_clean(card):
+    """v35: one card dict from the page script -> {score, title, items:[{t, ok}], href} or None when no usable score."""
+    if not isinstance(card, dict):
+        return None
+    score = card.get("score")
+    if isinstance(score, float) and score == int(score):
+        score = int(score)
+    if not isinstance(score, int) or score < 0 or score > 100:
+        return None
+    items = []
+    for item in (card.get("items") or [])[:8]:
+        if isinstance(item, dict) and str(item.get("t") or "").strip():
+            items.append({"t": str(item["t"]).strip()[:90], "ok": item.get("ok") if item.get("ok") in (True, False) else None})
+    return {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300]}
+
+
+def _as_fetch_scores_on_page(sb, url):
+    """v35: the summary page is already open (fetch_as_hist). Reads the Profitability and Solvency cards, scrolling down in steps
+    until both show a score (they may be lazy loaded like the history block). Stores _AS_RATIOS['scores']. Never raises."""
+    if os.environ.get("AS_SCORES", "1") == "0":
+        return
+    try:
+        deadline = time.time() + int(os.environ.get("AS_SCORES_WAIT", "20"))
+        result = {}
+        scroll_y = 0
+        rounds = 0
+        while time.time() < deadline:
+            rounds += 1
+            try:
+                result = sb.execute_script(_AS_SCORES_JS) or {}
+            except Exception:
+                result = {}
+            profit = _as_scores_clean(result.get("profit"))
+            solv = _as_scores_clean(result.get("solv"))
+            if profit and solv:
+                break
+            try:
+                height = int(sb.execute_script("return Math.round(document.body.scrollHeight || 0);") or 0)
+                scroll_y = scroll_y + 600
+                if height and scroll_y > height:
+                    scroll_y = 0
+                sb.execute_script("window.scrollTo(0, {});".format(scroll_y))
+            except Exception:
+                pass
+            sb.sleep(1.2)
+        profit = _as_scores_clean(result.get("profit"))
+        solv = _as_scores_clean(result.get("solv"))
+        if not profit and not solv:
+            try:
+                os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                with open(os.path.join(DIAGNOSTICS_DIR, "as_scores_row{}.html".format(os.environ.get("ROW_NUMBER", ""))), "w", encoding="utf-8") as handle:
+                    handle.write(sb.get_page_source()[:400000])
+            except Exception:
+                pass
+            step("scores", "FAIL", reason="no score card found", hasProfit=result.get("hasProfit"), hasSolv=result.get("hasSolv"), rounds=rounds)
+            return
+        scores = {"url": url}
+        if profit:
+            scores["profit"] = profit
+        if solv:
+            scores["solv"] = solv
+        _AS_RATIOS["scores"] = scores
+        step("scores", "OK", profit=(profit or {}).get("score"), solv=(solv or {}).get("score"),
+             profitItems=len((profit or {}).get("items") or []), solvItems=len((solv or {}).get("items") or []), rounds=rounds)
+    except Exception as scores_error:
+        step("scores", "FAIL", reason=type(scores_error).__name__)
+
+
 def fetch_as_hist(sb, abbrev_as):
     """v30/v31: reads the AlphaSpread 'valuation history' sentence (.../summary) and stores {rank, headline, context, url} under
     _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
@@ -1638,6 +1792,7 @@ def fetch_as_hist(sb, abbrev_as):
             except Exception:
                 pass
             sb.sleep(1.5)
+        _as_fetch_scores_on_page(sb, url)  # v35: Profitability / Solvency cards, same page visit
         headline = (probe.get("headline") or "").strip()
         context = (probe.get("context") or "").strip()
         if not headline:
@@ -2057,7 +2212,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v34",
+            "v": "v35",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
