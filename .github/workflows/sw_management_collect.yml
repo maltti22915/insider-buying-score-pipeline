@@ -1,15 +1,16 @@
 # sw_management_collect.yml v1 -- collects the Simply Wall St Management (6) and Ownership (7) pages for a list of stocks.
 # Save as .github/workflows/sw_management_collect.yml; sw_management_collect.py goes in the repository root. Writes nothing to the sheet.
 # Result: the workflow artifact "sw-management-data" (sw_mgmt_all.txt is the easiest file to hand over, sw_mgmt_all.json has the same data).
-# Get the list from the sheet: run fn_24_78_ShowSwAbbrevList_StockData_60 in Apps Script and paste the text into "abbrevs".
+# v1.1: the 16 Salkku stocks are built into sw_management_collect.py -- just press Run workflow. "abbrevs" is optional (it replaces the built-in list).
 name: SW Management Collect
 
 "on":
   workflow_dispatch:
     inputs:
       abbrevs:
-        description: 'SW abbreviations, separated by comma / space / new line'
-        required: true
+        description: 'Optional: SW abbreviations (comma / space / new line); empty = the built-in 16 stocks'
+        required: false
+        default: ''
         type: string
       pages:
         description: 'Pages to read (default management,ownership)'
