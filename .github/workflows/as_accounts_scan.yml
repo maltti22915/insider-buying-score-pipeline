@@ -1,0 +1,37 @@
+name: AS Accounts Scan
+on:
+  workflow_dispatch:
+    inputs:
+      accounts:
+        description: "Accounts JSON list [{label,email,password},...] (sent by fn_26_50_ASAccountsUpdate)"
+        required: true
+      nonce:
+        description: "Run id from Apps Script (matches the result to the request)"
+        required: false
+        default: ""
+      pages:
+        description: "Paths to read after login (comma separated; empty = default)"
+        required: false
+        default: ""
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install seleniumbase
+      - name: Scan accounts
+        env:
+          ACCOUNTS_JSON: ${{ inputs.accounts }}
+          NONCE: ${{ inputs.nonce }}
+          PAGES: ${{ inputs.pages }}
+        run: python as_accounts_scan.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: as-accounts-scan
+          path: as_scan_out/
+          retention-days: 1
