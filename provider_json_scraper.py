@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v38: the score's font colour is read from the deepest element whose whole text is 'NN' or 'NN / 100' (v37 log: scores OK but profitColor/solvColor empty because the number is not a leaf element).
   v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
   v36: the font colour AlphaSpread itself uses for the score number (computed style of the '99' / '80') is read too (card.color, '#rrggbb') so the sheet can show the score in the same colour.
   v35: AlphaSpread 'Profitability Score' and 'Solvency Score' cards (0-100 plus the tick-mark reasons, e.g. 'Exceptional 3Y Average ROIC') are read from the same summary page visit as AS Hist and sent in the ASRP payload as ratios.scores = {profit, solv}. Columns 'AS Profit' / 'AS Solv' (fn_91_07 v6, fn_24_69). AS_SCORES=0 disables.
@@ -1678,17 +1679,31 @@ function readCard(kind) {
         if (norm(leaves[k].textContent) === item.t) { item.ok = okState(leaves[k].parentElement || leaves[k]); break; }
       }
     });
-    for (var q = 0; q < leaves.length && out.score !== null; q++) {
-      if (/^\d{1,3}$/.test(norm(leaves[q].textContent)) && parseInt(norm(leaves[q].textContent), 10) === out.score) {
+    if (out.score !== null) {
+      // v38: the number often sits next to a "/ 100" child inside one element, so it is not a leaf. Take the deepest element whose
+      // whole text is "NN" or "NN / 100" and read the colour of that element.
+      var scoreRe = /^(\d{1,3})(?:\s*\/\s*100)?$/;
+      var best = null;
+      card.querySelectorAll('*').forEach(function (e) {
+        var m2 = norm(e.textContent).match(scoreRe);
+        if (m2 && parseInt(m2[1], 10) === out.score) {
+          var childMatches = false;
+          for (var c = 0; c < e.children.length; c++) {
+            var m3 = norm(e.children[c].textContent).match(scoreRe);
+            if (m3 && parseInt(m3[1], 10) === out.score) { childMatches = true; break; }
+          }
+          if (!childMatches) { best = e; }
+        }
+      });
+      if (best) {
         try {
-          var cc = getComputedStyle(leaves[q]).color || '';
+          var cc = getComputedStyle(best).color || '';
           var cm = cc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
           if (cm) {
-            var hx = function (v) { var s = Math.max(0, Math.min(255, +v)).toString(16); return s.length < 2 ? '0' + s : s; };
+            var hx = function (v) { var s2 = Math.max(0, Math.min(255, +v)).toString(16); return s2.length < 2 ? '0' + s2 : s2; };
             out.color = '#' + hx(cm[1]) + hx(cm[2]) + hx(cm[3]);
           }
         } catch (e) {}
-        break;
       }
     }
     var links = card.querySelectorAll('a[href]');
@@ -2237,7 +2252,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v37",
+            "v": "v38",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
