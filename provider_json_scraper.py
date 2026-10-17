@@ -34,6 +34,8 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v42: Simply Wall St now runs on SeleniumBase CDP mode (CdpSB adapter, sb.cdp.solve_captcha): sw_probe v2 passed 12 of 12 for CDP against 2 of 6 for the old uc engine (hour 12 UTC, normally the worst). SW_ENGINE=uc switches back.
+  v41: the 'View All' details read is OFF by default (AS_SCORE_DETAILS=1 turns it on): the live runs showed that AlphaSpread hides the score and checks on /profitability and /solvency for the logged-out bot ('score is Hidden', fewer than 3 checks), and each try cost 20-40 s per row.
   v39: after AS Hist the scraper opens the AlphaSpread Profitability and Solvency analysis pages, clicks 'View All' and reads ALL due-diligence checks (name, value such as '90% > 91%', green/yellow/red status) into ratios.scores.<kind>.checks; the cell notes then list every check. AS_SCORE_DETAILS=0 disables. A failure keeps the 4 reasons from the summary card.
   v38: the score's font colour is read from the deepest element whose whole text is 'NN' or 'NN / 100' (v37 log: scores OK but profitColor/solvColor empty because the number is not a leaf element).
   v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
@@ -381,6 +383,68 @@ def utc_clock_text():
 def utc_iso_text():
     """Current UTC time as an ISO 8601 string (second precision)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----------------------------------------------------------------------------
+# v42: SeleniumBase CDP mode for Simply Wall St (sw_probe v2 result: CDP + solve_captcha passed 12 of 12 at 12:51 UTC, the
+# webdriver "uc" baseline 2 of 6, headless uc 0 of 6). CdpSB gives the CDP browser the few sb.* methods the SW code uses,
+# so the proven SW dialog code stays unchanged. Env SW_ENGINE=uc switches back to the old webdriver engine.
+# ----------------------------------------------------------------------------
+SW_ENGINE = os.environ.get("SW_ENGINE", "cdp").strip().lower()
+
+
+class CdpSB(object):
+    """Thin adapter: the sb.* calls of the SW scraper on top of sb.cdp (pure CDP, no webdriver)."""
+
+    def __init__(self, sb):
+        self.sb = sb
+        self.opened = False
+
+    def uc_open_with_reconnect(self, url, reconnect_time=None):
+        if not self.opened:
+            self.sb.activate_cdp_mode(url)
+            self.opened = True
+        else:
+            self.sb.cdp.open(url)
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def execute_script(self, script):
+        return self.sb.cdp.evaluate(script)
+
+    def get_page_source(self):
+        return self.sb.cdp.get_page_source()
+
+    def get_title(self):
+        return self.sb.cdp.get_title()
+
+    def get_current_url(self):
+        return self.sb.cdp.get_current_url()
+
+    def uc_gui_click_captcha(self):
+        self.sb.cdp.solve_captcha()
+
+    def click(self, selector, timeout=None):
+        self.sb.cdp.click(selector)
+
+    def set_window_size(self, width, height):
+        try:
+            self.sb.cdp.set_window_size(width, height)
+        except Exception:
+            pass
+
+    def send_keys(self, selector, text):
+        try:
+            self.sb.cdp.press_keys(selector, text)
+        except Exception:
+            pass
+
+    def save_screenshot(self, name, folder=None):
+        try:
+            return self.sb.cdp.save_screenshot(name, folder)
+        except Exception:
+            return None
 
 
 def run_js(sb, function_body):
@@ -1879,7 +1943,7 @@ _AS_VIEW_ALL_JS = (
 def fetch_as_score_details(sb, abbrev_as):
     """v39: opens the AlphaSpread Profitability / Solvency pages named by the summary cards, clicks 'View All' and stores every
     due-diligence check under _AS_RATIOS['scores'][kind]['checks']. Never raises; on any failure the summary card's reasons stay."""
-    if os.environ.get("AS_SCORE_DETAILS", "1") == "0" or os.environ.get("AS_SCORES", "1") == "0":
+    if os.environ.get("AS_SCORE_DETAILS", "0") != "1" or os.environ.get("AS_SCORES", "1") == "0":
         return
     scores = _AS_RATIOS.get("scores")
     if not isinstance(scores, dict):
@@ -2402,7 +2466,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v40",
+            "v": "v42",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2630,9 +2694,10 @@ def run_bot():
                 step_begin(target, attempt, mode)
 
                 try:
-                    with SB(uc=True, headless=headless) as sb:
+                    use_cdp = (target == "SW" and SW_ENGINE == "cdp")  # v42
+                    with (SB(uc=True, test=True, locale="en") if use_cdp else SB(uc=True, headless=headless)) as sb:
                         browser_ready = True
-                        data = scrape(sb, abbrev, row_number, headless)
+                        data = scrape(CdpSB(sb) if use_cdp else sb, abbrev, row_number, headless)
                         posted = post_provider_json(
                             webhook_url, target, row_number, abbrev, sheet_name, data
                         )
