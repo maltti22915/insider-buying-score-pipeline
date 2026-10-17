@@ -1,4 +1,5 @@
 """
+sw_management_collect.py v1.2 -- (v1.2: the expand step finds 'Show more' / 'Show all' / 'View all' on any element, not only buttons, clicks it once, and logs which controls it clicked.)
 sw_management_collect.py v1 -- DATA COLLECTION ONLY (writes nothing to the sheet).
 Collects the Simply Wall St "Management" (6) and "Ownership" (7) pages of every stock in a list, so that a "Skin in the Game" metric
 can be designed from real data. Output (workflow artifact "sw-management-data"):
@@ -82,14 +83,21 @@ EXTRACT_JS = r"""(function(){
 })()"""
 
 EXPAND_JS = r"""(function(){
-  var n = 0;
-  [].slice.call(document.querySelectorAll('button,a,[role=button]')).forEach(function(b){
-    var tx = (b.innerText || '').replace(/\s+/g,' ').trim();
-    if (/^(show|view|see)\s+(more|all)\b/i.test(tx) && !/update|news/i.test(tx)) {
-      try { b.scrollIntoView({block:'center'}); b.click(); n++; } catch (e) {}
+  var clicked = [], seen = [];
+  var els = [].slice.call(document.querySelectorAll('button,a,[role=button],div,span,p'));
+  els.forEach(function(e){
+    if (e.children.length > 3) { return; }
+    var tx = (e.innerText || '').replace(/\s+/g,' ').trim();
+    if (!tx || tx.length > 40) { return; }
+    if (/^(show|view|see|load|read)\s+(more|all|full)\b/i.test(tx) || /^(more|expand)$/i.test(tx)) {
+      if (/update|news|less|hide/i.test(tx)) { return; }
+      seen.push(tx);
+      var target = e.closest('button,a,[role=button]') || e;
+      if (target.getAttribute && target.getAttribute('data-sw-clicked')) { return; }
+      try { target.setAttribute('data-sw-clicked', '1'); target.scrollIntoView({block:'center'}); target.click(); clicked.push(tx); } catch (err) {}
     }
   });
-  return n;
+  return JSON.stringify({clicked: clicked, seen: seen});
 })()"""
 
 
@@ -189,8 +197,15 @@ class Browser(object):
         time.sleep(2)
         self.scroll_all()
         expanded = 0
-        for _ in range(3):
-            n = int(self.js(EXPAND_JS) or 0)
+        controls = []
+        for _ in range(4):
+            res = self.js(EXPAND_JS)
+            try:
+                res = json.loads(res) if isinstance(res, str) else (res or {})
+            except Exception:
+                res = {}
+            n = len(res.get("clicked") or [])
+            controls.extend(res.get("clicked") or [])
             expanded += n
             if not n:
                 break
@@ -203,6 +218,7 @@ class Browser(object):
         if len(data.get("lines") or []) < 15:
             raise RuntimeError("page nearly empty ({} lines)".format(len(data.get("lines") or [])))
         data["expandedClicks"] = expanded
+        data["clickedControls"] = controls
         return data
 
 
@@ -212,9 +228,10 @@ def collect_stock(browser, abbrev):
         url = "https://simplywall.st/stocks/{}/{}".format(abbrev, page)
         try:
             record["pages"][page] = browser.read_page(url)
-            print("  OK   {} | {} lines | {} rows | icons={} | expanded={}".format(
+            print("  OK   {} | {} lines | {} rows | icons={} | expanded={} {}".format(
                 page, len(record["pages"][page]["lines"]), len(record["pages"][page]["rows"]),
-                len(record["pages"][page]["icons"]), record["pages"][page]["expandedClicks"]), flush=True)
+                len(record["pages"][page]["icons"]), record["pages"][page]["expandedClicks"],
+                record["pages"][page].get("clickedControls") or ""), flush=True)
         except Exception as e:
             record["errors"][page] = "{}: {}".format(type(e).__name__, str(e)[:150])
             print("  FAIL {} | {}".format(page, record["errors"][page]), flush=True)
@@ -252,7 +269,7 @@ def main():
     if not abbrevs:
         print("no abbreviations to collect")
         sys.exit(1)
-    print("SW management collect v1 | {} stocks | pages={}".format(len(abbrevs), PAGES), flush=True)
+    print("SW management collect v1.2 | {} stocks | pages={}".format(len(abbrevs), PAGES), flush=True)
     records, browser = [], None
     try:
         for index, abbrev in enumerate(abbrevs, 1):
