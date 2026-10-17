@@ -1,5 +1,5 @@
 """
-sw_management_collect.py v1.2 -- (v1.2: the expand step finds 'Show more' / 'Show all' / 'View all' on any element, not only buttons, clicks it once, and logs which controls it clicked.)
+sw_management_collect.py v2 -- (v1.2: the expand step finds 'Show more' / 'Show all' / 'View all' on any element, not only buttons, clicks it once, and logs which controls it clicked.)
 sw_management_collect.py v1 -- DATA COLLECTION ONLY (writes nothing to the sheet).
 Collects the Simply Wall St "Management" (6) and "Ownership" (7) pages of every stock in a list, so that a "Skin in the Game" metric
 can be designed from real data. Output (workflow artifact "sw-management-data"):
@@ -101,6 +101,48 @@ EXPAND_JS = r"""(function(){
 })()"""
 
 
+TAB_LABELS = ("CEO", "Leadership Team", "Board Members")
+SECTION_HEADS = ("Leadership Team", "Board Members", "Ownership Breakdown", "Top Shareholders", "Recent Insider Transactions")
+
+CLICK_LABEL_JS = r"""(function(label){
+  var els = [].slice.call(document.querySelectorAll('button,[role=tab],a,div,span,li'));
+  for (var i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.children.length > 2) { continue; }
+    var tx = (e.innerText || '').replace(/\s+/g,' ').trim();
+    if (tx === label && !/^H[1-6]$/.test(e.tagName)) {
+      try { e.scrollIntoView({block:'center'}); e.click(); return 'clicked ' + e.tagName + ' role=' + (e.getAttribute('role')||''); } catch (err) { return 'err ' + err; }
+    }
+  }
+  return 'notfound';
+})(%s)"""
+
+SCROLL_TO_JS = r"""(function(label){
+  var els = [].slice.call(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'));
+  for (var i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.children.length > 2) { continue; }
+    var tx = (e.innerText || '').replace(/\s+/g,' ').trim();
+    if (tx === label) { e.scrollIntoView({block:'center'}); return 'ok'; }
+  }
+  return 'notfound';
+})(%s)"""
+
+SECTION_HTML_JS = r"""(function(label){
+  var els = [].slice.call(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'));
+  for (var i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.children.length > 2) { continue; }
+    var tx = (e.innerText || '').replace(/\s+/g,' ').trim();
+    if (tx === label) {
+      var p = e.parentElement && e.parentElement.parentElement ? e.parentElement.parentElement : e.parentElement;
+      return (p ? p.outerHTML : '').slice(0, 6000);
+    }
+  }
+  return '';
+})(%s)"""
+
+
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -190,12 +232,71 @@ class Browser(object):
         except Exception:
             pass
 
+    def slow_scroll(self):
+        """Small steps with waits so lazy-loaded sections (IntersectionObserver) render."""
+        try:
+            height = int(self.js("document.body.scrollHeight") or 0)
+        except Exception:
+            height = 8000
+        y = 0
+        while y < height + 600:
+            try:
+                self.js("window.scrollTo(0, %d)" % y)
+            except Exception:
+                break
+            time.sleep(0.9)
+            y += 350
+            try:
+                height = max(height, int(self.js("document.body.scrollHeight") or 0))
+            except Exception:
+                pass
+
+    def lines_now(self):
+        raw = self.js(EXTRACT_JS)
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return (data or {}).get("lines") or []
+
+    def reveal_sections(self, base_lines):
+        """Scroll to each section, click the CEO / Leadership Team / Board Members tabs, store new text."""
+        out = {"tabs": {}, "scrolled": {}, "html": {}}
+        known = set(base_lines)
+        for label in SECTION_HEADS:
+            try:
+                out["scrolled"][label] = self.js(SCROLL_TO_JS % json.dumps(label))
+                for _ in range(6):
+                    time.sleep(1.5)
+                    cur = self.lines_now()
+                    if not any(l.startswith("Loading") for l in cur):
+                        break
+                new = [l for l in cur if l not in known]
+                if new:
+                    out["scrolled"][label + "_newlines"] = new[:200]
+                    known.update(new)
+            except Exception as e:
+                out["scrolled"][label] = "err " + str(e)
+        for label in TAB_LABELS:
+            try:
+                res = self.js(CLICK_LABEL_JS % json.dumps(label))
+                time.sleep(2.5)
+                cur = self.lines_now()
+                new = [l for l in cur if l not in known]
+                known.update(new)
+                out["tabs"][label] = {"click": res, "newLines": new[:300]}
+            except Exception as e:
+                out["tabs"][label] = {"click": "err " + str(e), "newLines": []}
+        for label in SECTION_HEADS + ("CEO Compensation Analysis",):
+            try:
+                out["html"][label] = self.js(SECTION_HTML_JS % json.dumps(label))
+            except Exception:
+                pass
+        return out
+
     def read_page(self, url):
         self.open(url)
         if not self.wait_clear():
             raise RuntimeError("blocked by Cloudflare")
         time.sleep(2)
-        self.scroll_all()
+        self.slow_scroll()
         expanded = 0
         controls = []
         for _ in range(4):
@@ -217,6 +318,14 @@ class Browser(object):
             raise RuntimeError("extract failed: {}".format((data or {}).get("error")))
         if len(data.get("lines") or []) < 15:
             raise RuntimeError("page nearly empty ({} lines)".format(len(data.get("lines") or [])))
+        try:
+            data["reveal"] = self.reveal_sections(data.get("lines") or [])
+            try:
+                data["lines"] = self.lines_now()
+            except Exception:
+                pass
+        except Exception as e:
+            data["reveal"] = {"error": str(e)}
         data["expandedClicks"] = expanded
         data["clickedControls"] = controls
         return data
@@ -253,6 +362,14 @@ def write_outputs(records):
                 if d.get("icons"):
                     fh.write("[criteria icons: {}]\n".format("; ".join("color={} stroke={}".format(i.get("color"), i.get("stroke")) for i in d["icons"])))
                 fh.write("\n".join(d.get("lines", [])) + "\n")
+                rv = d.get("reveal") or {}
+                for lab, t in (rv.get("tabs") or {}).items():
+                    fh.write("\n[TAB {} -> {}]\n{}\n".format(lab, t.get("click"), "\n".join(t.get("newLines") or [])))
+                for lab, v in (rv.get("scrolled") or {}).items():
+                    if lab.endswith("_newlines"):
+                        fh.write("\n[AFTER SCROLL TO {}]\n{}\n".format(lab[:-9], "\n".join(v)))
+                for lab, h in (rv.get("html") or {}).items():
+                    fh.write("\n[HTML {}]\n{}\n".format(lab, h[:2500]))
                 if d.get("rows"):
                     fh.write("\n[table-like rows]\n" + "\n".join(" | ".join(c) for c in d["rows"]) + "\n")
             for page, err in r["errors"].items():
@@ -269,7 +386,7 @@ def main():
     if not abbrevs:
         print("no abbreviations to collect")
         sys.exit(1)
-    print("SW management collect v1.2 | {} stocks | pages={}".format(len(abbrevs), PAGES), flush=True)
+    print("SW management collect v2 | {} stocks | pages={}".format(len(abbrevs), PAGES), flush=True)
     records, browser = [], None
     try:
         for index, abbrev in enumerate(abbrevs, 1):
