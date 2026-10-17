@@ -1,6 +1,8 @@
-# sw_probe.yml v1 -- read-only experiment: which browser behaviour passes the Simply Wall St Cloudflare challenge most often?
-# Save as .github/workflows/sw_probe.yml; sw_probe.py goes in the repository root. No secrets needed. Posts nothing to the sheet.
-# 8 attempts x 5 variants takes roughly 25-35 minutes. Result: the job summary page (table) and the log lines "SW_PROBE ...".
+# sw_probe.yml v2 -- read-only experiment: which GitHub-runner strategy passes the Simply Wall St Cloudflare gate most often?
+# Save as .github/workflows/sw_probe.yml; sw_probe.py goes in the repository root. Posts nothing to the sheet.
+# Manual run: pick variants/attempts. Scheduled run: every 3 hours with 3 attempts per variant, so the job summaries show
+# the pass rate by time of day. Variant S (Scrape.do) is only used when you list it AND the secret SCRAPEDO_TOKEN exists.
+# Result: the job summary page (table) and the log lines "SW_PROBE ..." / "SW_PROBE_JSON ...".
 name: SW Probe
 
 "on":
@@ -11,31 +13,32 @@ name: SW Probe
         required: true
         type: string
       attempts_per_variant:
-        description: 'Attempts per variant (default 8)'
+        description: 'Attempts per variant (default 6)'
         required: false
-        default: '8'
+        default: '6'
         type: string
       variants:
-        description: 'Variants to test, comma separated (A baseline, B early_click, C long_reconnect, D warmup_home, E no_click)'
+        description: 'A uc_baseline, F cdp_solve, G cdp_gui, H uc_headless, I http_chrome, J http_warm, K cdp_long, S scrape_do'
         required: false
-        default: 'A,B,C,D,E'
+        default: 'A,F,G,H,I,J,K'
         type: string
+  schedule:
+    - cron: '17 */3 * * *'
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
-      - run: pip install -r requirements.txt
+      - run: pip install seleniumbase curl_cffi requests
       - name: Run the probe
         env:
-          ABBREV_SW: ${{ inputs.abbrev_sw }}
-          ATTEMPTS_PER_VARIANT: ${{ inputs.attempts_per_variant }}
-          VARIANTS: ${{ inputs.variants }}
+          ABBREV_SW: ${{ inputs.abbrev_sw || 'us/software/nasdaq-adsk/autodesk' }}
+          ATTEMPTS_PER_VARIANT: ${{ inputs.attempts_per_variant || '3' }}
+          VARIANTS: ${{ inputs.variants || 'A,F,G,H,I,J,K' }}
+          SCRAPEDO_TOKEN: ${{ secrets.SCRAPEDO_TOKEN }}
         run: python sw_probe.py
