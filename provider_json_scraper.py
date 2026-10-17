@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v43: SW run also reads the SW Management + Ownership pages after the valuation dialog and posts the "Skin" score + note (target SKIN, handler fn_91_10; scoring in sw_skin.py; env SW_SKIN=0 switches it off).
   v42: Simply Wall St now runs on SeleniumBase CDP mode (CdpSB adapter, sb.cdp.solve_captcha): sw_probe v2 passed 12 of 12 for CDP against 2 of 6 for the old uc engine (hour 12 UTC, normally the worst). SW_ENGINE=uc switches back.
   v41: the 'View All' details read is OFF by default (AS_SCORE_DETAILS=1 turns it on): the live runs showed that AlphaSpread hides the score and checks on /profitability and /solvency for the logged-out bot ('score is Hidden', fewer than 3 checks), and each try cost 20-40 s per row.
   v39: after AS Hist the scraper opens the AlphaSpread Profitability and Solvency analysis pages, clicks 'View All' and reads ALL due-diligence checks (name, value such as '90% > 91%', green/yellow/red status) into ratios.scores.<kind>.checks; the cell notes then list every check. AS_SCORE_DETAILS=0 disables. A failure keeps the 4 reasons from the summary card.
@@ -360,7 +361,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "SWP": "abbrevSW", "GFP": "abbrevGF"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -1043,6 +1044,9 @@ def poll_for_dialog(sb):
 # v13: Simply Wall St future / dividend / valuation pages (replace Scrape.do)
 # ----------------------------------------------------------------------------
 _SW_PAGES = {}
+_SW_SKIN = {}
+SW_SKIN_ENABLED = os.environ.get("SW_SKIN", "1") != "0"
+SW_SKIN_SECTIONS = ("Leadership Team", "Board Members", "Ownership Breakdown", "Recent Insider Transactions")
 SW_PAGE_MIN_CHARS = 20000
 # v40: Simply Wall St brings only the valuation dialog (SW Price value + SW JSON). The future / dividend pages are
 # opened only when the env SW_SUBPAGES lists them (e.g. "future,dividend"); default = none.
@@ -1077,6 +1081,60 @@ def fetch_sw_subpage(sb, abbrev_sw, name, headless):
         print("⚠️ SW {} page failed: {}".format(name, page_error))
         step("page_" + name, "FAIL", reason=str(page_error).replace("\n", " ")[:80])
         return ""
+
+
+SKIN_LINES_JS = (
+    "var r = document.querySelector('main') || document.body;"
+    "return String(r.innerText || '').split('\\n').map(function(x){return x.replace(/\\s+/g,' ').trim();}).filter(Boolean);"
+)
+SKIN_SCROLL_TO_JS = (
+    "var label = %s; var els = [].slice.call(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'));"
+    "for (var i = 0; i < els.length; i++) { var e = els[i]; if (e.children.length > 2) { continue; }"
+    " var tx = (e.innerText || '').replace(/\\s+/g,' ').trim();"
+    " if (tx === label) { e.scrollIntoView({block:'center'}); return 'ok'; } } return 'notfound';"
+)
+
+
+def fetch_sw_skin_lines(sb, abbrev_sw, page, headless):
+    """v43: opens the SW management / ownership page, scrolls its lazy sections in and returns the page text lines."""
+    url = "https://simplywall.st/stocks/{}/{}".format(abbrev_sw, page)
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
+        raise RuntimeError("skin: {} page still a challenge".format(page))
+    sb.sleep(2)
+    height = int(run_js(sb, "return document.body.scrollHeight;") or 6000)
+    y = 0
+    while y < height + 600 and y < 20000:
+        run_js(sb, "window.scrollTo(0, {}); return 1;".format(y))
+        time.sleep(0.8)
+        y += 350
+        height = max(height, int(run_js(sb, "return document.body.scrollHeight;") or height))
+    for label in SW_SKIN_SECTIONS:
+        run_js(sb, SKIN_SCROLL_TO_JS % json.dumps(label))
+        for _ in range(6):
+            time.sleep(1.2)
+            cur = run_js(sb, SKIN_LINES_JS) or []
+            if not any(str(l).startswith("Loading") for l in cur):
+                break
+    return run_js(sb, SKIN_LINES_JS) or []
+
+
+def fetch_sw_skin(sb, abbrev_sw, headless):
+    """v43: Management + Ownership pages -> Skin score dict (sw_skin.score_page_lines). Never raises."""
+    _SW_SKIN.clear()
+    if not SW_SKIN_ENABLED:
+        return
+    try:
+        import sw_skin
+        mgmt = fetch_sw_skin_lines(sb, abbrev_sw, "management", headless)
+        own = fetch_sw_skin_lines(sb, abbrev_sw, "ownership", headless)
+        res = sw_skin.score_page_lines(abbrev_sw, mgmt, own)
+        _SW_SKIN.update(res)
+        step("skin", "OK", score=res["score"], lines="{}/{}".format(len(mgmt), len(own)))
+    except Exception as skin_error:
+        print("⚠️ SW skin failed: {}".format(skin_error))
+        step("skin", "FAIL", reason=str(skin_error).replace("\n", " ")[:80])
 
 
 def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
@@ -1197,6 +1255,7 @@ def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
         save_sw_diagnostics(sb, row_number, dialog.get("html"), "always-on")
 
     fetch_sw_subpages_now()
+    fetch_sw_skin(sb, abbrev_sw, headless)  # v43
 
     data = {
         "source": "simplywall.st",
@@ -2466,7 +2525,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v42",
+            "v": "v43",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2489,8 +2548,29 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 # ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
+def post_sw_skin_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v43: posts the Skin score + note (target SKIN) for this row once."""
+    if not _SW_SKIN:
+        return
+    result = dict(_SW_SKIN)
+    _SW_SKIN.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        data = {"score": result["score"], "note": result["note"], "parts": result["parts"], "inputs": result["inputs"]}
+        posted = post_provider_json(webhook_url, "SKIN", row_number, abbrev, sheet_name, data)
+        info["skin"] = {"posted": bool(posted), "score": result["score"], "reason": None if posted else _LAST_POST.get("reason")}
+        step("post_skin", "OK" if posted else "FAIL", score=result["score"], reason=None if posted else _LAST_POST.get("reason"))
+    except Exception as skin_error:
+        print("❌ SW skin post failed: {}".format(skin_error))
+        info["skin"] = {"posted": False, "reason": str(skin_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
 def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
     """v13: posts the collected SW pages (target SWP) once; never touches the SW JSON result."""
+    post_sw_skin_if_any(webhook_url, row_number, abbrev, sheet_name, info)  # v43
     if not _SW_PAGES:
         return
     pages = dict(_SW_PAGES)
