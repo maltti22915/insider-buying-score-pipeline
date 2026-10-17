@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
   v36: the font colour AlphaSpread itself uses for the score number (computed style of the '99' / '80') is read too (card.color, '#rrggbb') so the sheet can show the score in the same colour.
   v35: AlphaSpread 'Profitability Score' and 'Solvency Score' cards (0-100 plus the tick-mark reasons, e.g. 'Exceptional 3Y Average ROIC') are read from the same summary page visit as AS Hist and sent in the ASRP payload as ratios.scores = {profit, solv}. Columns 'AS Profit' / 'AS Solv' (fn_91_07 v6, fn_24_69). AS_SCORES=0 disables.
   v34: SW gives up on a Cloudflare challenge after SW_CF_WAIT_SECONDS (default 15, env override) instead of 25. Log analysis of 240 SW attempts: every challenge that cleared did so within 7-11 s; the others never cleared, so the extra 10 s only delayed the next retry. Other providers still use CF_CHALLENGE_WAIT_SECONDS (25).
@@ -1635,59 +1636,65 @@ function findCard(kind) {
   var els = document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,a');
   for (var i = 0; i < els.length; i++) {
     var t = norm(els[i].textContent);
-    if (t.length < 60 && re.test(t) && els[i].children.length <= 2) {
+    if (t.length < 60 && re.test(t) && els[i].children.length <= 3) {
       var node = els[i];
-      for (var up = 0; up < 10 && node; up++) {
+      for (var up = 0; up < 12 && node; up++) {
         var tx = norm(node.textContent);
-        if (tx.length < 1500 && viewRe.test(tx)) { return {node: node, title: t}; }
+        if (tx.length < 2500 && viewRe.test(tx)) { return {node: node, title: t}; }
         node = node.parentElement;
       }
     }
   }
   return null;
 }
+var SKIP = /( (Profitability|Solvency) Score$|Due Diligence$|^View |^\/ ?100$|^(PROFITABILITY|SOLVENCY|SCORE)$)/i;
+function linesOf(text) { return String(text || '').split(/\n+/).map(norm).filter(function (l) { return l; }); }
 function readCard(kind) {
+  var headRe = new RegExp(kind + ' Score$', 'i');
   var found = findCard(kind);
-  if (!found) { return null; }
-  var card = found.node;
-  var out = {title: found.title, score: null, items: [], href: '', color: ''};
-  var leaves = [];
-  card.querySelectorAll('*').forEach(function (e) { if (e.children.length === 0 && norm(e.textContent)) { leaves.push(e); } });
-  var scoreIdx = -1;
-  for (var i = 0; i < leaves.length; i++) {
-    if (/^\d{1,3}$/.test(norm(leaves[i].textContent))) { out.score = parseInt(norm(leaves[i].textContent), 10); scoreIdx = i; break; }
+  var card = found ? found.node : null;
+  var lines = card ? linesOf(card.innerText) : null;
+  if (!lines || !lines.length) {
+    lines = linesOf(document.body ? document.body.innerText : '');
   }
-  if (scoreIdx >= 0) {
-    try {
-      var cc = getComputedStyle(leaves[scoreIdx]).color || '';
-      var cm = cc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-      if (cm) {
-        var hx = function (n) { var h = Math.max(0, Math.min(255, +n)).toString(16); return h.length < 2 ? '0' + h : h; };
-        out.color = '#' + hx(cm[1]) + hx(cm[2]) + hx(cm[3]);
-      }
-    } catch (e) {}
-  }
-  var skip = /(Score$|Due Diligence$|^View |^\/ ?100$|^(PROFITABILITY|SOLVENCY)$)/i;
-  var lis = card.querySelectorAll('li');
+  var h = -1;
+  for (var i = 0; i < lines.length; i++) { if (headRe.test(lines[i]) && lines[i].length < 60) { h = i; break; } }
+  if (h < 0) { return null; }
+  lines = lines.slice(h);
+  var out = {title: lines[0], score: null, items: [], href: '', color: '', dbg: lines.slice(0, 12).join(' | ').slice(0, 300), cardFound: !!card};
   var seen = {};
-  if (lis.length) {
-    lis.forEach(function (li) {
-      var t = norm(li.textContent);
-      if (t && !seen[t] && !skip.test(t)) { seen[t] = 1; out.items.push({t: t.slice(0, 90), ok: okState(li)}); }
-    });
+  for (var n = 1; n < lines.length && n < 40; n++) {
+    var line = lines[n];
+    if (/^View /i.test(line)) { break; }
+    var m = line.match(/^(\d{1,3})(?:\s*\/\s*100)?$/);
+    if (m) { if (out.score === null) { out.score = parseInt(m[1], 10); } continue; }
+    if (!SKIP.test(line) && line.length >= 6 && line.length <= 90 && !seen[line]) { seen[line] = 1; out.items.push({t: line, ok: null}); }
   }
-  if (!out.items.length) {
-    for (var j = 0; j < leaves.length && (scoreIdx < 0 || j < scoreIdx); j++) {
-      var t2 = norm(leaves[j].textContent);
-      if (t2.length >= 8 && t2.length <= 90 && !skip.test(t2) && t2 !== found.title && !seen[t2]) {
-        seen[t2] = 1;
-        out.items.push({t: t2, ok: okState(leaves[j].parentElement || leaves[j])});
+  if (card) {
+    var leaves = [];
+    card.querySelectorAll('*').forEach(function (e) { if (e.children.length === 0 && norm(e.textContent)) { leaves.push(e); } });
+    out.items.forEach(function (item) {
+      for (var k = 0; k < leaves.length; k++) {
+        if (norm(leaves[k].textContent) === item.t) { item.ok = okState(leaves[k].parentElement || leaves[k]); break; }
+      }
+    });
+    for (var q = 0; q < leaves.length && out.score !== null; q++) {
+      if (/^\d{1,3}$/.test(norm(leaves[q].textContent)) && parseInt(norm(leaves[q].textContent), 10) === out.score) {
+        try {
+          var cc = getComputedStyle(leaves[q]).color || '';
+          var cm = cc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+          if (cm) {
+            var hx = function (v) { var s = Math.max(0, Math.min(255, +v)).toString(16); return s.length < 2 ? '0' + s : s; };
+            out.color = '#' + hx(cm[1]) + hx(cm[2]) + hx(cm[3]);
+          }
+        } catch (e) {}
+        break;
       }
     }
-  }
-  var links = card.querySelectorAll('a[href]');
-  for (var k = 0; k < links.length; k++) {
-    if (/view/i.test(norm(links[k].textContent))) { out.href = links[k].href || ''; break; }
+    var links = card.querySelectorAll('a[href]');
+    for (var z = 0; z < links.length; z++) {
+      if (/view/i.test(norm(links[z].textContent))) { out.href = links[z].href || ''; break; }
+    }
   }
   return out;
 }
@@ -1754,7 +1761,10 @@ def _as_fetch_scores_on_page(sb, url):
                     handle.write(sb.get_page_source()[:400000])
             except Exception:
                 pass
-            step("scores", "FAIL", reason="no score card found", hasProfit=result.get("hasProfit"), hasSolv=result.get("hasSolv"), rounds=rounds)
+            pr, sv = result.get("profit") or {}, result.get("solv") or {}
+            step("scores", "FAIL", reason="no score found", hasProfit=result.get("hasProfit"), hasSolv=result.get("hasSolv"), rounds=rounds,
+                 profitCard=pr.get("cardFound"), profitScore=pr.get("score"), profitText=repr(pr.get("dbg"))[:260],
+                 solvCard=sv.get("cardFound"), solvScore=sv.get("score"), solvText=repr(sv.get("dbg"))[:260])
             return
         scores = {"url": url}
         if profit:
@@ -2227,7 +2237,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v36",
+            "v": "v37",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
