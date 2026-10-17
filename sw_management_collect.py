@@ -10,8 +10,9 @@ can be designed from real data. Output (workflow artifact "sw-management-data"):
 Engine: SeleniumBase CDP mode (the engine that passed Cloudflare 12 of 12 in sw_probe v2), ONE browser for many stocks (the
 Cloudflare clearance is kept between pages); the browser is restarted after a block and every 12 stocks.
 
-Env: ABBREVS (comma / space / newline separated Simply Wall St abbreviations, e.g. de/diversified-financials/etr-ftk/flatexdegiro-shares;
-     full simplywall.st URLs are accepted too), PAGES (default "management,ownership"), WAIT_SECONDS (Cloudflare, default 30),
+v1.1: the 16 Salkku stocks are built in (DEFAULT_ABBREVS below), so the workflow needs no input. Edit that list when stocks change.
+Env: ABBREVS (optional; when set it REPLACES the built-in list; comma / space / newline separated Simply Wall St abbreviations,
+     e.g. de/diversified-financials/etr-ftk/flatexdegiro-shares; full simplywall.st URLs are accepted too), PAGES (default "management,ownership"), WAIT_SECONDS (Cloudflare, default 30),
      PAUSE_SECONDS (between pages, default 3), OUT_DIR (default "sw_mgmt_out").
 The extraction was written from screenshots, not from the page source: it takes ALL visible text of the page (after scrolling and
 clicking "Show more"-type buttons) plus every table-like row, so nothing is lost; the metric work parses it afterwards.
@@ -25,6 +26,26 @@ PAUSE = float(os.environ.get("PAUSE_SECONDS", "3"))
 PAGES = [p.strip() for p in os.environ.get("PAGES", "management,ownership").split(",") if p.strip()]
 OUT_DIR = os.environ.get("OUT_DIR", "sw_mgmt_out")
 RESTART_EVERY = 12
+
+# Salkku stocks (abbrevSW from column D of the sheet, checked 2026-10-17)
+DEFAULT_ABBREVS = """
+us/media/nasdaq-app/applovin
+de/diversified-financials/etr-ftk/flatexdegiro-shares
+us/retail/nyse-baba/alibaba-group-holding
+nl/retail/ams-prx/prosus-shares
+us/transportation/nyse-uber/uber-technologies
+de/media/etr-evd/cts-eventim-kgaa-shares
+us/retail/nasdaq-amzn/amazoncom
+us/software/nasdaq-adsk/autodesk
+ca/software/tsx-csu/constellation-software-shares
+us/retail/nasdaq-meli/mercadolibre
+us/healthcare/nyse-unh/unitedhealth-group
+us/diversified-financials/nyse-msci/msci
+us/media/nasdaq-meta/meta-platforms
+dk/pharmaceuticals-biotech/cph-chemm/chemometec-shares
+de/software/etr-sap/sap-shares
+us/software/nyse-now/servicenow
+"""
 
 CF_MARKERS = ("just a moment", "/challenge", "verify you are human", "checking your browser", "attention required")
 
@@ -227,9 +248,9 @@ def write_outputs(records):
 
 
 def main():
-    abbrevs = parse_abbrevs(os.environ.get("ABBREVS", ""))
+    abbrevs = parse_abbrevs(os.environ.get("ABBREVS", "").strip() or DEFAULT_ABBREVS)
     if not abbrevs:
-        print("ABBREVS is empty (need Simply Wall St abbreviations like de/diversified-financials/etr-ftk/flatexdegiro-shares)")
+        print("no abbreviations to collect")
         sys.exit(1)
     print("SW management collect v1 | {} stocks | pages={}".format(len(abbrevs), PAGES), flush=True)
     records, browser = [], None
