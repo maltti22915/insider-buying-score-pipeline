@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v36: the font colour AlphaSpread itself uses for the score number (computed style of the '99' / '80') is read too (card.color, '#rrggbb') so the sheet can show the score in the same colour.
   v35: AlphaSpread 'Profitability Score' and 'Solvency Score' cards (0-100 plus the tick-mark reasons, e.g. 'Exceptional 3Y Average ROIC') are read from the same summary page visit as AS Hist and sent in the ASRP payload as ratios.scores = {profit, solv}. Columns 'AS Profit' / 'AS Solv' (fn_91_07 v6, fn_24_69). AS_SCORES=0 disables.
   v34: SW gives up on a Cloudflare challenge after SW_CF_WAIT_SECONDS (default 15, env override) instead of 25. Log analysis of 240 SW attempts: every challenge that cleared did so within 7-11 s; the others never cleared, so the extra 10 s only delayed the next retry. Other providers still use CF_CHALLENGE_WAIT_SECONDS (25).
   v26: one final row recalculation per parallel run instead of four (handlers get skipRecalc; the parent sends ASRP recalcOnly last). SINGLE_RECALC=0 restores the old behaviour.
@@ -1649,12 +1650,22 @@ function readCard(kind) {
   var found = findCard(kind);
   if (!found) { return null; }
   var card = found.node;
-  var out = {title: found.title, score: null, items: [], href: ''};
+  var out = {title: found.title, score: null, items: [], href: '', color: ''};
   var leaves = [];
   card.querySelectorAll('*').forEach(function (e) { if (e.children.length === 0 && norm(e.textContent)) { leaves.push(e); } });
   var scoreIdx = -1;
   for (var i = 0; i < leaves.length; i++) {
     if (/^\d{1,3}$/.test(norm(leaves[i].textContent))) { out.score = parseInt(norm(leaves[i].textContent), 10); scoreIdx = i; break; }
+  }
+  if (scoreIdx >= 0) {
+    try {
+      var cc = getComputedStyle(leaves[scoreIdx]).color || '';
+      var cm = cc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (cm) {
+        var hx = function (n) { var h = Math.max(0, Math.min(255, +n)).toString(16); return h.length < 2 ? '0' + h : h; };
+        out.color = '#' + hx(cm[1]) + hx(cm[2]) + hx(cm[3]);
+      }
+    } catch (e) {}
   }
   var skip = /(Score$|Due Diligence$|^View |^\/ ?100$|^(PROFITABILITY|SOLVENCY)$)/i;
   var lis = card.querySelectorAll('li');
@@ -1699,7 +1710,10 @@ def _as_scores_clean(card):
     for item in (card.get("items") or [])[:8]:
         if isinstance(item, dict) and str(item.get("t") or "").strip():
             items.append({"t": str(item["t"]).strip()[:90], "ok": item.get("ok") if item.get("ok") in (True, False) else None})
-    return {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300]}
+    color = str(card.get("color") or "").strip().lower()
+    if not re.match(r"^#[0-9a-f]{6}$", color):
+        color = ""
+    return {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300], "color": color}
 
 
 def _as_fetch_scores_on_page(sb, url):
@@ -1749,7 +1763,8 @@ def _as_fetch_scores_on_page(sb, url):
             scores["solv"] = solv
         _AS_RATIOS["scores"] = scores
         step("scores", "OK", profit=(profit or {}).get("score"), solv=(solv or {}).get("score"),
-             profitItems=len((profit or {}).get("items") or []), solvItems=len((solv or {}).get("items") or []), rounds=rounds)
+             profitItems=len((profit or {}).get("items") or []), solvItems=len((solv or {}).get("items") or []),
+             profitColor=(profit or {}).get("color"), solvColor=(solv or {}).get("color"), rounds=rounds)
     except Exception as scores_error:
         step("scores", "FAIL", reason=type(scores_error).__name__)
 
@@ -2212,7 +2227,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v35",
+            "v": "v36",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
