@@ -1,0 +1,41 @@
+# sw_management_collect.yml v1 -- collects the Simply Wall St Management (6) and Ownership (7) pages for a list of stocks.
+# Save as .github/workflows/sw_management_collect.yml; sw_management_collect.py goes in the repository root. Writes nothing to the sheet.
+# Result: the workflow artifact "sw-management-data" (sw_mgmt_all.txt is the easiest file to hand over, sw_mgmt_all.json has the same data).
+# Get the list from the sheet: run fn_24_78_ShowSwAbbrevList_StockData_60 in Apps Script and paste the text into "abbrevs".
+name: SW Management Collect
+
+"on":
+  workflow_dispatch:
+    inputs:
+      abbrevs:
+        description: 'SW abbreviations, separated by comma / space / new line'
+        required: true
+        type: string
+      pages:
+        description: 'Pages to read (default management,ownership)'
+        required: false
+        default: 'management,ownership'
+        type: string
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install seleniumbase
+      - name: Collect
+        env:
+          ABBREVS: ${{ inputs.abbrevs }}
+          PAGES: ${{ inputs.pages }}
+        run: python sw_management_collect.py
+      - name: Upload the data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sw-management-data
+          path: sw_mgmt_out/
+          if-no-files-found: warn
