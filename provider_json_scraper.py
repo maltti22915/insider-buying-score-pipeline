@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v39: after AS Hist the scraper opens the AlphaSpread Profitability and Solvency analysis pages, clicks 'View All' and reads ALL due-diligence checks (name, value such as '90% > 91%', green/yellow/red status) into ratios.scores.<kind>.checks; the cell notes then list every check. AS_SCORE_DETAILS=0 disables. A failure keeps the 4 reasons from the summary card.
   v38: the score's font colour is read from the deepest element whose whole text is 'NN' or 'NN / 100' (v37 log: scores OK but profitColor/solvColor empty because the number is not a leaf element).
   v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
   v36: the font colour AlphaSpread itself uses for the score number (computed style of the '99' / '80') is read too (card.color, '#rrggbb') so the sheet can show the score in the same colour.
@@ -1735,7 +1736,10 @@ def _as_scores_clean(card):
     color = str(card.get("color") or "").strip().lower()
     if not re.match(r"^#[0-9a-f]{6}$", color):
         color = ""
-    return {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300], "color": color}
+    cleaned = {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300], "color": color}
+    if card.get("checks"):
+        cleaned["checks"] = card.get("checks")
+    return cleaned
 
 
 def _as_fetch_scores_on_page(sb, url):
@@ -1792,6 +1796,148 @@ def _as_fetch_scores_on_page(sb, url):
              profitColor=(profit or {}).get("color"), solvColor=(solv or {}).get("color"), rounds=rounds)
     except Exception as scores_error:
         step("scores", "FAIL", reason=type(scores_error).__name__)
+
+
+_AS_CHECKS_JS = r"""
+var out = {found: false, checks: [], expanded: false, dbg: ''};
+function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function rgbOf(str) {
+  var m = String(str || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+  if (!m) { return null; }
+  if (m[4] !== undefined && parseFloat(m[4]) === 0) { return null; }
+  return [+m[1], +m[2], +m[3]];
+}
+function classify(c) {
+  var r = c[0], g = c[1], b = c[2];
+  if (r > 200 && g > 130 && b < 110) { return 'warn'; }
+  if (r > 150 && g < 110 && b < 130) { return 'bad'; }
+  if (g > r + 20 && g > b) { return 'ok'; }
+  return null;
+}
+function statusOf(svg) {
+  var cands = [];
+  try {
+    var cs = getComputedStyle(svg);
+    cands.push(cs.fill, cs.stroke, cs.color);
+    var inner = svg.querySelector('path,circle');
+    if (inner) { var ci = getComputedStyle(inner); cands.push(ci.fill, ci.stroke); }
+  } catch (e) {}
+  for (var i = 0; i < cands.length; i++) {
+    var c = rgbOf(cands[i]);
+    if (c) { var k = classify(c); if (k) { return k; } }
+  }
+  var cls = String(svg.getAttribute('class') || '') + ' ' + String(svg.parentElement ? svg.parentElement.className : '');
+  cls = cls.toLowerCase();
+  if (/(check|success)/.test(cls)) { return 'ok'; }
+  if (/(times|xmark|cross|danger|error)/.test(cls)) { return 'bad'; }
+  if (/(warn|exclam|minus)/.test(cls)) { return 'warn'; }
+  return null;
+}
+var head = null;
+document.querySelectorAll('*').forEach(function (e) {
+  if (!head && e.children.length === 0 && /^Due Diligence Checks/i.test(norm(e.textContent))) { head = e; }
+});
+if (!head) { return out; }
+var cont = head;
+for (var up = 0; up < 8; up++) {
+  if (!cont.parentElement) { break; }
+  cont = cont.parentElement;
+  if (cont.querySelectorAll('svg').length >= 4) { break; }
+}
+out.found = true;
+out.expanded = /\bHide\b/.test(norm(cont.innerText || ''));
+var seen = {};
+cont.querySelectorAll('svg').forEach(function (svg) {
+  var pill = svg.parentElement;
+  for (var u = 0; u < 4 && pill && pill !== cont && norm(pill.textContent).length < 6; u++) { pill = pill.parentElement; }
+  if (!pill || pill === cont) { return; }
+  if (pill.querySelectorAll('svg').length > 1) { return; }
+  var txt = norm(pill.innerText || pill.textContent);
+  if (!txt || /^(View All|Hide)$/i.test(txt) || txt.length > 140) { return; }
+  var m = txt.match(/^(.*?)\s+(-?[\d.,]+\s*(?:%|x|B|M|K|T)?(?:\s*>\s*-?[\d.,]+\s*(?:%|x|B|M|K|T)?)?)$/);
+  var name = m ? m[1] : txt;
+  var val = m ? m[2] : '';
+  if (name.length < 4 || seen[txt]) { return; }
+  seen[txt] = 1;
+  out.checks.push({t: name.slice(0, 90), v: val.slice(0, 24), s: statusOf(svg)});
+});
+out.dbg = norm(cont.innerText || '').slice(0, 200);
+return out;
+"""
+
+_AS_VIEW_ALL_JS = (
+    "var best = null;"
+    "document.querySelectorAll('a, button, span, div').forEach(function (e) {"
+    "  if (!best && e.children.length <= 2 && (e.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase() === 'view all' && e.offsetParent !== null) { best = e; } });"
+    "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';"
+)
+
+
+def fetch_as_score_details(sb, abbrev_as):
+    """v39: opens the AlphaSpread Profitability / Solvency pages named by the summary cards, clicks 'View All' and stores every
+    due-diligence check under _AS_RATIOS['scores'][kind]['checks']. Never raises; on any failure the summary card's reasons stay."""
+    if os.environ.get("AS_SCORE_DETAILS", "1") == "0" or os.environ.get("AS_SCORES", "1") == "0":
+        return
+    scores = _AS_RATIOS.get("scores")
+    if not isinstance(scores, dict):
+        return
+    base = "https://www.alphaspread.com/security/{}".format(str(abbrev_as).strip().strip("/"))
+    for kind, page in (("profit", "profitability"), ("solv", "solvency")):
+        card = scores.get(kind)
+        if not isinstance(card, dict):
+            continue
+        href = str(card.get("href") or "")
+        url = href if ("alphaspread.com" in href and page[:6] in href.lower()) else "{}/{}".format(base, page)
+        try:
+            sb.uc_open_with_reconnect(url, 5)
+            sb.sleep(1.5)
+            deadline = time.time() + int(os.environ.get("AS_SCORE_DETAILS_WAIT", "20"))
+            data = {}
+            while time.time() < deadline:
+                try:
+                    data = sb.execute_script(_AS_CHECKS_JS) or {}
+                except Exception:
+                    data = {}
+                if data.get("found") and len(data.get("checks") or []) >= 3:
+                    break
+                try:
+                    sb.execute_script("window.scrollTo(0, 500);")
+                except Exception:
+                    pass
+                sb.sleep(1.2)
+            clicked = ""
+            if data.get("found") and not data.get("expanded"):
+                try:
+                    clicked = sb.execute_script(_AS_VIEW_ALL_JS) or ""
+                except Exception:
+                    clicked = ""
+                if clicked == "clicked":
+                    sb.sleep(1.5)
+                    try:
+                        data = sb.execute_script(_AS_CHECKS_JS) or data
+                    except Exception:
+                        pass
+            checks = []
+            for item in (data.get("checks") or [])[:40]:
+                if isinstance(item, dict) and str(item.get("t") or "").strip():
+                    status = item.get("s") if item.get("s") in ("ok", "warn", "bad") else None
+                    checks.append({"t": str(item["t"]).strip()[:90], "v": str(item.get("v") or "").strip()[:24], "s": status})
+            if len(checks) >= 3:
+                card["checks"] = checks
+                step("scores_detail", "OK", kind=kind, checks=len(checks), expanded=data.get("expanded"), viewAll=clicked or "-",
+                     ok=sum(1 for c in checks if c["s"] == "ok"), warn=sum(1 for c in checks if c["s"] == "warn"), bad=sum(1 for c in checks if c["s"] == "bad"),
+                     unknown=sum(1 for c in checks if c["s"] is None))
+            else:
+                try:
+                    os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                    with open(os.path.join(DIAGNOSTICS_DIR, "as_{}_row{}.html".format(page, os.environ.get("ROW_NUMBER", ""))), "w", encoding="utf-8") as handle:
+                        handle.write(sb.get_page_source()[:400000])
+                except Exception:
+                    pass
+                step("scores_detail", "FAIL", kind=kind, reason="fewer than 3 checks", found=data.get("found"), viewAll=clicked or "-",
+                     text=repr(data.get("dbg"))[:200], url=url[-60:])
+        except Exception as detail_error:
+            step("scores_detail", "FAIL", kind=kind, reason=type(detail_error).__name__)
 
 
 def fetch_as_hist(sb, abbrev_as):
@@ -2092,6 +2238,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
             fetch_as_buyback(sb, abbrev_as)
             if os.environ.get("AS_HIST", "1") != "0":
                 fetch_as_hist(sb, abbrev_as)  # v30
+                fetch_as_score_details(sb, abbrev_as)  # v39
         if os.environ.get("AS_QUALITY", "1") != "0":
             fetch_as_quality(sb, abbrev_as)
 
@@ -2252,7 +2399,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v38",
+            "v": "v39",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
