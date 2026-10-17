@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
   v39: after AS Hist the scraper opens the AlphaSpread Profitability and Solvency analysis pages, clicks 'View All' and reads ALL due-diligence checks (name, value such as '90% > 91%', green/yellow/red status) into ratios.scores.<kind>.checks; the cell notes then list every check. AS_SCORE_DETAILS=0 disables. A failure keeps the 4 reasons from the summary card.
   v38: the score's font colour is read from the deepest element whose whole text is 'NN' or 'NN / 100' (v37 log: scores OK but profitColor/solvColor empty because the number is not a leaf element).
   v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
@@ -979,7 +980,9 @@ def poll_for_dialog(sb):
 # ----------------------------------------------------------------------------
 _SW_PAGES = {}
 SW_PAGE_MIN_CHARS = 20000
-SW_SUBPAGES = ("future", "dividend")
+# v40: Simply Wall St brings only the valuation dialog (SW Price value + SW JSON). The future / dividend pages are
+# opened only when the env SW_SUBPAGES lists them (e.g. "future,dividend"); default = none.
+SW_SUBPAGES = tuple(x.strip() for x in os.environ.get("SW_SUBPAGES", "").split(",") if x.strip())
 
 
 def slim_html(html):
@@ -2399,7 +2402,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v39",
+            "v": "v40",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
