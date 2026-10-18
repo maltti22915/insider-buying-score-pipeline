@@ -1,4 +1,4 @@
-"""as_accounts_scan.py v3 -- AlphaSpread account scan for the StockData_60 "AS accounts" sheet.
+"""as_accounts_scan.py v4 -- AlphaSpread account scan for the StockData_60 "AS accounts" sheet.
 Started by Apps Script fn_26_50_ASAccountsUpdate (workflow "AS Accounts Scan", input "accounts" = JSON list from the sheet).
 Per account: log in, read the logged-in pages, detect the stocks opened on that account and the used/free slots (free plan = 3).
 Output (artifact "as-accounts-scan", fetched by fn_26_51_ASAccountsFetch):
@@ -16,17 +16,26 @@ Detector v3 (from the user's screenshots, 2026-10-17):
   Free plan is capped at 3 stocks PER WEEK, so the result is this week's spots.
 
 CHANGE LOG
+v4 (2026-10-18): (1) the run output now also reaches the Apps Script Execution Log (import gh_log_uploader; the workflow passes
+    GAS_WEBHOOK_URL). (2) A failed login now has a REASON: after "Sign in with email" the page is polled up to LOGIN_WAIT seconds; on
+    failure the status says why (still on the login page / error text / challenge / captcha / too many attempts), the visible page
+    text and a screenshot go to the log / artifact, and the login is retried once on a fresh page. (3) Stock Spots modal: waits until
+    no line says "Loading" (company names were sometimes read as "Loading..."). (4) A short pause between accounts.
 v3 (2026-10-17): stocks read from the "Free Plan: Stock Spots" modal text (numbered list: name + ticker), not from
     page links; modal links kept as "links" for exchange/ticker matching; Stocks written as "TICKER (Company)".
 v2 (2026-10-17): real AlphaSpread flow: /login, "Sign in with email" button, "Free Plan: N / M" badge counter,
     "Show Stock Spots" list; screenshots of the badge popup and spots list in the artifact (after login only).
 v1 (2026-10-17): first version.
 """
+import gh_log_uploader  # v4: copies everything printed to the Apps Script Execution Log
 import json, os, re, sys, time
 from datetime import datetime, timezone
 from seleniumbase import SB
 
-VERSION = "as_accounts_scan v3"
+VERSION = "as_accounts_scan v4"
+LOGIN_WAIT = float(os.environ.get("LOGIN_WAIT_SECONDS") or 25)
+PAUSE_BETWEEN = float(os.environ.get("PAUSE_BETWEEN_SECONDS") or 6)
+ERR_RX = re.compile(r"invalid|incorrect|wrong|not found|verify|too many|try again|locked|captcha|robot|blocked|denied", re.I)
 BASE = "https://www.alphaspread.com"
 OUT = os.environ.get("OUT_DIR", "as_scan_out")
 SLOTS = 3
@@ -190,6 +199,31 @@ def shot(sb, label, name):
         pass
 
 
+def login_attempt(sb, acc, r, tag):
+    """One login try on the current page. Returns (ok, reason, page)."""
+    fill = str(js(sb, FILL_JS % (json.dumps(acc["email"]), json.dumps(acc["password"]))))
+    r["steps"].append(tag + "fill: " + fill)
+    if fill != "filled":
+        return False, "login form not found (" + fill + ")", page(sb)
+    time.sleep(1)
+    base = set(page(sb).get("lines", []))  # text that was already on the page before the submit is not an error message
+    r["steps"].append(tag + "submit: " + str(js(sb, SUBMIT_JS)))
+    waited, pg = 0.0, {}
+    while waited < LOGIN_WAIT:
+        time.sleep(2); waited += 2
+        wait_cf(sb)
+        pg = page(sb)
+        if pg.get("pw") is False:
+            r["steps"].append(tag + "logged in after {:.0f}s".format(waited))
+            return True, "", pg
+        bad = [l for l in pg.get("lines", []) if len(l) < 200 and l not in base and ERR_RX.search(l)]
+        if bad and waited >= 6:
+            return False, "site message: " + bad[0][:80], pg
+    lines = pg.get("lines", [])
+    title = (pg.get("title") or "")[:60]
+    return False, "still on the login page after {:.0f}s (title '{}')".format(waited, title), pg
+
+
 def scan_account(acc):
     label = acc.get("label")
     r = {"label": label, "status": "", "pages": {}, "home_links": [], "steps": [],
@@ -202,17 +236,18 @@ def scan_account(acc):
         if js(sb, HAS_PW_JS) is not True:
             r["steps"].append("login click: " + str(js(sb, CLICK_JS % json.dumps(r"^(log ?in|sign ?in)$"))))
             time.sleep(WAIT); wait_cf(sb)
-        fill = str(js(sb, FILL_JS % (json.dumps(acc["email"]), json.dumps(acc["password"]))))
-        r["steps"].append("fill: " + fill)
-        if fill != "filled":
-            r["status"] = "login form not found"; return r
-        time.sleep(1)
-        r["steps"].append("submit: " + str(js(sb, SUBMIT_JS)))
-        time.sleep(WAIT * 2); wait_cf(sb)
-        after = page(sb)
-        if after.get("pw"):
-            bad = [l for l in after.get("lines", []) if re.search(r"invalid|incorrect|wrong|not found|verify", l, re.I)]
-            r["status"] = "login failed" + (": " + bad[0][:60] if bad else "")
+        ok, reason, after = login_attempt(sb, acc, r, "")
+        if not ok:
+            r["steps"].append("login try 1 failed: " + reason)
+            shot(sb, label, "0_login_failed_try1")
+            log("{}: login try 1 failed | {} | page lines: {}".format(label, reason, " / ".join(after.get("lines", [])[:12])))
+            sb.cdp.open(BASE + "/login"); wait_cf(sb); time.sleep(WAIT * 2)
+            ok, reason, after = login_attempt(sb, acc, r, "retry ")
+        if not ok:
+            shot(sb, label, "0_login_failed")
+            lines = after.get("lines", [])
+            r["status"] = "login failed: " + reason
+            r["login_page_lines"] = lines[:30]
             return r
         r["status"] = "OK"
         r["pages"]["after_login"] = after
@@ -231,11 +266,16 @@ def scan_account(acc):
             shot(sb, label, "2_badge_popup")
             r["steps"].append("spots: " + str(js(sb, CLICK_JS % json.dumps(r"^show stock spots$"))))
             time.sleep(WAIT); wait_cf(sb)
-            raw = js(sb, SPOTS_JS)
-            try:
-                modal = json.loads(raw)
-            except Exception:
-                modal = {"found": False, "error": str(raw)[:160]}
+            modal = {"found": False}
+            for _try in range(8):  # v4: wait until the company names are loaded
+                raw = js(sb, SPOTS_JS)
+                try:
+                    modal = json.loads(raw)
+                except Exception:
+                    modal = {"found": False, "error": str(raw)[:160]}
+                if modal.get("found") and not any(re.search(r"loading", l, re.I) for l in modal.get("lines", [])):
+                    break
+                time.sleep(1.5)
             shot(sb, label, "3_stock_spots")
             r["steps"].append("spots modal found: " + str(modal.get("found")))
             if modal.get("found"):
@@ -286,6 +326,7 @@ def main():
         r = scrub(r, secrets)
         log("{}: {} | {}".format(r["label"], r["status"], " || ".join(r["steps"])))
         raw.append(r)
+        time.sleep(PAUSE_BETWEEN)
 
     # detector v2
     results = []
@@ -319,6 +360,8 @@ def main():
             fh.write("links before spots click (excluded): " + (", ".join(r.get("before_links", [])) or "-") + "\n")
             fh.write("spot links: " + (", ".join(r.get("spot_links", [])) or "-") + "\n")
             fh.write("spots parsed: " + (", ".join("{} ({})".format(t, n) for t, n in r.get("spots", [])) or "-") + "\n")
+            if r.get("login_page_lines"):
+                fh.write("login page text after the failed login:\n" + "\n".join("  | " + l for l in r["login_page_lines"]) + "\n")
             fh.write("spots modal text:\n" + "\n".join("  | " + l for l in r.get("spots_lines", [])) + "\n")
             for name, d in r["pages"].items():
                 fh.write("\n--- {} | {} | {}\n".format(name, d.get("url"), d.get("title")))
