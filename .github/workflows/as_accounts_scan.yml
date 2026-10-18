@@ -28,6 +28,8 @@ jobs:
           ACCOUNTS_JSON: ${{ inputs.accounts }}
           NONCE: ${{ inputs.nonce }}
           PAGES: ${{ inputs.pages }}
+          GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+          SHEET_NAME: AS accounts
         run: python as_accounts_scan.py
       - uses: actions/upload-artifact@v4
         if: always()
