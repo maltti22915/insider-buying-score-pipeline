@@ -186,6 +186,7 @@ def parse_spots(lines):
             continue
         tick = ticks[-1]
         names = [l for l in block if l != tick]
+        names = [l for l in names if not re.search(r"^(loading\.*|activate unlimited plan)$", l.strip(), re.I)]
         name = max(names, key=len) if names else ""
         if tick not in seen:
             seen.add(tick); out.append((tick, name))
@@ -267,7 +268,7 @@ def scan_account(acc):
             r["steps"].append("spots: " + str(js(sb, CLICK_JS % json.dumps(r"^show stock spots$"))))
             time.sleep(WAIT); wait_cf(sb)
             modal = {"found": False}
-            for _try in range(8):  # v4: wait until the company names are loaded
+            for _try in range(12):  # v4: wait until the company names are loaded
                 raw = js(sb, SPOTS_JS)
                 try:
                     modal = json.loads(raw)
@@ -275,7 +276,7 @@ def scan_account(acc):
                     modal = {"found": False, "error": str(raw)[:160]}
                 if modal.get("found") and not any(re.search(r"loading", l, re.I) for l in modal.get("lines", [])):
                     break
-                time.sleep(1.5)
+                time.sleep(2.5)
             shot(sb, label, "3_stock_spots")
             r["steps"].append("spots modal found: " + str(modal.get("found")))
             if modal.get("found"):
