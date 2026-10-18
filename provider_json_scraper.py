@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v44: a Cloudflare block (or any error) inside the SB context manager is no longer swallowed: it is re-raised after the browser closes, so the run counts it as "blocked" (and retries) instead of 'cannot access local variable posted'.
   v43: SW run also reads the SW Management + Ownership pages after the valuation dialog and posts the "Skin" score + note (target SKIN, handler fn_91_10; scoring in sw_skin.py; env SW_SKIN=0 switches it off).
   v42: Simply Wall St now runs on SeleniumBase CDP mode (CdpSB adapter, sb.cdp.solve_captcha): sw_probe v2 passed 12 of 12 for CDP against 2 of 6 for the old uc engine (hour 12 UTC, normally the worst). SW_ENGINE=uc switches back.
   v41: the 'View All' details read is OFF by default (AS_SCORE_DETAILS=1 turns it on): the live runs showed that AlphaSpread hides the score and checks on /profitability and /solvency for the logged-out bot ('score is Hidden', fewer than 3 checks), and each try cost 20-40 s per row.
@@ -1618,6 +1619,21 @@ def fetch_as_buyback(sb, abbrev_as):
             step("buyback", "FAIL", reason="blocked")
             return
         values = _as_extract_buyback(_as_strip_text(source))
+        # v44: the block renders lazily - up to 3 extra tries (scroll to the block, wait, re-read; last try reloads the page)
+        for attempt in range(3):
+            if values.get("current") is not None and values.get("avg") is not None:
+                break
+            try:
+                if attempt == 2:
+                    sb.uc_open_with_reconnect(url, 5)
+                sb.execute_script("var e=document.getElementById('buybacks')||document.querySelector('[id*=buyback]');"
+                                  "if(e){e.scrollIntoView({block:'center'});}else{window.scrollTo(0,document.body.scrollHeight/2);}")
+                sb.sleep(4 + 3 * attempt)
+                sb.execute_script("window.scrollBy(0,400);")
+                sb.sleep(2)
+                values = _as_extract_buyback(_as_strip_text(sb.get_page_source()))
+            except Exception:
+                pass
         if values.get("current") is not None and values.get("avg") is not None:
             _AS_RATIOS["buyback"] = values
             step("buyback", "OK", **values)
@@ -2525,7 +2541,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v43",
+            "v": "v44",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2775,20 +2791,28 @@ def run_bot():
 
                 try:
                     use_cdp = (target == "SW" and SW_ENGINE == "cdp")  # v42
+                    swallowed_error = []  # v44: the SB context manager can swallow an exception raised inside "with" (then "posted" was never set)
+                    posted = None
                     with (SB(uc=True, test=True, locale="en") if use_cdp else SB(uc=True, headless=headless)) as sb:
-                        browser_ready = True
-                        data = scrape(CdpSB(sb) if use_cdp else sb, abbrev, row_number, headless)
-                        posted = post_provider_json(
-                            webhook_url, target, row_number, abbrev, sheet_name, data
-                        )
-                        step("post_to_sheet", "OK" if posted else "FAIL",
-                             chars=_LAST_POST.get("chars"), column=_LAST_POST.get("column"),
-                             reason=_LAST_POST.get("reason"))
-                        if target == "SW":
-                            post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
-                        elif target == "ASDCF":
-                            post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
-                            post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        try:
+                            browser_ready = True
+                            data = scrape(CdpSB(sb) if use_cdp else sb, abbrev, row_number, headless)
+                            posted = post_provider_json(
+                                webhook_url, target, row_number, abbrev, sheet_name, data
+                            )
+                            step("post_to_sheet", "OK" if posted else "FAIL",
+                                 chars=_LAST_POST.get("chars"), column=_LAST_POST.get("column"),
+                                 reason=_LAST_POST.get("reason"))
+                            if target == "SW":
+                                post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                            elif target == "ASDCF":
+                                post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                                post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        except BaseException as inner_error:
+                            swallowed_error.append(inner_error)
+                            raise
+                    if swallowed_error and posted is None:
+                        raise swallowed_error[0]
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "ok" if posted else "not_written"
