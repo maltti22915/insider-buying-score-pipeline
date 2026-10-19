@@ -1,5 +1,6 @@
 """
-as_ttm_metrics.py v1.2 (profile argument; FIN skips FCF and gross-margin signals; implausible >40pp margin changes ignored)
+as_ttm_metrics.py v1.3 (TTM can be built from the Quarterly view when the TTM toggle fails)
+v1.2 (profile argument; FIN skips FCF and gross-margin signals; implausible >40pp margin changes ignored)
 v1.1 (cell parts joined with a space: "TTM<br>Mar 2024" is read as "TTM Mar 2024") -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
 
 Pure functions, no browser. Input = page HTML after the toggle was clicked:
@@ -176,7 +177,25 @@ def _window(inc, cfs, p):
             "gm": _margin(gp, rev), "om": _margin(op, rev), "fcfm": _margin(_fcf_sbc(cfs, p), rev)}
 
 
-def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pct=None, profile="NF"):
+def ttm_from_quarters(rows, plist):
+    """v1.3: {label: {(y, m): quarterly value}} -> {label: {(y, m): sum of the 4 quarters ending there}} and the usable end periods.
+    Needs 4 consecutive quarters (3 months apart); a missing quarter makes that TTM value None."""
+    out, ends = {}, []
+    for p in plist:
+        chain = [_shift(p, -3 * k) for k in range(4)]
+        if all(c in plist for c in chain):
+            ends.append(p)
+    for label, series in rows.items():
+        vals = {}
+        for p in ends:
+            parts = [series.get(_shift(p, -3 * k)) for k in range(4)]
+            vals[p] = None if any(v is None for v in parts) else sum(parts)
+        out[label] = vals
+    return out, ends
+
+
+def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pct=None, profile="NF",
+                income_q_html=None, cashflow_q_html=None):
     out = {"signals": {}, "scores": {}, "levels": {}, "now": None, "warnings": [], "details": {}}
     inc, ip, iinfo = parse_period_table(income_ttm_html, "ttm")
     cfs, cp, cinfo = parse_period_table(cashflow_ttm_html, "ttm")
@@ -184,6 +203,16 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     for name, info in (("income", iinfo), ("cashflow", cinfo), ("balance", binfo)):
         if info.get("error"):
             out["warnings"].append("{}: {}".format(name, info["error"]))
+    if not ip and income_q_html:   # v1.3: TTM view did not open -> build TTM from the Quarterly view (sum of 4 quarters)
+        qrows, qp, qinfo = parse_period_table(income_q_html, "q")
+        inc, ip = ttm_from_quarters(qrows, qp)
+        if ip:
+            out["warnings"].append("income TTM built from quarters")
+    if not cp and cashflow_q_html:
+        qrows, qp, qinfo = parse_period_table(cashflow_q_html, "q")
+        cfs, cp = ttm_from_quarters(qrows, qp)
+        if cp:
+            out["warnings"].append("cash flow TTM built from quarters")
     if not ip:
         out["warnings"].append("income TTM table missing: no Now score")
         return out
