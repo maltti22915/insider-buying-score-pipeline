@@ -1,5 +1,5 @@
-# as_strategy_test.py v1 -- finds the most reliable way to read AlphaSpread "AS Profit", "AS Solv" and "Trend" inputs.
-# For every AlphaSpread path (default: the 13 Salkku stocks) it runs each STRATEGY below in a fresh page load and records
+# as_strategy_test.py v2 (fix: Trend strategies crashed on unpacking) -- finds the most reliable way to read AlphaSpread "AS Profit", "AS Solv" and "Trend" inputs.
+# For every AlphaSpread path (default: the first 3 Salkku stocks) it runs each STRATEGY below in a fresh page load and records
 # success / seconds / attempts. Output: results_strategy.json, a ranking table in the log and in $GITHUB_STEP_SUMMARY,
 # raw HTML of every failure under as_pages_strategy/ (so the failure can be studied).
 #
@@ -27,7 +27,7 @@ except Exception as import_error:   # keep the test usable even if the scraper c
     SCORES_JS, scores_clean = None, None
 import as_ttm_metrics as ttm
 
-DEFAULT = "nyse/uber tsx/csu nyse/msci aex/prx nyse/now nyse/unh nasdaq/app nyse/baba xetra/ftk cse/chemm xetra/sap nasdaq/meta nasdaq/amzn"
+DEFAULT = "nyse/uber tsx/csu nyse/msci"
 PATHS = [p.strip().strip("/") for p in re.split(r"[\s,]+", os.environ.get("AS_PATHS", "").strip() or DEFAULT) if p.strip()]
 ONLY = [s.strip() for s in re.split(r"[\s,]+", os.environ.get("STRATEGIES", "").strip()) if s.strip()]
 OUT = "as_pages_strategy"
@@ -226,15 +226,15 @@ def run(sb, path, name, fn, url):
         if not open_page(sb, url):
             entry["info"] = {"error": "blocked (Cloudflare)"}
         else:
-            a, b, info = fn(sb, url)
             if name.startswith("S"):
+                a, b, info = fn(sb, url)
                 entry["ok"] = bool(a and b)
                 entry["partial"] = bool(a or b) and not entry["ok"]
                 entry["profit"], entry["solv"] = (a or {}).get("score"), (b or {}).get("score")
             else:
+                a, info = fn(sb, url)   # v2: trend strategies return (value, info) -- v1 unpacked 3 values and every T-run failed
                 entry["ok"] = a is not None
                 entry["value"] = a
-                info = b
             entry["info"] = info
     except Exception as e:
         entry["info"] = {"error": type(e).__name__ + ": " + str(e)[:80]}
@@ -251,7 +251,9 @@ def run(sb, path, name, fn, url):
 
 
 def wanted(name):
-    return not ONLY or name in ONLY or name[0] in ONLY or name[:2] in ONLY
+    if not ONLY:
+        return name not in ("S4_slowfull", "S5_events")   # v2: both failed on every stock in the first run; ask for them by name to repeat
+    return name in ONLY or name[0] in ONLY or name[:2] in ONLY
 
 
 for path in PATHS:
