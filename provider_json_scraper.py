@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v45: AS Profitability / Solvency cards: scrolls the card heading into view and reloads the page once when no score shows (AMZN had empty cards).
   v45: Trend fix: the AlphaSpread TTM view click retries 3 x 12 s; "Now" is computed from the income TTM alone when the cash-flow TTM is missing (only the FCF-margin signal is dropped).
   v44: a Cloudflare block (or any error) inside the SB context manager is no longer swallowed: it is re-raised after the browser closes, so the run counts it as "blocked" (and retries) instead of 'cannot access local variable posted'.
   v44: the AlphaSpread buyback read retries up to 3 more times (scroll to the buybacks block, wait, re-read; the last try reloads the page) before it reports FAIL 'no buyback numbers on the page'.
@@ -1886,7 +1887,7 @@ def _as_scores_clean(card):
     return cleaned
 
 
-def _as_fetch_scores_on_page(sb, url):
+def _as_fetch_scores_on_page(sb, url, _retry=False):
     """v35: the summary page is already open (fetch_as_hist). Reads the Profitability and Solvency cards, scrolling down in steps
     until both show a score (they may be lazy loaded like the history block). Stores _AS_RATIOS['scores']. Never raises."""
     if os.environ.get("AS_SCORES", "1") == "0":
@@ -1906,6 +1907,16 @@ def _as_fetch_scores_on_page(sb, url):
             solv = _as_scores_clean(result.get("solv"))
             if profit and solv:
                 break
+            try:  # v45: bring the card heading itself into view (a lazy card may stay empty until it is really on screen)
+                if rounds >= 3:
+                    sb.execute_script(
+                        "var t = (arguments[0] % 2) ? 'Profitability Score' : 'Solvency Score', f = null;"
+                        "document.querySelectorAll('h1,h2,h3,h4,div,span').forEach(function (e) {"
+                        "  if (!f && e.children.length === 0 && (e.textContent || '').trim().slice(-t.length) === t) { f = e; } });"
+                        "if (f) { f.scrollIntoView({block: 'center'}); }", rounds)
+                    sb.sleep(1.5)
+            except Exception:
+                pass
             try:
                 height = int(sb.execute_script("return Math.round(document.body.scrollHeight || 0);") or 0)
                 scroll_y = scroll_y + 600
@@ -1917,6 +1928,14 @@ def _as_fetch_scores_on_page(sb, url):
             sb.sleep(1.2)
         profit = _as_scores_clean(result.get("profit"))
         solv = _as_scores_clean(result.get("solv"))
+        if not profit and not solv and not _retry:
+            step("scores", "INFO", note="no score yet: reloading the page once")  # v45
+            try:
+                sb.uc_open_with_reconnect(url, 4)
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            return _as_fetch_scores_on_page(sb, url, True)
         if not profit and not solv:
             try:
                 os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
@@ -2235,7 +2254,7 @@ def fetch_as_quality(sb, abbrev_as):
         step("quality", "FAIL", reason="as_quality_metrics.py missing: " + type(import_error).__name__)
         return
     base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
-    pages, ttm_pages = {}, {}
+    pages, ttm_pages, q_pages = {}, {}, {}
     for name, path in AS_QUALITY_PAGES:
         try:
             sb.uc_open_with_reconnect(base + path, 4)
@@ -2253,6 +2272,8 @@ def fetch_as_quality(sb, abbrev_as):
             step("quality_" + name, "OK", chars=len(source))
             if name in AS_TTM_TOGGLE:  # v21: same page, other view (TTM / Quarterly); never blocks the annual metrics
                 ttm_pages[name] = _as_click_view(sb, AS_TTM_TOGGLE[name])
+                if name in ("income", "cashflow") and not ttm_pages[name]:  # v45: TTM toggle failed -> the Quarterly toggle (reliable) gives 4-quarter sums
+                    q_pages[name] = _as_click_view(sb, ("Quarterly", r"Q\d\s*FY\d{4}"))
         except Exception as page_error:
             step("quality_" + name, "FAIL", reason=type(page_error).__name__)
     moat_source = ""
@@ -2304,11 +2325,12 @@ def fetch_as_quality(sb, abbrev_as):
     except Exception as moat_error:
         step("quality_moat", "FAIL", reason=type(moat_error).__name__ + ": " + str(moat_error)[:60])
     now_block = None
-    if ttm_pages.get("income"):  # v45: cash flow TTM is optional (only the FCF margin signal needs it)
+    if ttm_pages.get("income") or q_pages.get("income"):  # v45: cash flow is optional (only the FCF margin signal needs it); Quarterly view is the fallback
         try:
             import as_ttm_metrics
-            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
-                                                   profile=(v4_block or {}).get("profile") or "NF")
+            now_block = as_ttm_metrics.compute_now(ttm_pages.get("income", ""), ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
+                                                   profile=(v4_block or {}).get("profile") or "NF",
+                                                   income_q_html=q_pages.get("income", ""), cashflow_q_html=q_pages.get("cashflow", ""))
             _AS_QUALITY["now"] = now_block
             step("quality_now", "OK", now=now_block.get("now"), signals=now_block.get("signals"), warnings=";".join(now_block.get("warnings") or []) or "none")
         except Exception as now_error:
