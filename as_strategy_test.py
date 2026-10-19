@@ -1,4 +1,5 @@
-# as_strategy_test.py v2 (fix: Trend strategies crashed on unpacking) -- finds the most reliable way to read AlphaSpread "AS Profit", "AS Solv" and "Trend" inputs.
+# as_strategy_test.py v3 (Cloudflare blocks are retried; T6 added)
+# v2 (fix: Trend strategies crashed on unpacking) -- finds the most reliable way to read AlphaSpread "AS Profit", "AS Solv" and "Trend" inputs.
 # For every AlphaSpread path (default: the first 3 Salkku stocks) it runs each STRATEGY below in a fresh page load and records
 # success / seconds / attempts. Output: results_strategy.json, a ranking table in the log and in $GITHUB_STEP_SUMMARY,
 # raw HTML of every failure under as_pages_strategy/ (so the failure can be studied).
@@ -15,7 +16,8 @@
 #   T2_click3      up to 3 JS clicks, 12 s each                  (v45)
 #   T3_real_click  Selenium click on the element after readyState + 3 s
 #   T4_reload      reload, wait 4 s, then T2
-#   T5_quarterly   Quarterly view of the income statement, TTM summed from 4 quarters (tested only for page access)
+#   T5_quarterly   Quarterly view opens (counts quarter columns)
+#   T6_q_to_ttm    Quarterly view -> TTM summed from 4 quarters -> Now score (the v45 fallback)
 import json, os, re, sys, time
 from seleniumbase import SB
 
@@ -49,9 +51,15 @@ def blocked(sb):
 
 
 def open_page(sb, url):
-    sb.uc_open_with_reconnect(url, 4)
-    sb.sleep(2.0)
-    return not blocked(sb)
+    """v3: a Cloudflare block is retried up to 3 times (waits 12 s, then 25 s) -- v2 counted every block as a strategy failure."""
+    for wait in (0, 12, 25):
+        if wait:
+            sb.sleep(wait)
+        sb.uc_open_with_reconnect(url, 4)
+        sb.sleep(2.0)
+        if not blocked(sb):
+            return True
+    return False
 
 
 def read_scores(sb):
@@ -216,10 +224,24 @@ def t5(sb, url):
     return None, {"error": "no quarter header"}
 
 
-TREND_STRATEGIES = [("T1_click1", t1), ("T2_click3", t2), ("T3_real_click", t3), ("T4_reload", t4), ("T5_quarterly", t5)]
+def t6(sb, url):
+    """Quarterly view of the income statement -> TTM = sum of 4 quarters (as_ttm_metrics.compute_now(income_q_html=...))."""
+    if sb.execute_script(CLICK_JS, "Quarterly") != "clicked":
+        return None, {"error": "toggle not found"}
+    for _ in range(12):
+        sb.sleep(1.0)
+        src = sb.get_page_source()
+        if re.search(r"Q\d\s*FY\d{4}", re.sub(r"<[^>]+>", " ", src)):
+            now = ttm.compute_now("", "", "", income_q_html=src)
+            return now.get("now"), {"signals": sorted((now.get("signals") or {}).keys()), "warnings": (now.get("warnings") or [])[-2:]}
+    return None, {"error": "no quarter header"}
+
+
+TREND_STRATEGIES = [("T1_click1", t1), ("T2_click3", t2), ("T3_real_click", t3), ("T4_reload", t4), ("T5_quarterly", t5), ("T6_q_to_ttm", t6)]
 
 
 def run(sb, path, name, fn, url):
+    sb.sleep(4.0)   # v3: spacing between page loads (Cloudflare)
     started = time.time()
     entry = {"path": path, "strategy": name, "ok": False, "sec": 0, "info": {}}
     try:
