@@ -16,6 +16,162 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 14 (2026-10-19): scrape_alphaspread_html retries (up to 4 tries) when
+AlphaSpread answers with its Cloudflare page ("Just a moment", ~29 KB) instead of
+the real summary, and raises instead of posting that page (AS Price was MISSING
+on many rows). Nothing else changed from v13.
+
+VERSION 13 (REQUESTED DIRECTLY, TWO SMALL OBSERVABILITY FIXES, NO
+BEHAVIOUR CHANGE): 
+  (1) save_alphaspread_diagnostics no longer reports a false
+      "looks like interstitial/blocked: True". The markers "consent" and
+      "challenge-platform" appear on perfectly normal AlphaSpread pages
+      (confirmed on real Row 18 and Row 28 runs whose headline loaded
+      fine), so they were removed from the marker list. The remaining
+      markers ("just a moment", "access denied", "captcha",
+      "cookie consent") are unchanged.
+  (2) The "AS webhook reply:" log line now carries a UTC timestamp
+      (HH:MM:SS). The reply itself says the webhook wrote the value, but
+      without a time the run log could not show whether that write landed
+      before or after the Apps Script row refresh's own final write
+      (Apps Script logs are in local time, UTC+3 for this project; this
+      log is UTC). The timestamp is taken when the reply is received.
+  No change to scraping, waiting, the modal click, posting, or the
+  Insider Buying Score path. No .yml change needed.
+
+VERSION 12 (REQUESTED DIRECTLY, REAL CONFIRMED ROOT CAUSE): the saved
+diagnostics HTML (Row 28, nasdaq/amzn) shows the lazy Livewire component
+wire:name="valuation.history-context.block" (x-intersect lazy load,
+class valuation-history-context--loading, aria-busy) is rendered INSIDE the
+"More details" modal of the Intrinsic Value History widget
+(x-teleport="body", style="display: none;"). A hidden element never
+intersects the viewport, so the headline can never load by scrolling --
+which is why Rows 18 and 28 stayed at the loading placeholder after 26-27
+scrolls. (v10/v11's "block" scroll target was also the wrong element: the
+selector [class*='valuation-history-context'] matched the verdict widget
+first.) The wait now clicks .intrinsic-value-history__details ("More
+details") to open the modal, then waits for the real headline with text,
+re-clicking every ALPHASPREAD_OPEN_EVERY_SECONDS. The verdict element is
+still never accepted. UNCONFIRMED until run: that opening the modal
+actually completes the lazy load from the GitHub runner. (CONFIRMED on
+real Row 28 and Row 18 runs: the headline appeared 1.5-1.9s after the
+first click.)
+
+VERSION 11 (REQUESTED DIRECTLY, DIAGNOSTICS ONLY): the AS webhook's full
+JSON reply (trimmed to 1500 characters) is now printed after every AS post,
+because the webhook's own Apps Script execution log was not visible and
+"accepted but did not write (VALUE_NULL)" alone does not say which column
+failed or why. No behaviour change otherwise.
+
+VERSION 10 (REQUESTED DIRECTLY, REAL CONFIRMED MISTAKE): removed the v9
+verdict fallback. A real Alibaba run (Row 22, nyse/baba) waited 25s, then
+accepted .intrinsic-value-history__verdict (its text said the valuation
+was in line with its history), and the webhook correctly answered
+VALUE_NULL: that element belongs to the Intrinsic Value History widget,
+not the Valuation History headline "AS vs usual" is meant to capture (see
+fn_22_30 v88). The wait now accepts ONLY
+.valuation-history-context__headline with non-empty text, for the full
+ALPHASPREAD_WAIT_TIMEOUT_SECONDS, and scrolls the lazy Livewire block into
+view every ALPHASPREAD_SCROLL_EVERY_SECONDS seconds while waiting
+(UNCONFIRMED hypothesis: the block loads on viewport entry). The log
+reports how long the headline took and how many scrolls had happened.
+If the headline never appears the wait does NOT raise: the page is posted
+anyway so AS Price can still land, and diagnostics are saved. No .yml
+change needed.
+
+VERSION 9 (REQUESTED DIRECTLY, REAL CONFIRMED RISK): the AlphaSpread wait
+no longer ends on "whichever of the two selectors appears first". v6 waited
+on both as one CSS list. A real Row 34 (Chemometec) run matched
+.intrinsic-value-history__verdict and the webhook then reported
+VALUE_NULL; the Apps Script side treats the verdict element as the wrong
+widget for "AS vs usual", and on the same page the real
+.valuation-history-context__headline can still be loading when the verdict
+is already present, so the combined wait could end too early.
+  (1) The scraper now waits for the headline element ALONE for
+      ALPHASPREAD_FALLBACK_AFTER_SECONDS (25s).
+  (2) Only if the headline has not appeared by then, it keeps polling for
+      the rest of ALPHASPREAD_WAIT_TIMEOUT_SECONDS (60s) and accepts the
+      verdict element ONLY when it holds real, non-empty text; the headline
+      still wins if it shows up at any point. This keeps the page-markup
+      fallback from v6 (some pages may serve only the new component) while
+      removing the early-exit on an empty verdict shell.
+  (3) To go strictly headline-only, set ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
+      = False (the wait then runs the full timeout for the headline alone).
+  (4) The matched-element logging (v7/v8) and failure diagnostics are
+      unchanged; no .yml change is needed (the selectors are not in it).
+
+VERSION 8 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): the v7 element
+diagnostic never actually worked. A real Row 34 (Chemometec) run printed
+"could not read element content: SyntaxError: Illegal return statement"
+(column 58 of the script, exactly where its own "return null;" sat)
+instead of the matched element's text. In this script's own uc-mode
+session, sb.execute_script evaluates the string as a bare expression
+(the error object is a DevTools-protocol evaluation result), NOT as a
+function body the way plain Selenium does, so a top-level "return" is
+illegal and "arguments[0]" would not exist either. The same flaw sat in
+save_alphaspread_diagnostics' own visible-text read (its error was
+swallowed, so it only ever reported "unavailable").
+  (1) New run_js helper: wraps a function body in an immediately-invoked
+      function, JSON.stringify's the result inside the page (so objects
+      survive either evaluation mode), and tries a "return (...)" form
+      first (classic Selenium) then a bare-expression form (uc/CDP
+      evaluation), JSON-decoding whatever comes back. Selectors are
+      embedded with json.dumps instead of passed as arguments[0].
+  (2) describe_matched_elements and the diagnostics' visible-text read
+      now both use run_js.
+  (3) Behaviour otherwise unchanged: both helpers stay fully guarded and
+      can never affect the scrape, the webhook POST or the other
+      provider's own scrape. Only the log output changes -- it should
+      now finally show whether a matched element had real text or was
+      an empty/loading shell (the question v7 was built to answer).
+
+VERSION 7 (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOTS): three
+observability fixes, found by reading a real Row 34 (Chemometec) run
+where v6 correctly matched the new .intrinsic-value-history__verdict
+element but the AS webhook then answered "accepted but did not write
+(VALUE_NULL)", and the log could not say why.
+  (1) EVERY AS scrape now prints the matched element's own visible text
+      (and whether that text is empty) plus an HTML snippet, not just
+      the selector that matched. This is what distinguishes "the element
+      was still empty/loading when the wait returned" from "the element
+      had real text the webhook's parser could not read".
+  (2) AS diagnostics (page summary, screenshot, HTML) are now also saved
+      when the webhook answers "not written" or refuses/fails -- not only
+      when the scrape itself throws. v6 only covered the timeout case, so
+      the VALUE_NULL run left nothing to inspect.
+  (3) When a webhook response is not valid JSON, the HTTP status code,
+      content type, redirect count, body length and the first 200
+      characters of the body are now logged (shared read_webhook_json
+      helper, used by both the IS and AS posts), and the message no
+      longer implies the write failed. The real Row 34 IS run printed
+      "webhook POST itself failed: Expecting value: line 1 column 1"
+      while Apps Script's own log showed the score had in fact been
+      written -- an unreadable response is not the same as a failed
+      write, and the log must not say so.
+
+VERSION 6 (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): the AlphaSpread
+scrape now waits for EITHER of AlphaSpread's two known "valuation
+history" markup shapes, and saves real diagnostics when the wait fails.
+A real GitHub Actions run for Row 34 (Chemometec, cse/chemm) showed the
+Insider Buying Score half succeeding while the AS half failed with
+"Element {.valuation-history-context__headline} was not found after 60
+seconds" -- while fn_22_30 v87 (Apps Script side) had already learned
+that AlphaSpread can serve a second, structurally different component
+(intrinsic-value-history__verdict) INSTEAD of the original headline for
+some stock pages. v4/v5 waited only for the original selector, so on a
+page using the newer component this script could wait its full timeout
+for an element that would never appear, no matter how long it waited.
+v6 waits for either selector (one combined CSS selector list) and logs
+which one matched. On any AS scrape failure it now also prints a compact
+page summary into the run log (title, URL, which selectors are present,
+whether the page looks like a Cloudflare/consent interstitial, and the
+first part of the visible text) and writes the page's own screenshot and
+HTML into ./diagnostics/ so the workflow can upload them as an artifact
+(see insider_score_scraper.yml's own matching v6 entry). The cause of
+the Row 34 failure itself is NOT yet confirmed -- the new selector is the
+leading hypothesis, and the diagnostics exist so the next failure
+explains itself instead of ending in a bare "not found".
+
 VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is is now ALSO
 optional (default '', mirroring abbrev_as's own v4 treatment exactly),
 rather than a required environment variable read. Previously a row with
@@ -130,6 +286,58 @@ requests
 
 VERSION
 ----------------------------------------------------------------------------
+v13 -- Requested directly, observability only: the diagnostics'
+  "looks like interstitial/blocked" check no longer counts the markers
+  "consent" and "challenge-platform" (false positive on normal
+  AlphaSpread pages), and the "AS webhook reply:" line now carries a UTC
+  timestamp so the write order against the Apps Script row refresh can
+  be read from the logs. See this file's own top PURPOSE section's own
+  VERSION 13 paragraph.
+
+v12 -- Requested directly, real confirmed root cause (Row 28, nasdaq/amzn):
+  the lazy valuation-history block lives inside the hidden "More details"
+  modal, so the wait now clicks .intrinsic-value-history__details
+  immediately and every ALPHASPREAD_OPEN_EVERY_SECONDS until the headline
+  has text. Does not raise on timeout (posts the page anyway, saves
+  diagnostics). Scrolling removed from use.
+
+v11 -- Diagnostics only: prints the AS webhook's full JSON reply
+  (trimmed to 1500 characters) after every AS post.
+
+v10 -- Removed the v9 verdict fallback (the verdict element is the
+  Intrinsic Value History widget, not the headline "AS vs usual" needs);
+  waits for the headline with non-empty text only.
+
+v9 -- Headline-first wait with an opt-in, non-empty-only verdict fallback
+  (superseded by v10).
+
+v8 -- Requested directly, real confirmed bug: run_js helper (IIFE plus
+  JSON.stringify, two call shapes) replaces execute_script calls that
+  used a top-level "return" / arguments[0] and failed with "Illegal
+  return statement" in uc mode.
+
+v7 -- Requested directly, real confirmed blind spots (Row 34,
+  cse/chemm): every AS scrape now logs the matched element's text and
+  an HTML snippet (describe_matched_elements); AS diagnostics are also
+  saved when the webhook answers "not written" or refuses/fails, via
+  post_alphaspread_to_webhook now returning whether it wrote; and
+  non-JSON webhook responses now log status code, content type,
+  redirect count, body length and the first 200 body characters
+  (read_webhook_json), with wording that no longer claims the write
+  failed. Insider Buying Score scraping and scoring unchanged. See this
+  file's own top PURPOSE section's own VERSION 7 paragraph.
+
+v6 -- Requested directly, real confirmed failure (Row 34, cse/chemm): the
+  AS scrape now waits for either known valuation-history markup shape
+  (.valuation-history-context__headline OR
+  .intrinsic-value-history__verdict) instead of only the first, logs
+  which one matched, and on any AS scrape failure prints a compact page
+  summary to the run log and saves the page's screenshot and HTML to
+  ./diagnostics/ (uploaded as a workflow artifact by the matching
+  insider_score_scraper.yml v6 step). Insider Buying Score path
+  unchanged. See this file's own top PURPOSE section's own VERSION 6
+  paragraph for the full detail.
+
 v5 -- Requested directly, real confirmed gap: abbrev_is is now ALSO
   optional, mirroring abbrev_as's own v4 treatment. See this file's own
   top PURPOSE section's own VERSION 5 paragraph for the full detail.
@@ -169,10 +377,16 @@ v1 -- First version -- read every configured company's own abbrevIS from
 ============================================================================
 """
 
+import json
 import os
+import re
+import time
+from datetime import datetime, timezone
 
 import requests
 from seleniumbase import SB
+
+import gh_log_uploader
 
 
 # ----------------------------------------------------------------------------
@@ -209,8 +423,135 @@ PAGE_LOAD_SETTLE_SECONDS = 6
 # a separate, fresh attempt succeeded in as little as 3-5 seconds. A real
 # browser with no per-request proxy/rotation cost can simply wait longer,
 # with no equivalent penalty for doing so.
-ALPHASPREAD_HEADLINE_SELECTOR = ".valuation-history-context__headline"
 ALPHASPREAD_WAIT_TIMEOUT_SECONDS = 60
+
+# VERSION 6 CHANGE (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE):
+# AlphaSpread appears to serve at least two structurally different markup
+# shapes for the "valuation history" block (see fn_22_30 v87 on the Apps
+# Script side, which already falls back from the original headline to
+# intrinsic-value-history__verdict). v4/v5 waited only for the first, so
+# a page using the second could never satisfy the wait. Both selectors
+# are now waited on together as one CSS selector list -- whichever
+# appears first ends the wait.
+ALPHASPREAD_HEADLINE_SELECTORS = [
+    ".valuation-history-context__headline",
+    ".intrinsic-value-history__verdict",
+]
+ALPHASPREAD_WAIT_SELECTOR = ", ".join(ALPHASPREAD_HEADLINE_SELECTORS)
+
+# VERSION 9 ADDITION: the headline is the real target; the verdict element
+# is only an opt-in fallback, accepted only with non-empty text after the
+# headline has had ALPHASPREAD_FALLBACK_AFTER_SECONDS to appear on its own.
+ALPHASPREAD_PRIMARY_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[0]
+ALPHASPREAD_FALLBACK_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[1]
+# VERSION 10: the verdict element is the Intrinsic Value History widget,
+# NOT the Valuation History headline "AS vs usual" needs (fn_22_30 v88).
+# Kept False and no longer used by the wait; only the diagnostics
+# still look at it.
+ALPHASPREAD_ACCEPT_VERDICT_FALLBACK = False
+ALPHASPREAD_FALLBACK_AFTER_SECONDS = 25   # unused as of v10
+
+# VERSION 10 (superseded by v12 below): scrolling was tried first.
+ALPHASPREAD_BLOCK_SELECTOR = "[class*='valuation-history-context']"  # unused as of v12
+ALPHASPREAD_SCROLL_EVERY_SECONDS = 2  # unused as of v12
+
+# VERSION 12: confirmed from the saved diagnostics HTML (Row 28, AMZN): the
+# lazy Livewire block (wire:name="valuation.history-context.block",
+# x-intersect lazy load) lives INSIDE the hidden "More details" modal of the
+# Intrinsic Value History widget (style="display: none;"), so it can never
+# intersect the viewport and scrolling cannot load it. Clicking this button
+# opens the modal, which is what triggers the lazy load.
+ALPHASPREAD_OPEN_DETAILS_SELECTOR = ".intrinsic-value-history__details"
+ALPHASPREAD_OPEN_EVERY_SECONDS = 10
+
+# VERSION 10: filled in by wait_for_alphaspread_block so run_bot can save
+# diagnostics when the headline never appeared, even though the page is
+# still posted (AS Price can land without the headline).
+ALPHASPREAD_WAIT_STATE = {"headline_appeared": None}
+
+# VERSION 6 ADDITION: where AS failure diagnostics (screenshot + HTML) are
+# written. Relative to the workflow's working directory; the matching
+# insider_score_scraper.yml v6 step uploads this folder as an artifact.
+DIAGNOSTICS_DIR = "diagnostics"
+
+# VERSION 6 ADDITION: how many characters of the page's visible text to
+# print into the run log when an AS scrape fails.
+DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
+
+# VERSION 13: markers that make save_alphaspread_diagnostics report
+# "looks like interstitial/blocked: True". "consent" and
+# "challenge-platform" were REMOVED because normal AlphaSpread pages
+# contain them (false positive on real Row 18 / Row 28 runs).
+INTERSTITIAL_MARKERS = (
+    "just a moment",
+    "access denied",
+    "captcha",
+    "cookie consent",
+)
+
+# VERSION 7 ADDITIONS: how much of a matched valuation-history element's
+# own text / outer HTML to print on every AS scrape, and how much of a
+# non-JSON webhook response body to print (REQUESTED DIRECTLY: first 200
+# characters).
+ELEMENT_TEXT_PREVIEW_CHARS = 300
+ELEMENT_HTML_SNIPPET_CHARS = 600
+WEBHOOK_BODY_PREVIEW_CHARS = 200
+
+
+def utc_clock_text():
+    """VERSION 13 ADDITION: current UTC time as HH:MM:SS, for log lines."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def run_js(sb, function_body):
+    """
+    VERSION 8 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BUG): runs a
+    JavaScript function BODY in the page and returns its JSON-decoded
+    result (None when nothing usable came back).
+
+    WHY: in this script's uc-mode session sb.execute_script can evaluate
+    its string as a bare expression, where a top-level "return" is a
+    SyntaxError ("Illegal return statement") and "arguments" does not
+    exist. Plain Selenium instead wraps the string as a function body,
+    where a bare expression returns nothing. So the body is wrapped in an
+    IIFE, its result is JSON.stringify'd inside the page (objects then
+    survive either mode), and both call shapes are tried in order.
+
+    Raises the last error if neither shape works; callers stay guarded.
+    """
+    iife = (
+        "(function(){"
+        " try {"
+        " var __r = (function(){" + function_body + "})();"
+        " return JSON.stringify(__r === undefined ? null : __r);"
+        " } catch (e) {"
+        " return JSON.stringify({__js_error: String(e)});"
+        " }"
+        "})()"
+    )
+
+    last_error = None
+    for candidate in ("return " + iife + ";", iife):
+        try:
+            raw = sb.execute_script(candidate)
+        except Exception as error:
+            last_error = error
+            continue
+
+        if raw is None:
+            continue
+
+        result = json.loads(raw) if isinstance(raw, str) else raw
+
+        if isinstance(result, dict) and "__js_error" in result:
+            raise RuntimeError(result["__js_error"])
+
+        return result
+
+    if last_error is not None:
+        raise last_error
+
+    return None
 
 
 def scrape_company_html(sb, abbrev_is):
@@ -233,6 +574,108 @@ def scrape_company_html(sb, abbrev_is):
     return sb.get_page_source()
 
 
+def open_alphaspread_details_modal(sb):
+    """
+    VERSION 12 ADDITION: clicks the "More details" button of the Intrinsic
+    Value History widget. That opens the modal which contains the lazy
+    valuation-history block, so the block finally becomes visible and
+    Livewire loads it. Returns 'clicked', 'no-button' or None (error).
+    Fully guarded.
+    """
+    try:
+        return run_js(
+            sb,
+            "var b = document.querySelector("
+            + json.dumps(ALPHASPREAD_OPEN_DETAILS_SELECTOR)
+            + "); if (!b) { return 'no-button'; }"
+            " b.click(); return 'clicked';",
+        )
+    except Exception:
+        return None
+
+
+def alphaspread_headline_has_text(sb):
+    """VERSION 10 ADDITION: True when the real headline exists AND has text."""
+    try:
+        if not sb.is_element_present(ALPHASPREAD_PRIMARY_SELECTOR):
+            return False
+
+        text = run_js(
+            sb,
+            "var el = document.querySelector("
+            + json.dumps(ALPHASPREAD_PRIMARY_SELECTOR)
+            + "); if (!el) { return ''; }"
+            " return (el.innerText || el.textContent || '');",
+        )
+        return isinstance(text, str) and bool(text.strip())
+    except Exception:
+        return False
+
+
+def wait_for_alphaspread_block(sb):
+    """
+    VERSION 10 REWRITE: waits ONLY for .valuation-history-context__headline
+    with real text, for up to ALPHASPREAD_WAIT_TIMEOUT_SECONDS. The verdict
+    element is never accepted (wrong widget, see fn_22_30 v88).
+
+    VERSION 12: the lazy block sits inside the hidden "More details" modal
+    of the Intrinsic Value History widget, so scrolling (v10/v11) could
+    never load it. The loop now clicks that button right away and again
+    every ALPHASPREAD_OPEN_EVERY_SECONDS seconds until the headline has
+    text. The log says how long the headline took and how many times the
+    modal was opened ('clicked' = button found; 'no-button' = the page
+    has no such button, i.e. the layout changed again).
+
+    Returns True when the headline appeared, False when it did not. It does
+    NOT raise on timeout (unlike the v10 patch notes): the page is still
+    posted so "AS Price" can land from it, and run_bot saves diagnostics
+    using ALPHASPREAD_WAIT_STATE.
+    """
+    started = time.monotonic()
+    deadline = started + ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+    last_open_at = None
+    open_count = 0
+    last_open_result = None
+
+    ALPHASPREAD_WAIT_STATE["headline_appeared"] = None
+
+    while time.monotonic() < deadline:
+        if alphaspread_headline_has_text(sb):
+            ALPHASPREAD_WAIT_STATE["headline_appeared"] = True
+            print(
+                "\u2705 Headline appeared after {:.1f}s | modal opens so far: {}"
+                " (last result: {})".format(
+                    time.monotonic() - started,
+                    open_count,
+                    last_open_result,
+                )
+            )
+            return True
+
+        now = time.monotonic()
+        if (
+            last_open_at is None
+            or now - last_open_at >= ALPHASPREAD_OPEN_EVERY_SECONDS
+        ):
+            last_open_result = open_alphaspread_details_modal(sb)
+            last_open_at = now
+            open_count += 1
+
+        sb.sleep(1)
+
+    ALPHASPREAD_WAIT_STATE["headline_appeared"] = False
+    print(
+        "\u26a0\ufe0f {} (with text) did not appear within {} seconds |"
+        " modal opens: {} (last result: {})".format(
+            ALPHASPREAD_PRIMARY_SELECTOR,
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+            open_count,
+            last_open_result,
+        )
+    )
+    return False
+
+
 def scrape_alphaspread_html(sb, abbrev_as):
     """
     VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): fetches the real,
@@ -240,6 +683,17 @@ def scrape_alphaspread_html(sb, abbrev_as):
     for the "valuation history" block's own real headline element to
     actually appear (via SeleniumBase's own condition-based
     wait_for_element) rather than a fixed sleep.
+
+    VERSION 6 CHANGE: waits for EITHER known markup shape of that block
+    (see ALPHASPREAD_HEADLINE_SELECTORS) rather than only the original
+    headline element, and logs which one actually matched.
+
+    VERSION 7 CHANGE: also logs the matched element's own text and an
+    HTML snippet (describe_matched_elements), since a selector merely
+    being present does not prove the lazy-loaded block had finished
+    filling in. The original
+    only-first-selector wait could never succeed on a page that serves
+    the newer intrinsic-value-history__verdict component instead.
 
     WHY THIS EXISTS: this project's own earlier Apps Script pipeline
     fetched this same page via Scrape.do's own headless-render API with a
@@ -268,24 +722,27 @@ def scrape_alphaspread_html(sb, abbrev_as):
     navigation), which costs nothing extra and keeps this function
     consistent with the rest of this same run.
 
-    Raises whatever SeleniumBase's own wait_for_element raises
-    (a real timeout exception) if the headline never appears within
-    ALPHASPREAD_WAIT_TIMEOUT_SECONDS -- the caller (run_bot) is
-    responsible for catching this, exactly as it already does for
-    scrape_company_html's own failures, so one scrape failing can never
+    VERSION 10 CHANGE: no longer raises when the headline never appears;
+    the page is returned anyway (AS Price does not depend on the headline)
+    and run_bot saves diagnostics via ALPHASPREAD_WAIT_STATE. Other
+    failures (navigation etc.) still raise and are caught by run_bot,
+    exactly as for scrape_company_html, so one scrape failing can never
     block the other.
     """
     target_url = "https://www.alphaspread.com/security/{}/summary".format(
         abbrev_as
     )
 
-    # v6 (2026-10-19): AS Price came out MISSING on many rows because AlphaSpread
-    # sometimes answers with its Cloudflare page (about 29 KB, title "Just a moment")
-    # and that page was posted as if it were the summary. Now: up to 4 tries; each try
-    # must show the real summary (not the challenge, long enough, headline present);
-    # between tries a longer pause. A page that never becomes real raises, so nothing
-    # is posted and the old cell stays.
+    # VERSION 14 (2026-10-19): AS Price came out MISSING on many rows because
+    # AlphaSpread sometimes answers with its Cloudflare page (title "Just a
+    # moment", about 29 KB instead of about 2 MB) and that page was posted as if
+    # it were the summary. Up to 4 tries now: a try only counts when the title is
+    # not the challenge and the page is long enough; otherwise wait (longer each
+    # time) and re-open with uc_open_with_reconnect. If every try is blocked this
+    # raises, so nothing is posted and the old cell stays (run_bot logs the error
+    # and saves diagnostics).
     last_problem = "unknown"
+    page_ok = False
     for attempt in range(1, 5):
         print("🌐 Navigating to: {} (try {} of 4)".format(target_url, attempt))
         try:
@@ -293,47 +750,293 @@ def scrape_alphaspread_html(sb, abbrev_as):
                 sb.open(target_url)
             else:
                 sb.uc_open_with_reconnect(target_url, reconnect_time=6)
+            sb.sleep(2)
         except Exception as open_error:
             last_problem = "open failed: {}".format(open_error)
             sb.sleep(15 * attempt)
             continue
-
-        title = ""
         try:
-            title = (sb.get_title() or "").lower()
+            page_title = (sb.get_title() or "").lower()
         except Exception:
-            pass
-        if "just a moment" in title:
-            last_problem = "Cloudflare page (title)"
-            print("⚠️ Cloudflare page instead of the summary -- waiting {} s and retrying".format(20 * attempt))
+            page_title = ""
+        try:
+            page_length = len(sb.get_page_source() or "")
+        except Exception:
+            page_length = 0
+        if "just a moment" in page_title or page_length < 100000:
+            last_problem = "Cloudflare/short page (title={!r}, {} chars)".format(page_title[:30], page_length)
+            print("⚠️ AlphaSpread did not give the real summary ({}) -- waiting {} s".format(last_problem, 20 * attempt))
             sb.sleep(20 * attempt)
             continue
+        page_ok = True
+        break
+    if not page_ok:
+        raise RuntimeError("AlphaSpread summary not usable after 4 tries: {}".format(last_problem))
+
+    print(
+        "⏳ Waiting up to {}s for the real valuation-history element"
+        " ({}) to appear (real browser, no fixed sleep)...".format(
+            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+            ALPHASPREAD_PRIMARY_SELECTOR
+            + (
+                " (verdict fallback after {}s, non-empty only)".format(
+                    ALPHASPREAD_FALLBACK_AFTER_SECONDS
+                )
+                if ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
+                else ""
+            ),
+        )
+    )
+
+    headline_appeared = wait_for_alphaspread_block(sb)
+
+    if not headline_appeared:
+        print(
+            "\u23e9 Headline never appeared -- posting the page anyway so"
+            " AS Price can still be written from it."
+        )
+
+    # VERSION 7: log which markup shape this page actually served AND
+    # what that element actually contained, on every scrape (not only
+    # failures) -- see describe_matched_elements.
+    describe_matched_elements(sb)
+
+    return sb.get_page_source()
+
+
+def describe_matched_elements(sb):
+    """
+    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOT):
+    for each known valuation-history selector that is present on the
+    page, prints its own visible text, whether that text is empty, its
+    child-element count, and a snippet of its outer HTML.
+
+    WHY: v6 only printed which selector matched. A real Row 34 run
+    matched .intrinsic-value-history__verdict and the webhook then
+    reported VALUE_NULL, with nothing in the log to show whether the
+    element had real text (a parser problem) or was still an empty or
+    loading shell when the wait returned (a wait problem). This output
+    answers that on every scrape, including successful ones, so a
+    working run can be compared with a failing one.
+
+    Fully guarded -- never raises, never affects the scrape itself.
+    """
+    # VERSION 8: a function BODY run via run_js (no top-level-return
+    # problem in uc mode); the selector is embedded, not "arguments[0]".
+    def build_script(selector):
+        return (
+            "var el = document.querySelector(" + json.dumps(selector) + ");"
+            " if (!el) { return null; }"
+            " return {text: (el.innerText || el.textContent || ''),"
+            " html: (el.outerHTML || ''),"
+            " children: el.children ? el.children.length : 0};"
+        )
+
+    matched_any = False
+
+    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
+        try:
+            if not sb.is_element_present(selector):
+                continue
+        except Exception:
+            continue
+
+        matched_any = True
+        print("🔎 Matched valuation-history element: {}".format(selector))
+
+        try:
+            details = run_js(sb, build_script(selector))
+        except Exception as error:
+            print("   (could not read element content: {})".format(error))
+            continue
+
+        if not details:
+            print("   (element disappeared before its content could be read)")
+            continue
+
+        text = re.sub(r"\s+", " ", details.get("text") or "").strip()
+        html_snippet = re.sub(r"\s+", " ", details.get("html") or "").strip()
 
         print(
-            "⏳ Waiting up to {}s for the real valuation-history headline"
-            " to appear (real browser, no fixed sleep)...".format(
-                ALPHASPREAD_WAIT_TIMEOUT_SECONDS
+            "   text length: {} | text empty: {} | child elements: {}".format(
+                len(text), not text, details.get("children")
             )
         )
-        try:
-            sb.wait_for_element(
-                ALPHASPREAD_HEADLINE_SELECTOR,
-                timeout=ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
+        print(
+            "   text (first {} chars): {}".format(
+                ELEMENT_TEXT_PREVIEW_CHARS,
+                text[:ELEMENT_TEXT_PREVIEW_CHARS] if text else "(empty)",
             )
-        except Exception as wait_error:
-            last_problem = "headline missing: {}".format(wait_error)
-            sb.sleep(15 * attempt)
-            continue
+        )
+        print(
+            "   HTML (first {} chars): {}".format(
+                ELEMENT_HTML_SNIPPET_CHARS,
+                html_snippet[:ELEMENT_HTML_SNIPPET_CHARS],
+            )
+        )
 
-        source = sb.get_page_source() or ""
-        if len(source) < 150000:
-            last_problem = "page too short ({} chars)".format(len(source))
-            print("⚠️ Summary page only {} chars -- waiting and retrying".format(len(source)))
-            sb.sleep(15 * attempt)
-            continue
-        return source
+    if not matched_any:
+        print("🔎 No known valuation-history element is present on the page.")
 
-    raise RuntimeError("AlphaSpread summary not usable after 4 tries: {}".format(last_problem))
+
+def read_webhook_json(response, label):
+    """
+    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED MISLEADING
+    LOG): parses a webhook response as JSON, returning the parsed object,
+    or None if the body is not valid JSON.
+
+    When parsing fails, prints the HTTP status code, content type,
+    redirect count, body length, and the first WEBHOOK_BODY_PREVIEW_CHARS
+    characters of the body, so an empty body, an HTML error page, and a
+    truncated response can be told apart from the log alone.
+
+    label -- a short prefix for the log lines, e.g. "Row 34 (abbrev)".
+    """
+    try:
+        return response.json()
+    except ValueError:
+        pass
+
+    try:
+        body_text = response.text or ""
+    except Exception:
+        body_text = ""
+
+    preview = re.sub(r"\s+", " ", body_text).strip()[:WEBHOOK_BODY_PREVIEW_CHARS]
+
+    print(
+        "⚠️ {}: webhook response was not valid JSON | HTTP {} |"
+        " content-type={} | redirects={} | body length={} chars".format(
+            label,
+            response.status_code,
+            response.headers.get("Content-Type"),
+            len(response.history),
+            len(body_text),
+        )
+    )
+    print(
+        "   body (first {} chars): {}".format(
+            WEBHOOK_BODY_PREVIEW_CHARS, preview if preview else "(empty)"
+        )
+    )
+
+    return None
+
+
+def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape failed"):
+    """
+    VERSION 6 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): when
+    the AS scrape fails (typically the wait timing out), records what
+    the browser was actually looking at so the failure explains itself.
+
+    VERSION 7 CHANGE: also called when the scrape succeeded but the
+    webhook answered "not written" or refused/failed (a real Row 34 run
+    ended in VALUE_NULL with nothing saved to inspect). The new reason
+    argument says which situation this is in the log.
+
+    VERSION 13 CHANGE: the "looks like interstitial/blocked" check uses
+    INTERSTITIAL_MARKERS, which no longer contains "consent" or
+    "challenge-platform" (both appear on normal AlphaSpread pages).
+
+    Does two things, each independently guarded so a failure in one (or
+    in this whole function) can never raise out of it or affect the rest
+    of the run:
+
+    1. Prints a compact summary into the run log: page title, current
+       URL, which of the known valuation-history selectors are present,
+       whether the page looks like a Cloudflare/consent/blocked
+       interstitial, the page source length, and the first part of the
+       page's visible text.
+    2. Writes the page's own screenshot and full HTML into
+       DIAGNOSTICS_DIR, for the workflow's own upload-artifact step.
+
+    Not a fix for anything by itself -- it only observes.
+    """
+    print(
+        "🩺 AS diagnostics for Row {} ({}) -- reason: {}".format(
+            row_number, abbrev_as, reason
+        )
+    )
+
+    try:
+        print("   title: {}".format(sb.get_title()))
+    except Exception as error:
+        print("   title: (unavailable: {})".format(error))
+
+    try:
+        print("   url: {}".format(sb.get_current_url()))
+    except Exception as error:
+        print("   url: (unavailable: {})".format(error))
+
+    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
+        try:
+            print(
+                "   present {}: {}".format(
+                    selector, sb.is_element_present(selector)
+                )
+            )
+        except Exception as error:
+            print("   present {}: (check failed: {})".format(selector, error))
+
+    page_source = ""
+
+    try:
+        page_source = sb.get_page_source() or ""
+        lowered = page_source.lower()
+        print("   page source length: {} chars".format(len(page_source)))
+        print(
+            "   looks like interstitial/blocked: {}".format(
+                any(marker in lowered for marker in INTERSTITIAL_MARKERS)
+            )
+        )
+        print(
+            "   mentions livewire: {} | mentions wire:snapshot: {}".format(
+                "livewire" in lowered, "wire:snapshot" in lowered
+            )
+        )
+    except Exception as error:
+        print("   page source: (unavailable: {})".format(error))
+
+    try:
+        visible_text = run_js(
+            sb, "return document.body ? document.body.innerText : '';"
+        ) or ""
+        visible_text = re.sub(r"\s+", " ", visible_text).strip()
+        print(
+            "   visible text (first {} chars): {}".format(
+                DIAGNOSTIC_TEXT_PREVIEW_CHARS,
+                visible_text[:DIAGNOSTIC_TEXT_PREVIEW_CHARS],
+            )
+        )
+    except Exception as error:
+        print("   visible text: (unavailable: {})".format(error))
+
+    safe_abbrev = re.sub(r"[^A-Za-z0-9_-]+", "_", abbrev_as)
+    base_name = "as_row{}_{}".format(row_number, safe_abbrev)
+
+    try:
+        os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+    except Exception as error:
+        print("   could not create {}: {}".format(DIAGNOSTICS_DIR, error))
+        return
+
+    try:
+        sb.save_screenshot(base_name + ".png", folder=DIAGNOSTICS_DIR)
+        print("   saved screenshot: {}/{}.png".format(DIAGNOSTICS_DIR, base_name))
+    except Exception as error:
+        print("   screenshot not saved: {}".format(error))
+
+    try:
+        if page_source:
+            with open(
+                os.path.join(DIAGNOSTICS_DIR, base_name + ".html"),
+                "w",
+                encoding="utf-8",
+            ) as html_file:
+                html_file.write(page_source)
+            print("   saved HTML: {}/{}.html".format(DIAGNOSTICS_DIR, base_name))
+    except Exception as error:
+        print("   HTML not saved: {}".format(error))
 
 
 def print_purchase_breakdown(purchase_details):
@@ -414,13 +1117,28 @@ def post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html):
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=120)
-        response_body = response.json()
 
     except Exception as post_error:
         print(
             "❌ Row {} ({}): webhook POST itself failed: {}".format(
                 row_number, abbrev_is, post_error
             )
+        )
+        return
+
+    # VERSION 7: parse separately from the POST, so an unreadable body is
+    # reported as exactly that. A real Row 34 run printed a "POST itself
+    # failed" error here while the webhook had in fact scored and written
+    # the value.
+    response_body = read_webhook_json(
+        response, "Row {} ({})".format(row_number, abbrev_is)
+    )
+
+    if response_body is None:
+        print(
+            "   The response could not be read, so it is unknown whether the"
+            " webhook wrote the score -- check the sheet or Apps Script"
+            " Executions before assuming it failed."
         )
         return
 
@@ -472,6 +1190,14 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     each function's own docstring stays focused on the one path it
     actually handles.
 
+    VERSION 7 CHANGE: returns True only when the webhook confirmed it
+    actually wrote the value, and False for every other outcome (not
+    written, refused/failed, unreadable response, POST failure), so
+    run_bot can save page diagnostics whenever the value did not land.
+
+    VERSION 13 CHANGE: the "AS webhook reply:" line now includes the UTC
+    time at which the reply was received.
+
     timeout=120, same reasoning as post_to_webhook's own matching
     parameter -- not yet confirmed necessary specifically for AS's own
     payload size (which is a single page's HTML, not a company's own
@@ -489,7 +1215,6 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
 
     try:
         response = requests.post(webhook_url, json=payload, timeout=120)
-        response_body = response.json()
 
     except Exception as post_error:
         print(
@@ -497,7 +1222,33 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
                 row_number, abbrev_as, post_error
             )
         )
-        return
+        return False
+
+    reply_received_at = utc_clock_text()
+
+    response_body = read_webhook_json(
+        response, "Row {} ({}) AS".format(row_number, abbrev_as)
+    )
+
+    # VERSION 11: the webhook's own Apps Script log is not always visible,
+    # so print the whole JSON reply (trimmed) -- it carries the reason and
+    # any per-column result fn_90_02 reports.
+    # VERSION 13: with the UTC time the reply was received.
+    try:
+        print(
+            "   AS webhook reply (UTC {}): ".format(reply_received_at)
+            + json.dumps(response_body, ensure_ascii=False)[:1500]
+        )
+    except Exception:
+        pass
+
+    if response_body is None:
+        print(
+            "   The response could not be read, so it is unknown whether the"
+            " webhook wrote the value -- check the sheet or Apps Script"
+            " Executions before assuming it failed."
+        )
+        return False
 
     if response_body.get("ok") and response_body.get("written"):
         print(
@@ -507,20 +1258,22 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
                 response_body.get("vsUsualText"),
             )
         )
+        return True
 
-    elif response_body.get("ok"):
+    if response_body.get("ok"):
         print(
             "⏩ Row {} ({}): AS webhook accepted but did not write ({})".format(
                 row_number, abbrev_as, response_body.get("reason")
             )
         )
+        return False
 
-    else:
-        print(
-            "❌ Row {} ({}): AS webhook refused/failed ({})".format(
-                row_number, abbrev_as, response_body.get("reason")
-            )
+    print(
+        "❌ Row {} ({}): AS webhook refused/failed ({})".format(
+            row_number, abbrev_as, response_body.get("reason")
         )
+    )
+    return False
 
 
 def run_bot():
@@ -601,13 +1354,29 @@ def run_bot():
         # actually provided. A separate, independent try/except, so an
         # IS-side failure above (or an AS-side failure here) can never
         # block the other from still being attempted and posted.
+        #
+        # VERSION 6: on failure, also records real page diagnostics (see
+        # save_alphaspread_diagnostics) before moving on. That call is
+        # itself fully guarded, so it can never turn an AS failure into
+        # a bigger one.
         # ------------------------------------------------------------------
         if abbrev_as:
+            diagnostics_reason = None
+
             try:
                 as_html = scrape_alphaspread_html(sb, abbrev_as)
-                post_alphaspread_to_webhook(
+                as_written = post_alphaspread_to_webhook(
                     webhook_url, row_number, abbrev_as, sheet_name, as_html
                 )
+
+                if not as_written:
+                    diagnostics_reason = (
+                        "scrape succeeded but the webhook did not write"
+                    )
+                elif ALPHASPREAD_WAIT_STATE.get("headline_appeared") is False:
+                    diagnostics_reason = (
+                        "headline never appeared (page posted anyway)"
+                    )
 
             except Exception as as_scrape_error:
                 print(
@@ -615,6 +1384,22 @@ def run_bot():
                         row_number, abbrev_as, as_scrape_error
                     )
                 )
+                diagnostics_reason = "AS scrape itself failed"
+
+            # VERSION 7: diagnostics are now saved for BOTH situations --
+            # a scrape that threw (v6) and a scrape that worked but whose
+            # value the webhook did not write (e.g. VALUE_NULL).
+            if diagnostics_reason:
+                try:
+                    save_alphaspread_diagnostics(
+                        sb, row_number, abbrev_as, diagnostics_reason
+                    )
+                except Exception as diagnostics_error:
+                    print(
+                        "⚠️ AS diagnostics themselves failed: {}".format(
+                            diagnostics_error
+                        )
+                    )
 
     print("🧹 Task complete!")
 
