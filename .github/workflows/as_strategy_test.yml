@@ -1,0 +1,31 @@
+# as_strategy_test.yml v1 -- compares strategies for reading AS Profit / AS Solv / Trend on many stocks (manual run)
+name: AS Strategy Test
+on:
+  workflow_dispatch:
+    inputs:
+      as_paths:
+        description: "AlphaSpread paths separated by space or comma (empty = default = the 13 Salkku stocks)"
+        default: ""
+      strategies:
+        description: "Optional filter, e.g. 'S2_heading S3_reload T2_click3' or just 'S T' (empty = all)"
+        default: ""
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install seleniumbase requests && sudo apt-get install -y xvfb
+      - run: xvfb-run -a python as_strategy_test.py
+        env:
+          AS_PATHS: ${{ inputs.as_paths }}
+          STRATEGIES: ${{ inputs.strategies }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: strategy_results
+          path: |
+            results_strategy.json
+            as_pages_strategy/
