@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v46: AlphaSpread run blocked by Cloudflare (DCF failed + 2 blocked pages): stops at once and is retried with a fresh browser after 30-60 s (up to 3 attempts, budget 800 s); the scores step no longer waits 20 s on a challenge page.
   v45: AS Profitability / Solvency cards: scrolls the card heading into view and reloads the page once when no score shows (AMZN had empty cards).
   v45: Trend fix: the AlphaSpread TTM view click retries 3 x 12 s; "Now" is computed from the income TTM alone when the cash-flow TTM is missing (only the FCF-margin signal is dropped).
   v44: a Cloudflare block (or any error) inside the SB context manager is no longer swallowed: it is re-raised after the browser closes, so the run counts it as "blocked" (and retries) instead of 'cannot access local variable posted'.
@@ -805,7 +806,7 @@ return {
 def step_begin(provider, attempt, mode):
     """Starts a new step trace for one browser launch."""
     _STEP_CTX.update({"provider": provider, "attempt": attempt, "mode": mode,
-                      "t0": time.monotonic(), "n": 0, "last": ""})
+                      "t0": time.monotonic(), "n": 0, "last": "", "blocked": 0})
 
 
 def step(name, status="OK", **details):
@@ -813,6 +814,8 @@ def step(name, status="OK", **details):
     try:
         _STEP_CTX["n"] += 1
         _STEP_CTX["last"] = name
+        if status == "FAIL" and details.get("reason") == "blocked":   # v46: counted so that a blocked AlphaSpread run stops early and is retried
+            _STEP_CTX["blocked"] = _STEP_CTX.get("blocked", 0) + 1
         extra = "".join(" | {}={}".format(k, v) for k, v in details.items())
         print("🔹 STEP {} a{}/{} | {:02d} {} | {}{} | +{:.1f}s".format(
             _STEP_CTX["provider"], _STEP_CTX["attempt"], _STEP_CTX["mode"],
@@ -1893,6 +1896,9 @@ def _as_fetch_scores_on_page(sb, url, _retry=False):
     if os.environ.get("AS_SCORES", "1") == "0":
         return
     try:
+        if "just a moment" in (sb.get_title() or "").lower():   # v46: Cloudflare page instead of the summary: do not wait 20 s for cards
+            step("scores", "FAIL", reason="blocked")
+            return
         deadline = time.time() + int(os.environ.get("AS_SCORES_WAIT", "20"))
         result = {}
         scroll_y = 0
@@ -2377,6 +2383,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
     except Exception as size_error:
         print("⚠️ could not set window size: {}".format(size_error))
 
+    dcf_failed = False
     try:
         step("run_extractor", "INFO", abbrev=abbrev_as)
         data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
@@ -2384,6 +2391,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
              sections=len(data.get("sections") or []))
 
     except Exception as error:
+        dcf_failed = True
         failure_report(sb, "as_dcf_" + (str(error).split(":")[0].strip().lower() or "failed")[:40],
                        str(error), looking_for="view calculation|full model|calculation|dcf")
         log_as_page_state(sb)
@@ -2401,13 +2409,22 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         # v19: the DCF goes FIRST (AlphaSpread showed a login wall on the DCF
         # modal when 7 other pages had been opened before it). Ratios and
         # quality run afterwards, also when the DCF failed, so they are kept.
+        # v46: when the DCF failed AND two following pages show the Cloudflare page, stop at once and let run_bot retry with a fresh browser
+        # (the old run kept opening pages for 3-4 minutes, all blocked, and was never retried: Amazon, MercadoLibre 2026-10-19).
+        def _stop_if_blocked():
+            if dcf_failed and _STEP_CTX.get("blocked", 0) >= 2:
+                raise CloudflareBlocked("AlphaSpread shows the Cloudflare page on {} steps after the DCF failed".format(_STEP_CTX.get("blocked", 0)))
         if os.environ.get("AS_RATIOS", "1") != "0":
             fetch_as_ratios(sb, abbrev_as)
+            _stop_if_blocked()
             fetch_as_buyback(sb, abbrev_as)
+            _stop_if_blocked()
             if os.environ.get("AS_HIST", "1") != "0":
                 fetch_as_hist(sb, abbrev_as)  # v30
+                _stop_if_blocked()
                 fetch_as_score_details(sb, abbrev_as)  # v39
         if os.environ.get("AS_QUALITY", "1") != "0":
+            _stop_if_blocked()
             fetch_as_quality(sb, abbrev_as)
 
     if SAVE_DIAGNOSTICS_ALWAYS:
@@ -2567,7 +2584,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v45",
+            "v": "v46",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2800,6 +2817,8 @@ def run_bot():
         for attempt in range(1, attempts + 1):
             if attempt > 1:
                 pause = random.uniform(CF_RETRY_WAIT_MIN_SECONDS, CF_RETRY_WAIT_MAX_SECONDS)
+                if target == "ASDCF":
+                    pause = random.uniform(30, 60)   # v46: AlphaSpread blocks last longer than a few seconds
                 print("🔁 {}: blocked by Cloudflare in every mode -- retry {}/{} after {:.0f}s".format(
                     target, attempt, attempts, pause))
                 time.sleep(pause)
@@ -2889,7 +2908,7 @@ def run_bot():
             if finished:
                 break
 
-            if time.monotonic() - provider_started >= CF_RETRY_BUDGET_SECONDS:
+            if time.monotonic() - provider_started >= (CF_RETRY_BUDGET_SECONDS * 2 if target == "ASDCF" else CF_RETRY_BUDGET_SECONDS):
                 print("⏹️ {}: retry time budget ({}s) used up -- giving up on this provider.".format(
                     target, CF_RETRY_BUDGET_SECONDS))
                 break
