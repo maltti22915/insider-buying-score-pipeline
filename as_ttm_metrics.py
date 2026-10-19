@@ -184,9 +184,12 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     for name, info in (("income", iinfo), ("cashflow", cinfo), ("balance", binfo)):
         if info.get("error"):
             out["warnings"].append("{}: {}".format(name, info["error"]))
-    if not ip or not cp:
-        out["warnings"].append("TTM tables missing: no Now score")
+    if not ip:
+        out["warnings"].append("income TTM table missing: no Now score")
         return out
+    if not cp:
+        out["warnings"].append("cash flow TTM missing: Now without the FCF margin signal")
+        cfs, cp = {}, list(ip)
     latest = ip[-1]
     if cp[-1] != latest:
         out["warnings"].append("income TTM ends {} but cash flow TTM ends {}".format(latest, cp[-1]))
