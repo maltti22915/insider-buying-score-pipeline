@@ -34,7 +34,9 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v45: Trend fix: the AlphaSpread TTM view click retries 3 x 12 s; "Now" is computed from the income TTM alone when the cash-flow TTM is missing (only the FCF-margin signal is dropped).
   v44: a Cloudflare block (or any error) inside the SB context manager is no longer swallowed: it is re-raised after the browser closes, so the run counts it as "blocked" (and retries) instead of 'cannot access local variable posted'.
+  v44: the AlphaSpread buyback read retries up to 3 more times (scroll to the buybacks block, wait, re-read; the last try reloads the page) before it reports FAIL 'no buyback numbers on the page'.
   v43: SW run also reads the SW Management + Ownership pages after the valuation dialog and posts the "Skin" score + note (target SKIN, handler fn_91_10; scoring in sw_skin.py; env SW_SKIN=0 switches it off).
   v42: Simply Wall St now runs on SeleniumBase CDP mode (CdpSB adapter, sb.cdp.solve_captcha): sw_probe v2 passed 12 of 12 for CDP against 2 of 6 for the old uc engine (hour 12 UTC, normally the worst). SW_ENGINE=uc switches back.
   v41: the 'View All' details read is OFF by default (AS_SCORE_DETAILS=1 turns it on): the live runs showed that AlphaSpread hides the score and checks on /profitability and /solvency for the logged-out bot ('score is Hidden', fewer than 3 checks), and each try cost 20-40 s per row.
@@ -2196,30 +2198,32 @@ AS_TTM_TOGGLE = {"income": ("TTM", r"TTM\s+[A-Z][a-z]{2}\s+\d{4}"), "cashflow": 
 
 
 def _as_click_view(sb, toggle):
-    """Clicks the view switch by its visible text and returns the page source once the new header shows; '' on any failure."""
+    """v45: clicks the view switch by its visible text (up to 3 attempts, 12 s each) and returns the page source once the new header shows; '' on failure."""
     label, ready_pattern = toggle
-    try:
-        clicked = sb.execute_script(
-            "var want = arguments[0], best = null;"
-            "document.querySelectorAll('button, a, label, li, span, div').forEach(function (e) {"
-            "  if (e.children.length === 0 && (e.textContent || '').trim() === want) { best = best || e; } });"
-            "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';", label)
-        if clicked != "clicked":
-            step("quality_view_" + label.lower(), "FAIL", reason="toggle not found")
-            return ""
-        source = ""
-        for _ in range(10):
-            sb.sleep(1.0)
-            source = sb.get_page_source()
-            if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
-                step("quality_view_" + label.lower(), "OK", chars=len(source))
-                return source
-        step("quality_view_" + label.lower(), "FAIL", reason="header did not change")
-        return ""
-    except Exception as view_error:
-        step("quality_view_" + label.lower(), "FAIL", reason=type(view_error).__name__)
-        return ""
-
+    key = "quality_view_" + label.lower()
+    js = ("var want = arguments[0], best = null;"
+          "document.querySelectorAll('button, a, label, li, span, div').forEach(function (e) {"
+          "  if (e.children.length === 0 && (e.textContent || '').trim() === want) { best = best || e; } });"
+          "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';")
+    reason = "header did not change"
+    for attempt in range(1, 4):
+        try:
+            if sb.execute_script(js, label) != "clicked":
+                reason = "toggle not found"
+                sb.sleep(2.0)
+                continue
+            for _ in range(12):
+                sb.sleep(1.0)
+                source = sb.get_page_source()
+                if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
+                    step(key, "OK", chars=len(source), attempt=attempt)
+                    return source
+            reason = "header did not change"
+        except Exception as view_error:
+            reason = type(view_error).__name__
+            sb.sleep(2.0)
+    step(key, "FAIL", reason=reason, attempts=3)
+    return ""
 
 
 def fetch_as_quality(sb, abbrev_as):
@@ -2300,17 +2304,17 @@ def fetch_as_quality(sb, abbrev_as):
     except Exception as moat_error:
         step("quality_moat", "FAIL", reason=type(moat_error).__name__ + ": " + str(moat_error)[:60])
     now_block = None
-    if all(ttm_pages.get(k) for k in ("income", "cashflow")):
+    if ttm_pages.get("income"):  # v45: cash flow TTM is optional (only the FCF margin signal needs it)
         try:
             import as_ttm_metrics
-            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages["cashflow"], ttm_pages.get("balance", ""),
+            now_block = as_ttm_metrics.compute_now(ttm_pages["income"], ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
                                                    profile=(v4_block or {}).get("profile") or "NF")
             _AS_QUALITY["now"] = now_block
             step("quality_now", "OK", now=now_block.get("now"), signals=now_block.get("signals"), warnings=";".join(now_block.get("warnings") or []) or "none")
         except Exception as now_error:
             step("quality_now", "FAIL", reason=type(now_error).__name__ + ": " + str(now_error)[:60])
     else:
-        step("quality_now", "FAIL", reason="TTM views missing")
+        step("quality_now", "FAIL", reason="income TTM view missing")
     step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none", roic_scale=diag.get("roic_scale"), roic_min5=(result["metrics"].get("roic_min5") if result.get("metrics") else None))
 
 
@@ -2541,7 +2545,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v44",
+            "v": "v45",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
