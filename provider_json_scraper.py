@@ -368,7 +368,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "ASFIN": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "ASFIN": "abbrevAS", "ASQM": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -2412,6 +2412,12 @@ def fetch_as_qm(sb, abbrev_as):
     except Exception as import_error:
         step("qm", "FAIL", reason="as_qm_data.py missing: " + type(import_error).__name__)
         return
+    try:   # v48: the buyback block is blocked now and then -> one more try before the Quality Model is assembled
+        if not (isinstance(_AS_RATIOS, dict) and _AS_RATIOS.get("buyback")):
+            sb.sleep(15)
+            fetch_as_buyback(sb, abbrev_as)
+    except Exception:
+        pass
     try:
         qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
                                     buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
