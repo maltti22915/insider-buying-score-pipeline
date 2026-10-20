@@ -1,0 +1,31 @@
+# as_qm_test.yml v1 -- page discovery + stability test for the new Quality Model (QL / Dir / Outl); manual run
+name: AS QM Test
+on:
+  workflow_dispatch:
+    inputs:
+      as_paths:
+        description: "AlphaSpread paths separated by space or comma (empty = nasdaq/adsk, nyse/orcl, nyse/uber, nyse/baba)"
+        default: ""
+      repeats:
+        description: "How many times each page is loaded per stock (2 = also checks that the text is the same on a second load)"
+        default: "2"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install seleniumbase requests && sudo apt-get install -y xvfb
+      - run: xvfb-run -a python as_qm_test.py
+        env:
+          AS_PATHS: ${{ inputs.as_paths }}
+          REPEATS: ${{ inputs.repeats }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qm_test_results
+          path: |
+            results_qm.json
+            qm_pages/
