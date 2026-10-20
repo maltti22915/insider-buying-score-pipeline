@@ -194,7 +194,14 @@ def r1(sb, url, src):
         return None, "requests " + type(e).__name__
 
 
-STRATS = [("F1_auto", f1), ("F2_select", f2), ("F3_click_js", f3), ("F4_click_real", f4), ("F5_reload_f2", f5), ("R1_requests", r1)]
+def f6(sb, url, src):
+    """production routine (as_fin_data.ensure_millions): success = 'Scale: Millions' + clean table, 3 attempts incl. a reload"""
+    log = []
+    new, ok = F.ensure_millions(sb, url, src, lambda s_, u_, r_: open_page(s_, u_, r_)[0], lambda *a, **k: log.append(k.get("how", "") or a))
+    return (new, "ensure " + str(log)[:80]) if ok else (None, "ensure failed " + str(log)[:80])
+
+
+STRATS = [("F1_auto", f1), ("F2_select", f2), ("F3_click_js", f3), ("F4_click_real", f4), ("F5_reload_f2", f5), ("F6_ensure", f6), ("R1_requests", r1)]
 
 
 def millions_active(src):
