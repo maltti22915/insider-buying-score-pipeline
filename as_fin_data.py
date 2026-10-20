@@ -296,7 +296,7 @@ return done;
 
 
 # same wait condition the production quality step uses (provider_json_scraper.fetch_as_quality): the heading text is enough
-MOAT_READY = r"What is Economic Moat\?"
+MOAT_READY = r"What is Economic Moat\?|How we rate moats"   # old / new (2026-10-20) page layout
 
 
 def millions_ready(src):
