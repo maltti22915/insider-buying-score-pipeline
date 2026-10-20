@@ -2288,7 +2288,7 @@ def fetch_as_quality(sb, abbrev_as):
         sb.uc_open_with_reconnect(base + "qualitative/block/economic-moat", 4)
         for _ in range(12):
             moat_source = sb.get_page_source()
-            if "What is Economic Moat?" in moat_source:
+            if "What is Economic Moat?" in moat_source or "How we rate moats" in moat_source:   # old / new (2026-10-20) page layout
                 break
             sb.sleep(1.5)
         step("quality_moat_page", "OK", chars=len(moat_source))
