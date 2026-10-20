@@ -346,7 +346,7 @@ def run_statements(sb, path):
 
 def run_extras(sb, path):
     base = F.BASE.format(path)
-    items = [("solvency", "solvency", r"Net\s+Debt"), ("moat", "qualitative/block/economic-moat", r"What is Economic Moat\?"), ("profitability", "profitability", r"3Y Average ROIC")]
+    items = [("solvency", "solvency", r"Net\s+Debt"), ("moat", "qualitative/block/economic-moat", F.MOAT_READY), ("profitability", "profitability", r"3Y Average ROIC")]
     for rep in range(1, REPEATS + 1):
         for name, page, ready in items:
             t0 = time.time()
