@@ -149,6 +149,8 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
                          "rev_cagr_fwd_years": r.get("cagr_fwd_years"), "opi3": o.get("three"), "opi3_n": o.get("three_n"), "opi_only": o.get("only"),
                          "opi_cagr_fwd": o.get("cagr_fwd"), "opi_cagr_fwd_years": o.get("cagr_fwd_years"),
                          "rev_lt": r.get("cagr_hist"), "rev_lt_years": r.get("cagr_hist_years")}
+            if o.get("three") is None and not o.get("only"):
+                step("qm_est_debug", "INFO", opi_block=(_block_after(text, "In 3 years") or "")[:200], tab_click=how)
             step("qm_est", "OK" if (r.get("three") is not None or r.get("cagr_fwd") is not None) else "FAIL",
                  rev3=r.get("three"), opi3=o.get("three"), rev_lt=r.get("cagr_hist"), only=(r.get("only"), o.get("only")))
     except Exception as e:
@@ -161,6 +163,18 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     except Exception as e:
         qm["solv"] = {}
         step("qm_solv", "FAIL", reason=type(e).__name__)
+    # moat: normally taken from the quality step; read it here when that step was blocked
+    try:
+        if not moat or not moat.get("rating"):
+            msrc = _open(sb, base + "qualitative/block/economic-moat", r"How we rate moats|What is Economic Moat\?", open_page)
+            if msrc:
+                import as_moat
+                moat = as_moat.parse_moat(msrc)
+                step("qm_moat", "OK" if moat.get("rating") else "FAIL", rating=moat.get("rating"))
+            else:
+                step("qm_moat", "FAIL", reason="blocked")
+    except Exception as e:
+        step("qm_moat", "FAIL", reason=type(e).__name__)
     # data the scraper already holds
     if buyback:
         qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
