@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v47: Quality v2 -- new step fetch_as_fin (as_fin_data.py): annual income statement / balance sheet / cash flow (unit selector set to Millions), solvency, moat and 3Y ROIC pages become the "AS Fin JSON" posted as target ASFIN (fn_91_11). Env AS_FIN="0" skips it (the sheet keeps a JSON younger than 30 days).
   v46: AlphaSpread run blocked by Cloudflare (DCF failed + 2 blocked pages): stops at once and is retried with a fresh browser after 30-60 s (up to 3 attempts, budget 800 s); the scores step no longer waits 20 s on a challenge page.
   v45: AS Profitability / Solvency cards: scrolls the card heading into view and reloads the page once when no score shows (AMZN had empty cards).
   v45: Trend fix: the AlphaSpread TTM view click retries 3 x 12 s; "Now" is computed from the income TTM alone when the cash-flow TTM is missing (only the FCF-margin signal is dropped).
@@ -366,7 +367,7 @@ WEBHOOK_TIMEOUT_SECONDS = 120
 # v5: the payload key under which the webhook reads each target's abbreviation.
 # Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
 # from that rule are listed here (ASDCF reads the row's abbrevAS).
-ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "ASFIN": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
 
 # v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
 AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
@@ -2346,6 +2347,71 @@ def fetch_as_quality(sb, abbrev_as):
     step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none", roic_scale=diag.get("roic_scale"), roic_min5=(result["metrics"].get("roic_min5") if result.get("metrics") else None))
 
 
+_AS_FIN = {}
+
+
+def _as_fin_open_page(sb, url, ready_pattern):
+    """v47: opens one AlphaSpread page and waits until ready_pattern shows in the page text; '' when it stays a Cloudflare page."""
+    for attempt in (1, 2):
+        sb.uc_open_with_reconnect(url, 4)
+        source = ""
+        for _ in range(14):
+            source = sb.get_page_source()
+            if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
+                return source
+            if "just a moment" in (sb.get_title() or "").lower():
+                break
+            sb.sleep(1.5)
+        if "just a moment" in (sb.get_title() or "").lower():
+            sb.sleep(15 * attempt)
+            continue
+        return source
+    return ""
+
+
+def fetch_as_fin(sb, abbrev_as):
+    """v47: Quality v2 raw data (AS Fin JSON). Never raises: the DCF and the other AlphaSpread steps must not depend on it."""
+    _AS_FIN.clear()
+    if os.environ.get("AS_FIN", "1") == "0":
+        step("fin", "INFO", note="AS_FIN=0: stored AS Fin JSON is still fresh")
+        return
+    try:
+        import as_fin_data
+    except Exception as import_error:
+        step("fin", "FAIL", reason="as_fin_data.py missing: " + type(import_error).__name__)
+        return
+    try:
+        hint = None
+        try:
+            hint = ((_AS_QUALITY.get("moat") or {}).get("rating")) if isinstance(_AS_QUALITY, dict) else None
+        except Exception:
+            hint = None
+        fin = as_fin_data.fetch_as_fin(sb, abbrev_as, step, _as_fin_open_page, moat_hint=hint)
+        if fin:
+            _AS_FIN.update(fin)
+            step("fin", "OK", years=len(fin.get("fy") or []), moat=fin.get("moat"), roic3y=fin.get("roic3y_as"), flags=",".join(fin.get("flags") or []) or "none")
+    except Exception as fin_error:
+        step("fin", "FAIL", reason=type(fin_error).__name__ + ": " + str(fin_error)[:60])
+
+
+def post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v47: posts the AS Fin JSON once (target ASFIN); never touches the DCF result."""
+    if not _AS_FIN:
+        return
+    fin = dict(_AS_FIN)
+    _AS_FIN.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASFIN", row_number, abbrev, sheet_name, {"fin": fin})
+        info["fin"] = {"posted": bool(posted), "years": len(fin.get("fy") or []), "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as fin_post_error:
+        print("❌ AS Fin post failed: {}".format(fin_post_error))
+        info["fin"] = {"posted": False, "reason": str(fin_post_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
 def post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info):
     """Posts the computed quality metrics once (target ASQ); never touches the DCF result."""
     if not _AS_QUALITY:
@@ -2426,6 +2492,9 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         if os.environ.get("AS_QUALITY", "1") != "0":
             _stop_if_blocked()
             fetch_as_quality(sb, abbrev_as)
+        if os.environ.get("AS_FIN", "1") != "0":   # v47: Quality v2 raw data, only when the sheet's stored JSON is missing or older than 30 days
+            _stop_if_blocked()
+            fetch_as_fin(sb, abbrev_as)
 
     if SAVE_DIAGNOSTICS_ALWAYS:
         save_as_diagnostics(sb, row_number, "always-on")
@@ -2584,7 +2653,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
             providers_out[target] = entry
 
         summary = {
-            "v": "v46",
+            "v": "v47",
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2799,6 +2868,7 @@ def run_bot():
         if target == "ASDCF":
             _AS_RATIOS.clear()
             _AS_QUALITY.clear()
+            _AS_FIN.clear()
         provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
@@ -2853,6 +2923,7 @@ def run_bot():
                             elif target == "ASDCF":
                                 post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                                 post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                                post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         except BaseException as inner_error:
                             swallowed_error.append(inner_error)
                             raise
@@ -2881,6 +2952,7 @@ def run_bot():
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     continue
 
                 except Exception as scrape_error:
@@ -2898,6 +2970,7 @@ def run_bot():
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
