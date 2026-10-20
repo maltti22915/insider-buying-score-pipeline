@@ -1,4 +1,4 @@
-# as_fin_test.py v1 -- finds the most RELIABLE way to read AlphaSpread annual statements (+ solvency, moat, 3Y ROIC) for Quality v2.
+# as_fin_test.py v2 (millions check on the table only) -- finds the most RELIABLE way to read AlphaSpread annual statements (+ solvency, moat, 3Y ROIC) for Quality v2.
 #
 # Default stocks: nasdaq/adsk nyse/orcl nyse/uber (ADSK and ORCL are the two test cases of the Quality v2 spec).
 # Env: AS_PATHS (space/comma separated), STRATEGIES (filter, e.g. "F2 F3"), REPEATS (default 2 = every strategy is run twice per page to see
@@ -193,7 +193,9 @@ STRATS = [("F1_auto", f1), ("F2_select", f2), ("F3_click_js", f3), ("F4_click_re
 
 def millions_active(src):
     """True when no table value carries a B/T suffix (Auto shows 1.3B / 2.7T); needs at least one number."""
-    text = re.sub(r"<[^>]+>", " ", src)
+    tables = re.findall(r"<table.*?</table>", src, re.S)   # statement table only: the page header carries "Market Cap $376B"
+    tables.sort(key=lambda x: -len(re.findall(r"FY\s*20\d\d", x)))
+    text = re.sub(r"<[^>]+>", " ", tables[0] if tables else src)
     numbers = re.findall(r"\(?-?\d[\d,]*\.?\d*\s?([BT])\b", text)
     return len(numbers) == 0
 
