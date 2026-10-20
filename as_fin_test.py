@@ -1,4 +1,4 @@
-# as_fin_test.py v2 (millions check on the table only) -- finds the most RELIABLE way to read AlphaSpread annual statements (+ solvency, moat, 3Y ROIC) for Quality v2.
+# as_fin_test.py v3 (Cloudflare: captcha click + longer waits) (millions check on the table only) -- finds the most RELIABLE way to read AlphaSpread annual statements (+ solvency, moat, 3Y ROIC) for Quality v2.
 #
 # Default stocks: nasdaq/adsk nyse/orcl nyse/uber (ADSK and ORCL are the two test cases of the Quality v2 spec).
 # Env: AS_PATHS (space/comma separated), STRATEGIES (filter, e.g. "F2 F3"), REPEATS (default 2 = every strategy is run twice per page to see
@@ -94,14 +94,20 @@ def blocked(sb):
 def open_page(sb, url, ready=FY_RE):
     """opens url; waits for `ready` in the page text; Cloudflare is retried (12 s, 25 s). Returns (source, cloudflare_hits)."""
     hits = 0
-    for wait in (0, 12, 25):
+    for wait in (0, 20, 45):
         if wait:
             sb.sleep(wait)
         sb.uc_open_with_reconnect(url, 4)
         sb.sleep(2.0)
         if blocked(sb):
             hits += 1
-            continue
+            try:
+                sb.uc_gui_click_captcha()   # second way through the Cloudflare check (clicks the verification box if one is shown)
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            if blocked(sb):
+                continue
         for _ in range(14):
             src = sb.get_page_source()
             if re.search(ready, re.sub(r"<[^>]+>", " ", src)):
