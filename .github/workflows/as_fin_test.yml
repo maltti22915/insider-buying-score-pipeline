@@ -1,0 +1,35 @@
+# as_fin_test.yml v1 -- compares ways to read the AlphaSpread annual statements / solvency / moat / ROIC pages for Quality v2 (manual run)
+name: AS Fin Test
+on:
+  workflow_dispatch:
+    inputs:
+      as_paths:
+        description: "AlphaSpread paths separated by space or comma (empty = nasdaq/adsk, nyse/orcl, nyse/uber)"
+        default: ""
+      strategies:
+        description: "Optional filter, e.g. 'F2 F3 R1' (empty = all)"
+        default: ""
+      repeats:
+        description: "How many times each strategy runs per page (2 = also checks that the result is repeatable)"
+        default: "2"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install seleniumbase requests && sudo apt-get install -y xvfb
+      - run: xvfb-run -a python as_fin_test.py
+        env:
+          AS_PATHS: ${{ inputs.as_paths }}
+          STRATEGIES: ${{ inputs.strategies }}
+          REPEATS: ${{ inputs.repeats }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fin_test_results
+          path: |
+            results_fin.json
+            fin_pages/
