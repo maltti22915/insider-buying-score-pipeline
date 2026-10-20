@@ -1,172 +1,172 @@
-# as_qm_test.py v1 -- PAGE DISCOVERY + STABILITY TEST for the new Quality Model (QL / Dir / Outl, reference of 2026-10-20).
-# It does NOT score anything yet. It answers: for each AlphaSpread page the model needs, (1) can it be loaded reliably, (2) which of the phrases the parsers
-# will depend on are really on the page, (3) what does the text around them look like (saved as snippets), (4) are the snippets identical on a second load.
-# Pages: profitability (checklist: ROIC, margins, 3Y averages, "is Increasing"), analyst-estimates (Revenue / Operating Income tabs, "In 3 years", "Only N analysts",
-# CAGR sentences), buybacks (yield), solvency (net debt, interest cover, bankruptcy), economic-moat, summary (insider block), insider-trading page.
-# Env: AS_PATHS (default "nasdaq/adsk nyse/orcl nyse/uber nyse/baba"), REPEATS (default 2).
-# Output: results_qm.json (snippets per stock/page/phrase, stability flags), qm_pages/<stock>_<page>.html (+ _tab_<name>.html after a tab click), ranking in the step summary.
-import json, os, re, time
-from seleniumbase import SB
+"""
+as_qm_data.py v1 -- raw AlphaSpread inputs for the Quality Model (QL / Dir / Outl / Q).
+Pure parsers (no browser) + fetch_as_qm() which opens the analyst-estimates and solvency pages. The profitability page, buyback block, moat and
+TTM block are already read by provider_json_scraper.py (fetch_as_quality / fetch_as_buyback) and are passed in.
 
-DEFAULT = "nasdaq/adsk nyse/orcl nyse/uber nyse/baba"
-PATHS = [p.strip().strip("/") for p in re.split(r"[\s,]+", os.environ.get("AS_PATHS", "").strip() or DEFAULT) if p.strip()]
-REPEATS = max(1, int(os.environ.get("REPEATS", "2") or 2))
-OUT = "qm_pages"
-os.makedirs(OUT, exist_ok=True)
-BASE = "https://www.alphaspread.com/security/{}/"
+QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
+  {v:1, fetched, prof:{roic|opm|fcfm|gm|nm|roe: {now, avg3, prev}}, est:{rev3, rev3_n, rev_cagr_fwd, opi3, opi3_n, opi_cagr_fwd, rev_lt, rev_lt_years},
+   bb:{cur, avg5}, solv:{bankr, net_cash, net_debt_text}, moat, ttm:{rev_growth, rev_accel, nd_ebitda, nd_ebitda_prev, int_cover, sbc_pct_rev}, flags:[..]}
+"""
+import re
+from datetime import datetime, timezone
 
-PAGES = {
-    "profitability": ("profitability", r"ROIC|Profitability"),
-    "estimates": ("analyst-estimates", r"Financial Estimates|In \d+ years|analysts"),
-    "buybacks": ("investor-returns/i/buybacks", r"[Bb]uyback"),
-    "solvency": ("solvency", r"Net\s+Debt"),
-    "moat": ("qualitative/block/economic-moat", r"How we rate moats|What is Economic Moat\?"),
-    "summary": ("summary", r"Intrinsic Value|Insider"),
-    "insider": ("ownership/block/insider-trading", r"Insider"),
-}
-PHRASES = {
-    "profitability": ["ROIC", "3Y Average", "Operating Margin", "Free Cash Flow Margin", "Gross Margin", "Net Margin", "is Increasing", "is Decreasing", "Profitability Score", "previous"],
-    "estimates": ["In 3 years", "Only \\d+ analysts", "compound annual growth rate", "projected CAGR", "Operating Income", "Revenue", "Financial Estimates", "Over the last"],
-    "buybacks": ["buyback yield", "Buyback Yield", "shares outstanding", "Average", "5Y|5 Year|5-year"],
-    "solvency": ["Net Debt", "Interest Coverage", "Altman", "Bankruptcy", "Debt to Equity|D/E"],
-    "moat": ["How we rate moats", "No Moat Narrow Wide"],
-    "summary": ["Insider Trading", "bought", "sold", "0-12|12 months|12M", "USD|\\$"],
-    "insider": ["Insider Trading", "Bought|Purchase", "Sold|Sale", "Net", "12 months|12M|Last year"],
+PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
+    "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
 }
 TAB_CLICK_JS = ("var want = arguments[0], hit = null;"
                 "document.querySelectorAll('button, a, li, span, div, label').forEach(function (e) {"
                 "  if (!hit && e.children.length === 0 && (e.textContent || '').trim() === want) { hit = e; } });"
                 "if (!hit) { return 'none'; } hit.scrollIntoView({block: 'center'}); hit.click(); return 'clicked';")
-results = []
+NUM = r"(-?\d+(?:[.,]\d+)?)"
 
 
-def plain(html):
-    h = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", html or "")
-    h = re.sub(r"<[^>]+>", " ", h)
+def plain_text(html):
     import html as _h
-    return re.sub(r"\s+", " ", _h.unescape(h)).strip()
+    s = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", html or "")
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", _h.unescape(s)).strip()
 
 
-def blocked(sb):
-    return "just a moment" in (sb.get_title() or "").lower()
+def _f(x):
+    try:
+        return float(str(x).replace(",", "."))
+    except Exception:
+        return None
 
 
-def open_page(sb, url, ready):
-    """Cloudflare-aware load: retries at 0 / 20 / 45 s, tries the verification click; waits until the `ready` pattern is in the text. Returns (html, cloudflare_hits)."""
-    hits = 0
-    for wait in (0, 20, 45):
-        if wait:
-            sb.sleep(wait)
-        sb.uc_open_with_reconnect(url, 4)
-        sb.sleep(2.0)
-        if blocked(sb):
-            hits += 1
-            try:
-                sb.uc_gui_click_captcha()
-                sb.sleep(4.0)
-            except Exception:
-                pass
-            if blocked(sb):
-                continue
-        for _ in range(14):
-            src = sb.get_page_source()
-            if re.search(ready, plain(src)):
-                return src, hits
-            sb.sleep(1.5)
-        return sb.get_page_source(), hits
-    return "", hits
-
-
-def snippets(text, patterns, width=170, limit=3):
+def parse_profitability(html_or_text):
+    """Checklist -> {key: {now, avg3, prev}} in percent (AlphaSpread prints whole numbers). prev = the left number of 'prev% > now%'."""
+    t = html_or_text if "<" not in (html_or_text or "")[:200] else plain_text(html_or_text)
+    i = t.find("Due Diligence Checks")
+    if i >= 0:
+        j = t.find("Profitability Score", i)
+        t = t[i:j if j > i else i + 4000]
     out = {}
-    for p in patterns:
-        found = [text[max(0, m.start() - width): m.end() + width] for m in re.finditer(p, text)]
-        out[p] = {"count": len(found), "snippets": found[:limit]}
+    for key, label in PROFILE_METRICS.items():
+        lab = re.escape(label)
+        rec = {"now": None, "avg3": None, "prev": None}
+        m = re.search(r"3Y Average\s+" + lab + r"\s+" + NUM + r"\s*%", t)
+        if m:
+            rec["avg3"] = _f(m.group(1))
+        m = re.search(lab + r"(?:\s+is\s+(?:Increasing|Declining|Decreasing|Stable))?\s+" + NUM + r"\s*%\s*>\s*" + NUM + r"\s*%", t)
+        if m:
+            rec["prev"], rec["now"] = _f(m.group(1)), _f(m.group(2))
+        if rec["now"] is None:
+            m = re.search(r"(?<!Average )(?<!Average\s)\b" + lab + r"\s+" + NUM + r"\s*%(?!\s*>)", t)
+            if m:
+                rec["now"] = _f(m.group(1))
+        out[key] = rec
     return out
 
 
-def save(name, text):
+def _block_after(text, marker):
+    """Text of the 'In N years' block that starts at marker, up to the next 'In N years' block."""
+    i = text.find(marker)
+    if i < 0:
+        return ""
+    m = re.search(r"In \d+ years", text[i + len(marker):])
+    return text[i:i + len(marker) + (m.start() if m else 600)]
+
+
+def parse_estimates(text, metric="Revenue"):
+    """One estimates tab (Revenue or Operating Income) -> {three, three_n, only, cagr_fwd, cagr_fwd_years, cagr_hist, cagr_hist_years}.
+    three = the 'In 3 years' change in percent versus the last fiscal year (None when 'Only N analysts' marks the block or the value is 0)."""
+    out = {"three": None, "three_n": None, "only": False, "cagr_fwd": None, "cagr_fwd_years": None, "cagr_hist": None, "cagr_hist_years": None}
+    blk = _block_after(text, "In 3 years")
+    if blk:
+        m = re.search(r"([+-]\d[\d.,]*)\s*%", blk)
+        if m:
+            out["three"] = _f(m.group(1).replace(",", ""))
+        m = re.search(r"Average of (\d+) analysts", blk)
+        if m:
+            out["three_n"] = int(m.group(1))
+        if re.search(r"Only \d+ analysts?", blk):
+            out["only"] = True
+            out["three"] = None
+    seg = re.search(r"What is the " + re.escape(metric) + r" forecast for.*?(?=What is the |Back to Top|$)", text)
+    seg = seg.group(0) if seg else ""
+    m = re.search(r"projected CAGR for the next (\d+) years is " + NUM + r"\s*%", seg)
+    if m:
+        out["cagr_fwd_years"], out["cagr_fwd"] = int(m.group(1)), _f(m.group(2))
+    m = re.search(r"Over the last (\d+) years?, the compound annual growth rate for " + re.escape(metric) + r" has been " + NUM + r"\s*%", seg)
+    if m:
+        out["cagr_hist_years"], out["cagr_hist"] = int(m.group(1)), _f(m.group(2))
+    return out
+
+
+def parse_solvency(text):
+    out = {"bankr": None, "net_cash": None, "net_debt_text": None}
+    m = re.search(r"probability of bankruptcy is " + NUM + r"\s*%", text)
+    if m:
+        out["bankr"] = _f(m.group(1))
+    m = re.search(r"(Negative|Positive) Net Debt\s+(-?[\d.,]+\s*[KMBT]?\s*[A-Z]{3})", text)
+    if m:
+        out["net_cash"] = (m.group(1) == "Negative")
+        out["net_debt_text"] = m.group(2).strip()
+    return out
+
+
+def _open(sb, url, ready_pattern, open_page):
+    return open_page(sb, url, ready_pattern) if open_page else ""
+
+
+def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None):
+    """Opens analyst-estimates (+ Revenue / Operating Income tabs) and solvency; assembles the QM payload. Never raises; returns {} when nothing was read."""
+    base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
+    qm = {"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": []}
+    # profitability (page already loaded by fetch_as_quality)
     try:
-        with open(os.path.join(OUT, name), "w", encoding="utf-8") as h:
-            h.write(text)
-    except Exception:
-        pass
-
-
-def run_page(sb, stock, name, rep):
-    suffix, ready = PAGES[name]
-    t0 = time.time()
-    html, hits = open_page(sb, BASE.format(stock) + suffix, ready)
-    rec = {"stock": stock, "page": name, "rep": rep, "ok": bool(html), "cloudflare_hits": hits, "seconds": None, "chars": len(html or "")}
-    if html:
-        text = plain(html)
-        rec["found"] = snippets(text, PHRASES[name])
-        rec["missing_phrases"] = [p for p, v in rec["found"].items() if not v["count"]]
-        if rep == 1:
-            save("{}_{}.html".format(stock.replace("/", "_"), name), html)
-        if name == "estimates":
-            tabs = {}
-            for tab in ("Revenue", "Operating Income"):
-                how = None
-                try:
+        qm["prof"] = parse_profitability(prof_html) if prof_html else {}
+        got = sum(1 for v in qm["prof"].values() if v.get("now") is not None)
+        step("qm_prof", "OK" if got >= 4 else "FAIL", metrics=got)
+    except Exception as e:
+        qm["prof"] = {}
+        step("qm_prof", "FAIL", reason=type(e).__name__)
+    # analyst estimates
+    est = {}
+    try:
+        src = _open(sb, base + "analyst-estimates", r"Financial Estimates|In \d+ years|analysts", open_page)
+        if not src:
+            step("qm_est", "FAIL", reason="blocked")
+        else:
+            for tab, key in (("Revenue", "rev"), ("Operating Income", "opi")):
+                text = ""
+                for attempt in (1, 2, 3):
                     how = sb.execute_script(TAB_CLICK_JS, tab)
                     sb.sleep(2.5)
-                    tab_html = sb.get_page_source()
-                    tab_text = plain(tab_html)
-                    tabs[tab] = {"click": how, "found": snippets(tab_text, ["In 3 years", "Only \\d+ analysts", "projected CAGR", "compound annual growth rate"])}
-                    if rep == 1:
-                        save("{}_estimates_tab_{}.html".format(stock.replace("/", "_"), tab.replace(" ", "")), tab_html)
-                except Exception as e:
-                    tabs[tab] = {"click": how, "error": type(e).__name__}
-            rec["tabs"] = tabs
-    rec["seconds"] = round(time.time() - t0, 1)
-    results.append(rec)
-    print("[{}] {} rep{}: {} cf={} missing={} ({:.0f}s)".format(stock, name, rep, "OK" if rec["ok"] else "FAIL", hits, rec.get("missing_phrases", "-"), rec["seconds"]))
-    return rec
-
-
-def snippet_signature(rec):
-    return {p: v["snippets"][:1] for p, v in (rec.get("found") or {}).items()}
-
-
-def summary():
-    lines = ["| stock | page | loads ok | Cloudflare hits | stable on repeat | phrases missing |", "|---|---|---|---|---|---|"]
-    keys = []
-    for r in results:
-        k = (r["stock"], r["page"])
-        if k not in keys:
-            keys.append(k)
-    for stock, page in keys:
-        rs = [r for r in results if r["stock"] == stock and r["page"] == page]
-        ok = sum(1 for r in rs if r["ok"])
-        sigs = [json.dumps(snippet_signature(r), sort_keys=True) for r in rs if r["ok"]]
-        stable = "-" if len(sigs) < 2 else ("yes" if len(set(sigs)) == 1 else "NO")
-        miss = sorted({m for r in rs for m in r.get("missing_phrases", [])})
-        lines.append("| {} | {} | {}/{} | {} | {} | {} |".format(stock, page, ok, len(rs), sum(r["cloudflare_hits"] for r in rs), stable, "; ".join(miss)[:110]))
-    text = "\n".join(lines)
-    print("\n" + text)
-    p = os.environ.get("GITHUB_STEP_SUMMARY")
-    if p:
-        with open(p, "a", encoding="utf-8") as h:
-            h.write("## AS Quality Model page test\n" + text + "\n")
-
-
-def main():
-    print("as_qm_test v2 | stocks: {} | repeats: {} | fresh browser per stock+repeat".format(PATHS, REPEATS))
-    for stock in PATHS:
-        for rep in range(1, REPEATS + 1):
-            # production opens ONE stock per fresh browser; a reused session only unlocks the first stock
-            with SB(uc=True, headless=False, locale_code="en") as sb:
-                for name in PAGES:
-                    try:
-                        run_page(sb, stock, name, rep)
-                    except Exception as e:
-                        print("[{}] {} rep{} aborted: {}".format(stock, name, rep, type(e).__name__))
-                    sb.sleep(2.5)
-    with open("results_qm.json", "w", encoding="utf-8") as h:
-        json.dump(results, h, ensure_ascii=False, indent=1)
-    summary()
-
-
-if __name__ == "__main__":
-    main()
+                    text = plain_text(sb.get_page_source())
+                    p = parse_estimates(text, "Revenue" if key == "rev" else "Operating Income")
+                    if p["three"] is not None or p["only"] or attempt == 3:
+                        break
+                    sb.sleep(2.0)
+                est[key] = p
+            r, o = est.get("rev", {}), est.get("opi", {})
+            qm["est"] = {"rev3": r.get("three"), "rev3_n": r.get("three_n"), "rev_only": r.get("only"), "rev_cagr_fwd": r.get("cagr_fwd"),
+                         "rev_cagr_fwd_years": r.get("cagr_fwd_years"), "opi3": o.get("three"), "opi3_n": o.get("three_n"), "opi_only": o.get("only"),
+                         "opi_cagr_fwd": o.get("cagr_fwd"), "opi_cagr_fwd_years": o.get("cagr_fwd_years"),
+                         "rev_lt": r.get("cagr_hist"), "rev_lt_years": r.get("cagr_hist_years")}
+            step("qm_est", "OK" if (r.get("three") is not None or r.get("cagr_fwd") is not None) else "FAIL",
+                 rev3=r.get("three"), opi3=o.get("three"), rev_lt=r.get("cagr_hist"), only=(r.get("only"), o.get("only")))
+    except Exception as e:
+        step("qm_est", "FAIL", reason=type(e).__name__ + ": " + str(e)[:60])
+    # solvency
+    try:
+        src = _open(sb, base + "solvency", r"Net\s+Debt|Altman", open_page)
+        qm["solv"] = parse_solvency(plain_text(src)) if src else {}
+        step("qm_solv", "OK" if qm["solv"].get("bankr") is not None else "FAIL", **{k: v for k, v in qm["solv"].items() if v is not None})
+    except Exception as e:
+        qm["solv"] = {}
+        step("qm_solv", "FAIL", reason=type(e).__name__)
+    # data the scraper already holds
+    if buyback:
+        qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
+    if moat:
+        qm["moat"] = moat.get("rating")
+    if now_block:
+        lv, sg = now_block.get("levels") or {}, now_block.get("signals") or {}
+        qm["ttm"] = {"rev_growth": sg.get("rev_growth"), "rev_accel": sg.get("rev_accel"), "nd_ebitda": lv.get("nd_ebitda_ttm"),
+                     "nd_ebitda_prev": lv.get("nd_ebitda_prev"), "int_cover": lv.get("interest_cover_ttm"), "sbc_pct_rev": lv.get("sbc_pct_rev"),
+                     "warnings": now_block.get("warnings")}
+    if not qm.get("prof") and not qm.get("est"):
+        return {}
+    return qm
