@@ -295,8 +295,8 @@ return done;
 """
 
 
-# the moat page prints the heading text early, the rating strip later: wait for the complete strip, not just the heading
-MOAT_READY = r"(?:Wide|Narrow|None|No)\s+Economic\s+Moat\s+No\s+Moat\s+Narrow\s+Wide\s+What is Economic Moat\?"
+# same wait condition the production quality step uses (provider_json_scraper.fetch_as_quality): the heading text is enough
+MOAT_READY = r"What is Economic Moat\?"
 
 
 def millions_ready(src):
@@ -339,9 +339,10 @@ def ensure_millions(sb, url, source, open_page, step):
     return source, False
 
 
-def fetch_as_fin(sb, abbrev_as, step, open_page):
+def fetch_as_fin(sb, abbrev_as, step, open_page, moat_hint=None):
     """Browser routine. open_page(sb, url) must open the URL and return the page source ('' when blocked). Returns the AS Fin JSON dict or None.
-    Never raises."""
+    Never raises.
+    moat_hint: rating already read by the quality step (as_moat) in this same run; when given, the moat page is not opened again.""" 
     base = BASE.format(str(abbrev_as).strip().strip("/"))
     parts, rounded = {}, False
     for group, path in PAGES.items():
@@ -369,16 +370,19 @@ def fetch_as_fin(sb, abbrev_as, step, open_page):
     except Exception as e:
         step("fin_solvency", "FAIL", reason=type(e).__name__)
     try:
-        for moat_try in (1, 2):   # the rating strip sometimes renders late or not at all: a second load usually has it
-            moat_html = open_page(sb, base + "qualitative/block/economic-moat", MOAT_READY) or ""
-            try:
-                import as_moat
-                moat_rating = as_moat.parse_moat(moat_html).get("rating") if moat_html else None
-            except Exception:
-                moat_rating = None
-            if moat_rating:
-                break
-        step("fin_moat", "OK" if moat_rating else "INFO", rating=moat_rating)
+        if moat_hint:
+            moat_rating = parse_moat_rating(moat_hint)
+        else:
+            for moat_try in (1, 2):   # second load only when the first gave no rating
+                moat_html = open_page(sb, base + "qualitative/block/economic-moat", MOAT_READY) or ""
+                try:
+                    import as_moat
+                    moat_rating = as_moat.parse_moat(moat_html).get("rating") if moat_html else None
+                except Exception:
+                    moat_rating = None
+                if moat_rating:
+                    break
+        step("fin_moat", "OK" if moat_rating else "INFO", rating=moat_rating, source="quality step" if moat_hint else "own page load")
     except Exception as e:
         step("fin_moat", "FAIL", reason=type(e).__name__)
     try:
