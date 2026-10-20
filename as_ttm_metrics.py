@@ -1,5 +1,6 @@
 """
-as_ttm_metrics.py v1.3 (TTM can be built from the Quarterly view when the TTM toggle fails)
+as_ttm_metrics.py v1.4 (levels sbc_pct_rev and nd_ebitda_prev for the Quality Model)
+v1.3 (TTM can be built from the Quarterly view when the TTM toggle fails)
 v1.2 (profile argument; FIN skips FCF and gross-margin signals; implausible >40pp margin changes ignored)
 v1.1 (cell parts joined with a space: "TTM<br>Mar 2024" is read as "TTM Mar 2024") -- "Now" signals from AlphaSpread TTM (income statement, cash flow) and Quarterly (balance sheet) views.
 
@@ -224,7 +225,10 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
         out["warnings"].append("income TTM ends {} but cash flow TTM ends {}".format(latest, cp[-1]))
         latest = min(latest, cp[-1])
     out["details"]["latest"] = latest
+    _sbc = _g(cfs, "Stock-Based Compensation", latest)   # v1.4
     prev = _shift(latest, -12)
+    if _sbc is not None and now_w["revenue"]:
+        out["levels"]["sbc_pct_rev"] = 100.0 * abs(_sbc) / now_w["revenue"]
     prev2 = _shift(latest, -24)
     now_w, prev_w = _window(inc, cfs, latest), _window(inc, cfs, prev)
     out["levels"] = {"revenue_ttm": now_w["revenue"], "gm": now_w["gm"], "om": now_w["om"], "fcfm_after_sbc": now_w["fcfm"]}
@@ -281,5 +285,17 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
         interest = _g(inc, "Interest Expense", latest)
         if op is not None and interest:
             out["levels"]["interest_cover_ttm"] = op / abs(interest)
+        try:   # v1.4: the same ratio one year earlier (balance sheet quarter 12 months back, TTM window 12 months back)
+            qp = _shift(q, -12)
+            if qp in bp and prev_w.get("operating_income") is not None:
+                da_p = _g(cfs, "Depreciation & Amortization", prev)
+                if da_p is not None:
+                    debt_p = sum(_g(bal, l, qp) or 0.0 for l in DEBT_LABELS) + _lease_total(bal, qp)
+                    cash_p = (_first(bal, ["Cash & Cash Equivalents", "Cash Equivalents"], qp) or 0.0) + (_g(bal, "Short-Term Investments", qp) or 0.0)
+                    e_p = prev_w["operating_income"] + da_p
+                    nd_p = debt_p - cash_p
+                    out["levels"]["nd_ebitda_prev"] = (nd_p / e_p) if e_p > 0 else (-1.0 if nd_p <= 0 else None)
+        except Exception:
+            pass
         out["details"]["leverage"] = lev
     return out
