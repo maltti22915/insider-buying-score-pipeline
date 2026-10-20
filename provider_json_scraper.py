@@ -2382,19 +2382,25 @@ _AS_QM = {}
 
 
 def _as_fin_open_page(sb, url, ready_pattern):
-    """v47: opens one AlphaSpread page and waits until ready_pattern shows in the page text; '' when it stays a Cloudflare page."""
-    for attempt in (1, 2):
+    """v47/v48: opens one AlphaSpread page and waits until ready_pattern shows in the page text; '' when it stays a Cloudflare page.
+    v48: 3 attempts, each with a wait and a verification click when Cloudflare shows."""
+    for attempt in (1, 2, 3):
         sb.uc_open_with_reconnect(url, 4)
         source = ""
-        for _ in range(14):
+        for tick in range(14):
             source = sb.get_page_source()
             if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
                 return source
-            if "just a moment" in (sb.get_title() or "").lower():
+            if "just a moment" in (sb.get_title() or "").lower() and tick >= 3:
                 break
             sb.sleep(1.5)
         if "just a moment" in (sb.get_title() or "").lower():
-            sb.sleep(15 * attempt)
+            sb.sleep(20 * attempt)
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(4.0)
+            except Exception:
+                pass
             continue
         return source
     return ""
