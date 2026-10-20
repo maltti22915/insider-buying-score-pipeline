@@ -295,6 +295,46 @@ return done;
 """
 
 
+def millions_ready(src):
+    """True when the page says 'Scale: Millions' AND the statement table shows no B/T suffix (a half-rendered table fails the second test)."""
+    if 'Scale: Millions' not in (src or ""):
+        return False
+    tables = re.findall(r"<table.*?</table>", src, re.S)
+    tables.sort(key=lambda x: -len(re.findall(r"FY\s*20\d\d", x)))
+    text = re.sub(r"<[^>]+>", " ", tables[0] if tables else "")
+    return not re.search(r"\d\s?[BT]\b", text)
+
+
+def ensure_millions(sb, url, source, open_page, step):
+    """Switches the statement table to Millions (3 attempts: switch, switch again, reload + switch). The success test is the page itself
+    ('Scale: Millions' + no B/T in the table), never 'the page changed' (a loading state also changes it). Returns (source, millions_bool)."""
+    if millions_ready(source):
+        step("OK", how="already", attempt=0)
+        return source, True
+    for attempt in (1, 2, 3):
+        try:
+            if attempt == 3:
+                reloaded = open_page(sb, url, r"FY\s*20\d\d")
+                if not reloaded:
+                    step("INFO", how="reload blocked", attempt=attempt)
+                    break
+                source = reloaded
+                if millions_ready(source):
+                    step("OK", how="already after reload", attempt=attempt)
+                    return source, True
+            how = sb.execute_script(_SET_MILLIONS_JS)
+            for _ in range(14):
+                sb.sleep(1.0)
+                now = sb.get_page_source()
+                if millions_ready(now):
+                    step("OK", how=how, attempt=attempt)
+                    return now, True
+            step("INFO", how=how, attempt=attempt, reason="not Millions after 14 s")
+        except Exception as e:
+            step("INFO", reason=type(e).__name__, attempt=attempt)
+    return source, False
+
+
 def fetch_as_fin(sb, abbrev_as, step, open_page):
     """Browser routine. open_page(sb, url) must open the URL and return the page source ('' when blocked). Returns the AS Fin JSON dict or None.
     Never raises."""
@@ -306,20 +346,7 @@ def fetch_as_fin(sb, abbrev_as, step, open_page):
             if not source:
                 step("fin_" + group, "FAIL", reason="blocked")
                 return None
-            millions = False
-            try:
-                how = sb.execute_script(_SET_MILLIONS_JS)
-                if how in ("select", "clicked"):
-                    for _ in range(10):
-                        sb.sleep(1.0)
-                        new_source = sb.get_page_source()
-                        if new_source != source:
-                            source = new_source
-                            millions = True
-                            break
-                step("fin_unit_" + group, "OK" if millions else "INFO", how=how, millions=millions)
-            except Exception as unit_error:
-                step("fin_unit_" + group, "INFO", reason=type(unit_error).__name__)
+            source, millions = ensure_millions(sb, base + path, source, open_page, lambda *a, **k: step("fin_unit_" + group, *a, **k))
             if not millions:
                 rounded = True
             order, series, info = parse_statement(source, group, unit_selected_millions=millions)
