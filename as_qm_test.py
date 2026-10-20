@@ -152,10 +152,11 @@ def summary():
 
 
 def main():
-    print("as_qm_test v1 | stocks: {} | repeats: {}".format(PATHS, REPEATS))
-    with SB(uc=True, headless=False, locale_code="en") as sb:
-        for stock in PATHS:
-            for rep in range(1, REPEATS + 1):
+    print("as_qm_test v2 | stocks: {} | repeats: {} | fresh browser per stock+repeat".format(PATHS, REPEATS))
+    for stock in PATHS:
+        for rep in range(1, REPEATS + 1):
+            # production opens ONE stock per fresh browser; a reused session only unlocks the first stock
+            with SB(uc=True, headless=False, locale_code="en") as sb:
                 for name in PAGES:
                     try:
                         run_page(sb, stock, name, rep)
