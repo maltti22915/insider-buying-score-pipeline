@@ -26,11 +26,12 @@ PAGES = {
     "cf": "financials/cash-flow-statement",
 }
 SLUGS = {
-    "is": ["revenue", "operating-income", "pre-tax-income", "tax-provision", "net-income-common", "eps-diluted", "interest-expense"],
+    "is": ["revenue", "operating-income", "pre-tax-income", "tax-provision", "net-income-common", "eps-diluted"],
     "bs": ["cash-cash-equivalents", "short-term-investments", "short-term-debt", "current-portion-of-long-term-debt", "long-term-debt",
            "total-equity", "goodwill", "common-shares-outstanding"],
     "cf": ["cash-from-operating-activities", "capital-expenditures", "free-cash-flow", "stock-based-compensation", "depreciation-amortization"],
 }
+OPTIONAL = {"is": ["interest-expense", "interest-income-expense"]}   # not every company has them (ADSK only has the net row); never reported as missing
 NO_SCALE = {"eps-diluted"}   # per-share values are not money in millions
 
 # fallback when a row has no link: visible English label (lower case) -> slug
@@ -38,7 +39,7 @@ LABEL_TO_SLUG = {
     "revenue": "revenue", "total revenue": "revenue", "operating income": "operating-income", "pre-tax income": "pre-tax-income",
     "income before tax": "pre-tax-income", "tax provision": "tax-provision", "income tax": "tax-provision",
     "net income common": "net-income-common", "net income to common": "net-income-common", "eps diluted": "eps-diluted", "diluted eps": "eps-diluted",
-    "interest expense": "interest-expense", "cash & cash equivalents": "cash-cash-equivalents", "cash and cash equivalents": "cash-cash-equivalents",
+    "interest expense": "interest-expense", "interest income (expense)": "interest-income-expense", "cash & cash equivalents": "cash-cash-equivalents", "cash and cash equivalents": "cash-cash-equivalents",
     "short-term investments": "short-term-investments", "short term investments": "short-term-investments", "short-term debt": "short-term-debt",
     "short term debt": "short-term-debt", "current portion of long-term debt": "current-portion-of-long-term-debt",
     "long-term debt": "long-term-debt", "long term debt": "long-term-debt", "total equity": "total-equity", "goodwill": "goodwill",
@@ -62,7 +63,9 @@ def normalise_units(text):
 def parse_value(text, unit_selected_millions=True):
     """Returns (value_in_millions or None). '(419.1m)' -> -419.1; '1.3B' -> 1300; plain '1,234.5' is millions when the unit selector is on
     Millions, else raw units (-> /1e6). '—', '', '-' -> None."""
-    s = normalise_units(text).strip().replace(",", "").replace("$", "").replace("¥", "").replace("€", "")
+    s = normalise_units(text).strip()
+    s = re.sub(r"(?<=\d)[\u00a0\u202f\u2009 ](?=\d)", "", s)   # "37 792" (space / thin space as thousands separator) -> "37792"
+    s = s.replace(",", "").replace("$", "").replace("¥", "").replace("€", "")
     if s in ("", "-", "—", "–", "N/A", "n/a", "NaN", "nan"):
         return None
     neg = (s.startswith("(") and s.endswith(")")) or s.startswith("-") or s.startswith("−")
@@ -143,7 +146,8 @@ def parse_statement(html, group, unit_selected_millions=True):
         if m:
             col_label[index] = "FY" + m.group(1)
     order = sorted(set(col_label.values()))
-    wanted = set(SLUGS[group])
+    required = set(SLUGS[group])
+    wanted = required | set(OPTIONAL.get(group, []))
     series = {}
     for row in table:
         if not row or row is header:
@@ -159,7 +163,7 @@ def parse_statement(html, group, unit_selected_millions=True):
                     v = v * 1e6   # per-share rows are not scaled
                 by_label[label] = v
         series[slug] = [by_label.get(l) for l in order]
-    return order, series, {"columns": len(header), "rows": len(series), "missing": sorted(wanted - set(series))}
+    return order, series, {"columns": len(header), "rows": len(series), "missing": sorted(required - set(series))}
 
 
 def merge_statements(parts):
