@@ -51,7 +51,10 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v4
+VERSION: as_dcf_extractor v5
+v5 -- 2026-10-20: Cloudflare page handling. In the SAP runs of 2026-10-20 all 5 attempts stayed on the "Performing security verification ... Verification
+   successful. Waiting for www.alphaspread.com to respond" page for the whole 15 s wait and were reported as VIEW_CALCULATION_NOT_FOUND. Now, right after the page is
+   opened, _pass_cloudflare() waits for the page to clear (up to 25 s), tries the verification click, and re-opens the URL (up to 3 rounds) before the normal waits start.
 v4 -- Requested directly (another AI chat that reads the stored "AS JSON" needed the
       exact model assumptions). New key "assumptions" in the returned data, read
       from the page's own "Model settings" rows and header with NO extra click
@@ -131,7 +134,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v4"
+VERSION = "as_dcf_extractor v5"
 PROBE_AFTER_SECONDS = 15
 MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
@@ -736,6 +739,45 @@ def probe_page(sb, reason):
         _log("⚠️ probe failed (the real error is unaffected): {}".format(probe_error))
 
 
+def _is_cloudflare(sb):
+    try:
+        return "just a moment" in (sb.get_title() or "").lower()
+    except Exception:
+        return False
+
+
+def _pass_cloudflare(sb, url, rounds=3, wait_seconds=25):
+    """v5: returns True when the page is NOT the Cloudflare page any more. Each round: wait up to wait_seconds for the page to clear by itself, then try the
+    verification click, then re-open the URL. Never raises."""
+    for round_no in range(1, rounds + 1):
+        waited = 0
+        while waited < wait_seconds:
+            if not _is_cloudflare(sb):
+                if round_no > 1 or waited > 0:
+                    _log("Cloudflare page cleared (round {}, after {}s)".format(round_no, waited))
+                return True
+            time.sleep(1.0)
+            waited += 1
+        _log("Cloudflare page still showing after {}s (round {}/{})".format(wait_seconds, round_no, rounds))
+        try:
+            sb.uc_gui_click_captcha()
+            time.sleep(4.0)
+            if not _is_cloudflare(sb):
+                _log("Cloudflare page cleared by the verification click")
+                return True
+        except Exception as click_error:
+            _log("verification click not possible: {}".format(type(click_error).__name__))
+        if round_no < rounds:
+            try:
+                sb.uc_open_with_reconnect(url, 6)
+            except Exception:
+                try:
+                    sb.open(url)
+                except Exception:
+                    pass
+    return not _is_cloudflare(sb)
+
+
 def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_interval=0.5, probe_after=PROBE_AFTER_SECONDS):
     """Open the DCF page, open View Calculation -> Full Model, return the data dict."""
     abbrev = str(abbrev_as or "").strip().strip("/")
@@ -750,6 +792,10 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
         sb.uc_open_with_reconnect(url, 6)
     except AttributeError:
         sb.open(url)
+
+    # 0a. (v5) a Cloudflare page instead of the DCF page: give it time / retry before the normal waits start
+    if _is_cloudflare(sb):
+        _pass_cloudflare(sb, url)
 
     # 0. (v3) make sure browser scripts really run before waiting for anything
     _check_js_channel(sb)
