@@ -2215,6 +2215,7 @@ def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 # v18: structural quality metrics (as_quality_metrics.py) from the AlphaSpread statement pages
 # ----------------------------------------------------------------------------
 _AS_QUALITY = {}
+_QM_SRC = {}   # v48: moat block + TTM "now" block, kept even when an annual statement page is blocked and fetch_as_quality gives up
 _QM_PROF = {"html": ""}   # v48: profitability page of the current stock, reused by the Quality Model step
 AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/income-statement"),
                     ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
@@ -2257,6 +2258,8 @@ def _as_click_view(sb, toggle):
 def fetch_as_quality(sb, abbrev_as):
     """Never raises: the DCF must not depend on it. Fills _AS_QUALITY with the metrics dict (see as_quality_metrics)."""
     _AS_QUALITY.clear()
+    _QM_SRC.clear()
+    _QM_PROF["html"] = ""
     try:
         import as_quality_metrics
     except Exception as import_error:
@@ -2266,14 +2269,27 @@ def fetch_as_quality(sb, abbrev_as):
     pages, ttm_pages, q_pages = {}, {}, {}
     for name, path in AS_QUALITY_PAGES:
         try:
-            sb.uc_open_with_reconnect(base + path, 4)
             source = ""
-            for _ in range(14):
-                source = sb.get_page_source()
-                ready = ("3Y Average ROIC" in source) if name == "profitability" else bool(re.search(r"FY\s*20\d\d", source))
-                if ready:
+            for open_try in (1, 2, 3):   # v48: a Cloudflare page in the middle of the run is retried (wait, verification click, reopen)
+                sb.uc_open_with_reconnect(base + path, 4)
+                source = ""
+                for _ in range(14):
+                    source = sb.get_page_source()
+                    ready = ("3Y Average ROIC" in source) if name == "profitability" else bool(re.search(r"FY\s*20\d\d", source))
+                    if ready:
+                        break
+                    if "just a moment" in (sb.get_title() or "").lower() and _ >= 4:
+                        break
+                    sb.sleep(1.5)
+                if "just a moment" not in (sb.get_title() or "").lower():
                     break
-                sb.sleep(1.5)
+                step("quality_" + name, "INFO", note="Cloudflare page, retry {}".format(open_try))
+                sb.sleep(20 * open_try)
+                try:
+                    sb.uc_gui_click_captcha()
+                    sb.sleep(4.0)
+                except Exception:
+                    pass
             if "just a moment" in (sb.get_title() or "").lower():
                 step("quality_" + name, "FAIL", reason="blocked")
                 continue
@@ -2298,6 +2314,17 @@ def fetch_as_quality(sb, abbrev_as):
         step("quality_moat_page", "OK", chars=len(moat_source))
     except Exception as moat_page_error:
         step("quality_moat_page", "FAIL", reason=type(moat_page_error).__name__)
+    try:   # v48: moat + TTM block for the Quality Model, independent of the annual statement pages
+        if moat_source:
+            import as_moat
+            _QM_SRC["moat"] = as_moat.parse_moat(moat_source)
+        if ttm_pages.get("income") or q_pages.get("income"):
+            import as_ttm_metrics
+            _QM_SRC["now"] = as_ttm_metrics.compute_now(ttm_pages.get("income", ""), ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
+                                                        income_q_html=q_pages.get("income", ""), cashflow_q_html=q_pages.get("cashflow", ""))
+        step("qm_src", "OK", moat=(_QM_SRC.get("moat") or {}).get("rating"), ttm=bool((_QM_SRC.get("now") or {}).get("signals")))
+    except Exception as qm_src_error:
+        step("qm_src", "FAIL", reason=type(qm_src_error).__name__ + ": " + str(qm_src_error)[:60])
     if not all(k in pages for k in ("income", "balance", "cashflow")):
         step("quality", "FAIL", reason="statement pages missing: " + ",".join(sorted(pages.keys())))
         return
@@ -2388,8 +2415,8 @@ def fetch_as_qm(sb, abbrev_as):
     try:
         qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
                                     buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
-                                    moat=_AS_QUALITY.get("moat") if isinstance(_AS_QUALITY, dict) else None,
-                                    now_block=_AS_QUALITY.get("now") if isinstance(_AS_QUALITY, dict) else None)
+                                    moat=(_AS_QUALITY.get("moat") or _QM_SRC.get("moat")),
+                                    now_block=(_AS_QUALITY.get("now") or _QM_SRC.get("now")))
         if qm:
             _AS_QM.update(qm)
             step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
