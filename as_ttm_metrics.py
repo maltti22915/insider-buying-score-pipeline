@@ -227,14 +227,16 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     out["details"]["latest"] = latest
     _sbc = _g(cfs, "Stock-Based Compensation", latest)   # v1.4
     prev = _shift(latest, -12)
-    if _sbc is not None and now_w["revenue"]:
-        out["levels"]["sbc_pct_rev"] = 100.0 * abs(_sbc) / now_w["revenue"]
     prev2 = _shift(latest, -24)
     now_w, prev_w = _window(inc, cfs, latest), _window(inc, cfs, prev)
+    if _sbc is not None and now_w["revenue"]:   # v1.4
+        out.setdefault("_sbc", 100.0 * abs(_sbc) / now_w["revenue"])
     out["levels"] = {"revenue_ttm": now_w["revenue"], "gm": now_w["gm"], "om": now_w["om"], "fcfm_after_sbc": now_w["fcfm"]}
     if prev not in ip:
         out["warnings"].append("no TTM window 12 months before {}: no change signals".format(latest))
         return out
+    if "_sbc" in out:
+        out["levels"]["sbc_pct_rev"] = out.pop("_sbc")
     sig = out["signals"]
     if now_w["revenue"] and prev_w["revenue"]:
         growth = 100.0 * (now_w["revenue"] / prev_w["revenue"] - 1.0)
