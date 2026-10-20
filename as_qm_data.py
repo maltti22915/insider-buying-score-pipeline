@@ -96,7 +96,8 @@ def parse_estimates(text, metric="Revenue"):
 
 def parse_solvency(text):
     out = {"bankr": None, "net_cash": None, "net_debt_text": None}
-    m = re.search(r"probability of bankruptcy is " + NUM + r"\s*%", text)
+    m = (re.search(r"probability of bankruptcy is " + NUM + r"\s*%", text, re.I) or re.search(r"Bankruptcy Probability.{0,80}?" + NUM + r"\s*%", text, re.I)
+         or re.search(r"Probability of Bankruptcy\s+" + NUM + r"\s*%", text, re.I))
     if m:
         out["bankr"] = _f(m.group(1))
     m = re.search(r"(Negative|Positive) Net Debt\s+(-?[\d.,]+\s*[KMBT]?\s*[A-Z]{3})", text)
@@ -136,9 +137,12 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
                     sb.sleep(2.5)
                     text = plain_text(sb.get_page_source())
                     p = parse_estimates(text, "Revenue" if key == "rev" else "Operating Income")
-                    if p["three"] is not None or p["only"] or attempt == 3:
+                    same_as_rev = key == "opi" and p["three"] is not None and (est.get("rev") or {}).get("three") == p["three"]   # tab did not switch
+                    if (p["three"] is not None and not same_as_rev) or p["only"] or attempt == 3:
+                        if same_as_rev:
+                            p["three"] = None
                         break
-                    sb.sleep(2.0)
+                    sb.sleep(3.0 * attempt)
                 est[key] = p
             r, o = est.get("rev", {}), est.get("opi", {})
             qm["est"] = {"rev3": r.get("three"), "rev3_n": r.get("three_n"), "rev_only": r.get("only"), "rev_cagr_fwd": r.get("cagr_fwd"),
@@ -153,7 +157,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     try:
         src = _open(sb, base + "solvency", r"Net\s+Debt|Altman", open_page)
         qm["solv"] = parse_solvency(plain_text(src)) if src else {}
-        step("qm_solv", "OK" if qm["solv"].get("bankr") is not None else "FAIL", **{k: v for k, v in qm["solv"].items() if v is not None})
+        step("qm_solv", "OK" if (qm["solv"].get("bankr") is not None or qm["solv"].get("net_cash") is not None) else "FAIL", **{k: v for k, v in qm["solv"].items() if v is not None})
     except Exception as e:
         qm["solv"] = {}
         step("qm_solv", "FAIL", reason=type(e).__name__)
