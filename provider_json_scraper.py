@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v48: Quality Model (QL / Dir / Outl / Q) replaces Quality v2: new step fetch_as_qm (as_qm_data.py) reads the analyst-estimates and solvency pages and bundles them with the profitability checklist, buyback, moat and TTM block already read; posted as target ASQM (fn_91_12) into "QM JSON". The 10-year statement scrape (fetch_as_fin / as_fin_data) is retired. Env AS_FIN="0" still skips it.
   v47: Quality v2 -- new step fetch_as_fin (as_fin_data.py): annual income statement / balance sheet / cash flow (unit selector set to Millions), solvency, moat and 3Y ROIC pages become the "AS Fin JSON" posted as target ASFIN (fn_91_11). Env AS_FIN="0" skips it (the sheet keeps a JSON younger than 30 days).
   v46: AlphaSpread run blocked by Cloudflare (DCF failed + 2 blocked pages): stops at once and is retried with a fresh browser after 30-60 s (up to 3 attempts, budget 800 s); the scores step no longer waits 20 s on a challenge page.
   v45: AS Profitability / Solvency cards: scrolls the card heading into view and reloads the page once when no score shows (AMZN had empty cards).
@@ -2214,6 +2215,7 @@ def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 # v18: structural quality metrics (as_quality_metrics.py) from the AlphaSpread statement pages
 # ----------------------------------------------------------------------------
 _AS_QUALITY = {}
+_QM_PROF = {"html": ""}   # v48: profitability page of the current stock, reused by the Quality Model step
 AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/income-statement"),
                     ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
 
@@ -2277,6 +2279,8 @@ def fetch_as_quality(sb, abbrev_as):
                 continue
             pages[name] = source
             step("quality_" + name, "OK", chars=len(source))
+            if name == "profitability":
+                _QM_PROF["html"] = source
             if name in AS_TTM_TOGGLE:  # v21: same page, other view (TTM / Quarterly); never blocks the annual metrics
                 ttm_pages[name] = _as_click_view(sb, AS_TTM_TOGGLE[name])
                 if name in ("income", "cashflow") and not ttm_pages[name]:  # v45: TTM toggle failed -> the Quarterly toggle (reliable) gives 4-quarter sums
@@ -2347,7 +2351,7 @@ def fetch_as_quality(sb, abbrev_as):
     step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none", roic_scale=diag.get("roic_scale"), roic_min5=(result["metrics"].get("roic_min5") if result.get("metrics") else None))
 
 
-_AS_FIN = {}
+_AS_QM = {}
 
 
 def _as_fin_open_page(sb, url, ready_pattern):
@@ -2369,44 +2373,45 @@ def _as_fin_open_page(sb, url, ready_pattern):
     return ""
 
 
-def fetch_as_fin(sb, abbrev_as):
-    """v47: Quality v2 raw data (AS Fin JSON). Never raises: the DCF and the other AlphaSpread steps must not depend on it."""
-    _AS_FIN.clear()
+def fetch_as_qm(sb, abbrev_as):
+    """v48: Quality Model raw data (QM JSON): profitability checklist, analyst estimates, solvency + buyback / moat / TTM already read. Never raises.
+    Env AS_FIN="0" (workflow input as_fin) skips it."""
+    _AS_QM.clear()
     if os.environ.get("AS_FIN", "1") == "0":
-        step("fin", "INFO", note="AS_FIN=0: stored AS Fin JSON is still fresh")
+        step("qm", "INFO", note="AS_FIN=0: Quality Model data not refreshed")
         return
     try:
-        import as_fin_data
+        import as_qm_data
     except Exception as import_error:
-        step("fin", "FAIL", reason="as_fin_data.py missing: " + type(import_error).__name__)
+        step("qm", "FAIL", reason="as_qm_data.py missing: " + type(import_error).__name__)
         return
     try:
-        hint = None
-        try:
-            hint = ((_AS_QUALITY.get("moat") or {}).get("rating")) if isinstance(_AS_QUALITY, dict) else None
-        except Exception:
-            hint = None
-        fin = as_fin_data.fetch_as_fin(sb, abbrev_as, step, _as_fin_open_page, moat_hint=hint)
-        if fin:
-            _AS_FIN.update(fin)
-            step("fin", "OK", years=len(fin.get("fy") or []), moat=fin.get("moat"), roic3y=fin.get("roic3y_as"), flags=",".join(fin.get("flags") or []) or "none")
-    except Exception as fin_error:
-        step("fin", "FAIL", reason=type(fin_error).__name__ + ": " + str(fin_error)[:60])
+        qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
+                                    buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
+                                    moat=_AS_QUALITY.get("moat") if isinstance(_AS_QUALITY, dict) else None,
+                                    now_block=_AS_QUALITY.get("now") if isinstance(_AS_QUALITY, dict) else None)
+        if qm:
+            _AS_QM.update(qm)
+            step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
+        else:
+            step("qm", "FAIL", reason="nothing read")
+    except Exception as qm_error:
+        step("qm", "FAIL", reason=type(qm_error).__name__ + ": " + str(qm_error)[:60])
 
 
-def post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info):
-    """v47: posts the AS Fin JSON once (target ASFIN); never touches the DCF result."""
-    if not _AS_FIN:
+def post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v48: posts the Quality Model data once (target ASQM, fn_91_12); never touches the DCF result."""
+    if not _AS_QM:
         return
-    fin = dict(_AS_FIN)
-    _AS_FIN.clear()
+    qm = dict(_AS_QM)
+    _AS_QM.clear()
     saved_post = dict(_LAST_POST)
     try:
-        posted = post_provider_json(webhook_url, "ASFIN", row_number, abbrev, sheet_name, {"fin": fin})
-        info["fin"] = {"posted": bool(posted), "years": len(fin.get("fy") or []), "reason": None if posted else _LAST_POST.get("reason")}
-    except Exception as fin_post_error:
-        print("❌ AS Fin post failed: {}".format(fin_post_error))
-        info["fin"] = {"posted": False, "reason": str(fin_post_error)[:80]}
+        posted = post_provider_json(webhook_url, "ASQM", row_number, abbrev, sheet_name, {"qm": qm})
+        info["qm"] = {"posted": bool(posted), "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as qm_post_error:
+        print("❌ Quality Model post failed: {}".format(qm_post_error))
+        info["qm"] = {"posted": False, "reason": str(qm_post_error)[:80]}
     finally:
         _LAST_POST.clear()
         _LAST_POST.update(saved_post)
@@ -2492,9 +2497,9 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         if os.environ.get("AS_QUALITY", "1") != "0":
             _stop_if_blocked()
             fetch_as_quality(sb, abbrev_as)
-        if os.environ.get("AS_FIN", "1") != "0":   # v47: Quality v2 raw data, only when the sheet's stored JSON is missing or older than 30 days
+        if os.environ.get("AS_FIN", "1") != "0":   # v48: Quality Model raw data (QM JSON)
             _stop_if_blocked()
-            fetch_as_fin(sb, abbrev_as)
+            fetch_as_qm(sb, abbrev_as)
 
     if SAVE_DIAGNOSTICS_ALWAYS:
         save_as_diagnostics(sb, row_number, "always-on")
@@ -2868,7 +2873,7 @@ def run_bot():
         if target == "ASDCF":
             _AS_RATIOS.clear()
             _AS_QUALITY.clear()
-            _AS_FIN.clear()
+            _AS_QM.clear()
         provider_clock = time.monotonic()
 
         # Each provider in its OWN try/except: one failing can never
@@ -2923,7 +2928,7 @@ def run_bot():
                             elif target == "ASDCF":
                                 post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                                 post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
-                                post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                                post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         except BaseException as inner_error:
                             swallowed_error.append(inner_error)
                             raise
@@ -2952,7 +2957,7 @@ def run_bot():
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
-                        post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     continue
 
                 except Exception as scrape_error:
@@ -2970,7 +2975,7 @@ def run_bot():
                     elif target == "ASDCF":
                         post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                         post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
-                        post_as_fin_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
                     if not browser_ready:
                         # The browser itself could not start (e.g. no display
                         # for headed mode) -- try the next mode.
