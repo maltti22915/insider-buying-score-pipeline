@@ -1568,6 +1568,27 @@ def _as_num(text):
     return float(found.group(0).replace(",", "")) if found else None
 
 
+def _as_open_cf(sb, url, reconnect=4, attempts=3):
+    """v48: opens an AlphaSpread page; when Cloudflare shows ("Just a moment") it waits, clicks the verification box and opens the page
+    again (up to `attempts` times). Returns True when the page is not a Cloudflare page. Never raises."""
+    for attempt in range(1, attempts + 1):
+        try:
+            sb.uc_open_with_reconnect(url, reconnect)
+            if "just a moment" not in (sb.get_title() or "").lower():
+                return True
+            sb.sleep(12 * attempt)
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            if "just a moment" not in (sb.get_title() or "").lower():
+                return True
+        except Exception:
+            sb.sleep(3.0)
+    return "just a moment" not in (sb.get_title() or "").lower()
+
+
 def _as_extract_ratio(text):
     """Headline numbers of one AlphaSpread ratio page (verified on the real page text in as_probe v1)."""
     out = {}
@@ -1589,7 +1610,7 @@ def fetch_as_ratios(sb, abbrev_as):
     base = "https://www.alphaspread.com/security/{}/relative-valuation/ratio/".format(str(abbrev_as).strip().strip("/"))
     for name, slug in AS_RATIO_PAGES:
         try:
-            sb.uc_open_with_reconnect(base + slug, 4)
+            _as_open_cf(sb, base + slug, 4)
             source = sb.get_page_source()
             if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
                 step("ratio_" + name, "FAIL", reason="blocked")
@@ -1621,7 +1642,7 @@ def fetch_as_buyback(sb, abbrev_as):
     """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
     url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(str(abbrev_as).strip().strip("/"))
     try:
-        sb.uc_open_with_reconnect(url, 5)
+        _as_open_cf(sb, url, 5)
         source = sb.get_page_source()
         if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
             step("buyback", "FAIL", reason="blocked")
@@ -2117,7 +2138,7 @@ def fetch_as_hist(sb, abbrev_as):
     scrolls in steps until it appears. On failure it saves diagnostics/as_hist_row<N>.html. Never raises."""
     url = "https://www.alphaspread.com/security/{}/summary".format(str(abbrev_as).strip().strip("/"))
     try:
-        sb.uc_open_with_reconnect(url, 5)
+        _as_open_cf(sb, url, 5)
         if "just a moment" in (sb.get_title() or "").lower():
             step("hist", "FAIL", reason="blocked")
             return
@@ -2305,7 +2326,7 @@ def fetch_as_quality(sb, abbrev_as):
             step("quality_" + name, "FAIL", reason=type(page_error).__name__)
     moat_source = ""
     try:  # v22: AlphaSpread "Economic Moat" page (rating + advantage tags); never blocks the metrics
-        sb.uc_open_with_reconnect(base + "qualitative/block/economic-moat", 4)
+        _as_open_cf(sb, base + "qualitative/block/economic-moat", 4)
         for _ in range(12):
             moat_source = sb.get_page_source()
             if "What is Economic Moat?" in moat_source or "How we rate moats" in moat_source:   # old / new (2026-10-20) page layout
