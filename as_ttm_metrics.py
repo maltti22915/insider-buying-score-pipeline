@@ -20,7 +20,7 @@ Each signal scores 0 at the weak end, 60 at "no change", 100 at the strong end (
 Also returns TTM levels and TTM net debt / EBITDA and interest cover (net debt from the latest quarter).
 """
 
-VERSION = "as_ttm_metrics v1.4"
+VERSION = "as_ttm_metrics v1.5"   # v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
 
 import re
 from html.parser import HTMLParser
@@ -160,6 +160,17 @@ def score_signal(x, weak, strong):
     return 60.0 * (x - weak) / (0.0 - weak) if x < 0 else 60.0 + 40.0 * x / strong
 
 
+def _sga(inc, p):
+    """v1.5: selling, general & administrative expense (label varies: 'Selling, General & Admin', 'SG&A', ...)."""
+    for label in inc:
+        l = label.lower()
+        if "sg&a" in l or ("selling" in l and ("general" in l or "admin" in l)):
+            v = _g(inc, label, p)
+            if v is not None:
+                return abs(v)
+    return None
+
+
 def _margin(num, rev):
     return None if num is None or not rev else 100.0 * num / rev
 
@@ -235,6 +246,11 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     if _sbc is not None and now_w["revenue"]:   # v1.4
         out.setdefault("_sbc", 100.0 * abs(_sbc) / now_w["revenue"])
     out["levels"] = {"revenue_ttm": now_w["revenue"], "gm": now_w["gm"], "om": now_w["om"], "fcfm_after_sbc": now_w["fcfm"]}
+    _capex, _ocf = _g(cfs, "Capital Expenditures", latest), _g(cfs, "Cash from Operating Activities", latest)   # v1.5
+    out["levels"]["capex_ttm"] = None if _capex is None else abs(_capex)
+    out["levels"]["ocf_ttm"] = _ocf
+    out["levels"]["sga_ttm"] = _sga(inc, latest)
+    out["levels"]["sga_prev"] = _sga(inc, prev)
     if prev not in ip:
         out["warnings"].append("no TTM window 12 months before {}: no change signals".format(latest))
         return out
