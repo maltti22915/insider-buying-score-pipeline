@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.10"   # v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.11"   # v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -186,6 +186,62 @@ def qm_missing(qm):
     return miss
 
 
+_UNIT = {"k": 1e3, "m": 1e6, "b": 1e9, "t": 1e12, "\u5343": 1e3, "\u4e07": 1e4, "\u767e\u4e07": 1e6, "\u4ebf": 1e8, "\u5341\u4ebf": 1e9, "\u4e07\u4ebf": 1e12}
+
+
+def _usd(txt):
+    """'$25.7M' / '25.7 B' / '8.08\u4ebf' -> float USD, or None. Never 0 for unreadable text."""
+    m = re.search(r"(-?\d[\d,]*\.?\d*)\s*(\u4e07\u4ebf|\u5341\u4ebf|\u767e\u4e07|\u4ebf|\u4e07|\u5343|[KMBTkmbt])?(?![A-Za-z])", txt or "")
+    if not m:
+        return None
+    try:
+        v = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    u = (m.group(2) or "").lower()
+    return v * _UNIT.get(u, 1.0)
+
+
+def parse_insider(text):
+    """v1.11: the summary page 'Insider Trading' block, window 0-12 months: {'bought': USD, 'sold': USD} (None when not readable)."""
+    out = {"bought": None, "sold": None}
+    i = (text or "").find("Insider Trading")
+    if i < 0:
+        return out
+    seg = text[i:i + 900]
+    for key, word in (("bought", "Bought"), ("sold", "Sold")):
+        m = re.search(word + r"[^0-9$\-]{0,40}\$?\s*(-?\d[\d,]*\.?\d*\s*(?:\u4e07\u4ebf|\u5341\u4ebf|\u767e\u4e07|\u4ebf|\u4e07|[KMBkmb])?)", seg)
+        if m:
+            out[key] = _usd(m.group(1))
+    return out
+
+
+def read_insider(sb, step):
+    """Scrolls the open summary page to the 'Insider Trading' block and reads bought / sold USD. Never raises."""
+    ins = {"bought": None, "sold": None}
+    try:
+        for tick in range(10):
+            try:
+                sb.execute_script("var w=null;document.querySelectorAll('h1,h2,h3,h4,div,span').forEach(function(e){if(!w&&e.children.length===0&&(e.textContent||'').trim()==='Insider Trading'){w=e;}});"
+                                  "if(w){w.scrollIntoView({block:'center'});}else{window.scrollBy(0,700);}")
+            except Exception:
+                pass
+            sb.sleep(2.0)
+            t = plain_text(sb.get_page_source())
+            ins = parse_insider(t)
+            if ins.get("bought") is not None or ins.get("sold") is not None:
+                break
+        if ins.get("bought") is None and ins.get("sold") is None:
+            t = plain_text(sb.get_page_source())
+            i = t.find("Insider Trading")
+            step("qm_insider_debug", "INFO", text=t[i:i + 400] if i >= 0 else "no insider block text")
+        else:
+            step("qm_insider", "OK", bought=ins.get("bought"), sold=ins.get("sold"))
+    except Exception as e:
+        step("qm_insider_debug", "FAIL", reason=type(e).__name__)
+    return ins
+
+
 def read_wall_st(sb, step):
     """Scrolls the already open summary page to the 'Wall St Estimates' widget (lazy block) and reads Rev / OpInc / Earnings forecast %. Never raises."""
     wall = {"rev": None, "opi": None, "earn": None}
@@ -208,6 +264,7 @@ def read_wall_st(sb, step):
             step("qm_wall_debug", "INFO", text=t[i:i + 220] if i >= 0 else "no widget text")
     except Exception as e:
         step("qm_wall_debug", "FAIL", reason=type(e).__name__)
+    wall["ins"] = read_insider(sb, step)   # v1.11
     return wall
 
 
@@ -356,6 +413,9 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     except Exception as e:
         step("qm_moat", "FAIL", reason=type(e).__name__)
     # data the scraper already holds
+    ins = (wall or {}).get("ins") or {}
+    if ins.get("bought") is not None or ins.get("sold") is not None:
+        qm["ins"] = {"bought": ins.get("bought"), "sold": ins.get("sold")}
     if buyback:
         qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
     if moat:
@@ -364,6 +424,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
         lv, sg = now_block.get("levels") or {}, now_block.get("signals") or {}
         qm["ttm"] = {"rev_growth": sg.get("rev_growth"), "rev_accel": sg.get("rev_accel"), "nd_ebitda": lv.get("nd_ebitda_ttm"),
                      "nd_ebitda_prev": lv.get("nd_ebitda_prev"), "int_cover": lv.get("interest_cover_ttm"), "sbc_pct_rev": lv.get("sbc_pct_rev"),
+                     "capex_ttm": lv.get("capex_ttm"), "ocf_ttm": lv.get("ocf_ttm"), "sga_ttm": lv.get("sga_ttm"), "sga_prev": lv.get("sga_prev"),
                      "warnings": now_block.get("warnings")}
     if not qm.get("prof") and not qm.get("est"):
         return {}
