@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.9"   # v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.10"   # v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -101,8 +101,14 @@ def parse_wall_st(text):
     """Summary page widget "Wall St Estimates" (up to 3 selected indicators): 'Revenue Forecast +3%', 'Earnings Forecast +25%', 'Operating Income Forecast +x%'.
     The indicator menu lists the same names without numbers, so a number must follow the label directly. Returns {rev, opi, earn} in percent (None when not shown)."""
     out = {"rev": None, "opi": None, "earn": None}
+    text = text or ""
+    i = text.find("Wall St Estimates")
+    if i >= 0:   # v1.10: only the widget itself (up to its indicator menu), never other 'Forecast' texts further down the page
+        seg = text[i:i + 900]
+        j = seg.find("Select Indicators")
+        text = seg[:j] if j > 0 else seg
     for key, label in (("rev", "Revenue Forecast"), ("opi", "Operating Income Forecast"), ("earn", "Earnings Forecast")):
-        m = re.search(re.escape(label) + r"\s*([+-]?\d+(?:[.,]\d+)?)\s*%", text or "")
+        m = re.search(re.escape(label) + r"\s*([+-]?\d+(?:[.,]\d+)?)\s*%", text)
         if m:
             out[key] = _f(m.group(1))
     return out
