@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v54: completion pass: when the Quality Model payload still lacks inputs the missing parts are read again in a fresh browser (up to AS_QM_FILL_PASSES=2) and posted again; as_qm_data v1.9 qm_missing().
   v53: qm.fin = True for financials (profile FIN of the quality step); Apps Script then skips ND/EBITDA scoring and its exclusion.
   v52: margins missing on the AlphaSpread page are computed from the statements (as_quality_metrics v6 details['margins'], as_qm_data v1.8); metrics neither source can give are listed in qm.na so Apps Script does not re-scrape for them.
   v51: ROIC missing on the AlphaSpread page (UNH has no ROIC card) -> the yearly ROIC computed from the statements (Quality step) is used for the Quality Model (as_qm_data v1.7, step qm_roic_computed).
@@ -2415,6 +2416,8 @@ def fetch_as_quality(sb, abbrev_as):
 
 
 _AS_QM = {}
+_RUN_START = time.monotonic()
+_QM_LAST = {}   # v54: {'missing': [...]} of the last Quality Model payload
 
 
 def _as_fin_open_page(sb, url, ready_pattern):
@@ -2470,6 +2473,10 @@ def fetch_as_qm(sb, abbrev_as):
                                     margin_series=(((_AS_QUALITY.get("details") or {}).get("margins")) or None))
         if qm:
             qm["fin"] = bool(((_AS_QUALITY.get("v4") or {}).get("profile")) == "FIN")   # v53: financials are not scored / excluded on ND/EBITDA
+            try:
+                _QM_LAST["missing"] = as_qm_data.qm_missing(qm)   # v54: drives the completion pass
+            except Exception:
+                _QM_LAST["missing"] = []
             _AS_QM.update(qm)
             step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
         else:
@@ -2477,6 +2484,45 @@ def fetch_as_qm(sb, abbrev_as):
     except Exception as qm_error:
         step("qm", "FAIL", reason=type(qm_error).__name__ + ": " + str(qm_error)[:60])
 
+
+def qm_completion_passes(webhook_url, row_number, abbrev_as, sheet_name, info, headless):
+    """v54: when the Quality Model payload of the main pass lacks inputs (blocked pages), run the missing parts again in a FRESH browser (a new
+    browser often passes Cloudflare where the old one stays blocked) and post the result again; the sheet keeps what it already has.
+    Env AS_QM_FILL_PASSES (default 2, 0 = off). Never raises."""
+    try:
+        passes = int(os.environ.get("AS_QM_FILL_PASSES", "2"))
+    except ValueError:
+        passes = 2
+    if os.environ.get("AS_FIN", "1") == "0" or passes <= 0:
+        return
+    statement_inputs = {"ROIC", "Op mgn", "FCF mgn", "Gross Margin", "Rev g", "ND/EBITDA", "Moat"}
+    for n in range(1, passes + 1):
+        missing = list(_QM_LAST.get("missing") or [])
+        if not missing:
+            return
+        if time.monotonic() - _RUN_START > int(os.environ.get("AS_QM_FILL_MAX_ELAPSED", "1020")):
+            print("⏹️ QM completion pass skipped: run already took {:.0f}s".format(time.monotonic() - _RUN_START))
+            return
+        pause = random.uniform(20, 40)
+        print("🔁 QM completion pass {}/{}: still missing {} -- fresh browser after {:.0f}s".format(n, passes, ",".join(missing), pause))
+        time.sleep(pause)
+        _QM_LAST["missing"] = []
+        try:
+            step_begin("ASDCF", 90 + n, "headless" if headless else "headed")
+            _STEP_CTX["blocked"] = 0
+            with SB(uc=True, headless=headless) as sb2:
+                if statement_inputs & set(missing):
+                    fetch_as_quality(sb2, abbrev_as)
+                if "Shr chg" in missing and not (isinstance(_AS_RATIOS, dict) and _AS_RATIOS.get("buyback")):
+                    fetch_as_buyback(sb2, abbrev_as)
+                _QM_WALL.clear()
+                fetch_as_qm(sb2, abbrev_as)
+                post_as_qm_if_any(webhook_url, row_number, abbrev_as, sheet_name, info)
+            step("qm_fill", "OK", pass_=n, missing_after=",".join(_QM_LAST.get("missing") or []) or "-")
+        except BaseException as fill_error:
+            print("⚠️ QM completion pass {} failed: {}".format(n, str(fill_error)[:100]))
+            if isinstance(fill_error, KeyboardInterrupt):
+                raise
 
 def post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info):
     """v48: posts the Quality Model data once (target ASQM, fn_91_12); never touches the DCF result."""
@@ -2872,7 +2918,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v53"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v54"   # bump on every change to this file
 
 
 def module_versions():
@@ -3030,6 +3076,8 @@ def run_bot():
                             raise
                     if swallowed_error and posted is None:
                         raise swallowed_error[0]
+                    if target == "ASDCF":
+                        qm_completion_passes(webhook_url, row_number, abbrev, sheet_name, info, headless)   # v54
                     info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
                                              "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
                     info["status"] = "ok" if posted else "not_written"
