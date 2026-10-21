@@ -51,7 +51,7 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v5
+VERSION: as_dcf_extractor v6
 v5 -- 2026-10-20: Cloudflare page handling. In the SAP runs of 2026-10-20 all 5 attempts stayed on the "Performing security verification ... Verification
    successful. Waiting for www.alphaspread.com to respond" page for the whole 15 s wait and were reported as VIEW_CALCULATION_NOT_FOUND. Now, right after the page is
    opened, _pass_cloudflare() waits for the page to clear (up to 25 s), tries the verification click, and re-opens the URL (up to 3 rounds) before the normal waits start.
@@ -134,7 +134,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v5"
+VERSION = "as_dcf_extractor v6"
 PROBE_AFTER_SECONDS = 15
 MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
@@ -363,8 +363,14 @@ ASSUMPTIONS_JS = r"""
   var m;
   var price = (m = /(?:^|\s)Price:\s*([\d.,]+)\s*([A-Z]{3})/.exec(body)) ? m[1] + ' ' + m[2] : null;
   var cap = (m = /Market Cap:\s*(\S+)/.exec(body)) ? m[1] : null;
-  var dcf = (m = /DCF Value per Share\s*([\d.,]+)\s*([A-Z]{3})/.exec(body)) ? m[1] + ' ' + m[2] : null;
-  return { settings: settings, order: order, cards: cards, price: price, marketCap: cap, dcfValuePerShare: dcf };
+  var dcf = (m = /DCF Value per Share\s*[:\-]?\s*([\d.,]+)\s*([A-Z]{3})/.exec(body)) ? m[1] + ' ' + m[2] : null;
+  if (!dcf) {   // v6: other wording / symbol instead of the currency code
+    m = /(?:DCF Value|Intrinsic Value|Fair Value)(?: per Share)?\s*[:\-]?\s*([^\d\s]{0,3})\s*([\d][\d.,]*)\s*([A-Z]{3})?/i.exec(body);
+    if (m) { dcf = m[2] + (m[3] ? ' ' + m[3] : ''); }
+  }
+  var probe = null;
+  if (!dcf) { var ix = body.search(/DCF Value|Value per Share/i); probe = ix >= 0 ? body.slice(Math.max(0, ix - 40), ix + 140) : 'no DCF Value text on the page'; }
+  return { settings: settings, order: order, cards: cards, price: price, marketCap: cap, dcfValuePerShare: dcf, dcfProbe: probe };
 })()
 """
 
@@ -650,6 +656,8 @@ def build_assumptions(raw):
     out["price"] = raw.get("price")
     out["marketCap"] = raw.get("marketCap")
     out["dcfValuePerShare"] = raw.get("dcfValuePerShare")
+    if not raw.get("dcfValuePerShare"):
+        print("[as_dcf_extractor v6] DCF value per share not found; page text near it: {}".format(str(raw.get("dcfProbe"))[:200]))
     out["cards"] = [str(c)[:160] for c in (raw.get("cards") or [])[:6]]
 
     # shares are not on the page: derive them only when the currencies clearly match
