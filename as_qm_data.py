@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.13"   # v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.14"   # v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -256,6 +256,38 @@ def read_insider(sb, step):
     return ins
 
 
+def parse_px10(text):
+    """v1.14: '10Y +111%' (price chart period button / change label) -> 111.0, or None."""
+    for m in re.finditer(r"\b10\s?Y(?:ears?)?\b\D{0,40}?([+-]?\d[\d,]*\.?\d*)\s*%", text or ""):
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+    return None
+
+
+def read_price_10y(sb, step):
+    """v1.14: clicks the '10Y' period button of the price chart on the open summary page and reads the price change in percent. Never raises; None when unreadable."""
+    try:
+        px = parse_px10(plain_text(sb.get_page_source()))
+        how = "label"
+        if px is None:
+            sb.execute_script("window.scrollTo(0, 0);")
+            how = sb.execute_script(TAB_CLICK_JS, "10Y")
+            sb.sleep(2.5)
+            px = parse_px10(plain_text(sb.get_page_source()))
+        if px is None:
+            t = plain_text(sb.get_page_source())
+            hits = [t[max(0, m.start() - 60):m.start() + 160] for m in re.finditer(r"10\s?Y", t)][:3]
+            step("qm_px10_debug", "INFO", click=how, text=" || ".join(hits) if hits else "no 10Y text on the page")
+        else:
+            step("qm_px10", "OK", pct=px, how=how)
+        return px
+    except Exception as e:
+        step("qm_px10_debug", "FAIL", reason=type(e).__name__)
+        return None
+
+
 def read_wall_st(sb, step):
     """Scrolls the already open summary page to the 'Wall St Estimates' widget (lazy block) and reads Rev / OpInc / Earnings forecast %. Never raises."""
     wall = {"rev": None, "opi": None, "earn": None}
@@ -278,6 +310,7 @@ def read_wall_st(sb, step):
             step("qm_wall_debug", "INFO", text=t[i:i + 220] if i >= 0 else "no widget text")
     except Exception as e:
         step("qm_wall_debug", "FAIL", reason=type(e).__name__)
+    wall["px10"] = read_price_10y(sb, step)   # v1.14
     return wall
 
 
@@ -368,6 +401,20 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
                          "rev_cagr_fwd_years": r.get("cagr_fwd_years"), "opi3": o.get("three"), "opi3_n": o.get("three_n"), "opi_only": o.get("only"),
                          "opi_cagr_fwd": o.get("cagr_fwd"), "opi_cagr_fwd_years": o.get("cagr_fwd_years"),
                          "rev_lt": r.get("cagr_hist"), "rev_lt_years": r.get("cagr_hist_years")}
+            ni = {}
+            try:   # v1.14: Net Income long-term CAGR (tab may not exist: then Operating Income is the fallback in the calc)
+                for attempt in (1, 2):
+                    how_ni = sb.execute_script(TAB_CLICK_JS, "Net Income")
+                    if how_ni == "none":
+                        break
+                    sb.sleep(2.5 * attempt)
+                    ni = parse_estimates(plain_text(sb.get_page_source()), "Net Income")
+                    if ni.get("cagr_hist") is not None:
+                        break
+                step("qm_ni", "OK" if ni.get("cagr_hist") is not None else "INFO", ni_lt=ni.get("cagr_hist"), years=ni.get("cagr_hist_years"), opi_lt=o.get("cagr_hist"))
+            except Exception as e_ni:
+                step("qm_ni", "FAIL", reason=type(e_ni).__name__)
+            qm["est"].update({"ni_lt": ni.get("cagr_hist"), "ni_lt_years": ni.get("cagr_hist_years"), "opi_lt": o.get("cagr_hist"), "opi_lt_years": o.get("cagr_hist_years")})
             if o.get("three") is None and not o.get("only"):
                 step("qm_est_debug", "INFO", opi_block=(_block_after(text, "In 3 years") or "")[:200], tab_click=how)
             step("qm_est", "OK" if (r.get("three") is not None or r.get("cagr_fwd") is not None) else "FAIL",
@@ -426,6 +473,8 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     except Exception as e:
         step("qm_moat", "FAIL", reason=type(e).__name__)
     # data the scraper already holds
+    if (wall or {}).get("px10") is not None:
+        qm["px10"] = wall.get("px10")
     if buyback:
         qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
     if moat:
