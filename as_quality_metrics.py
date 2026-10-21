@@ -1,5 +1,5 @@
 """
-as_quality_metrics.py v5 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
+as_quality_metrics.py v6 (yearly margins in details['margins']) / v5 -- six STRUCTURAL quality metrics from AlphaSpread pages (STD profile).
 
   Q1 ROIC 3Y average      profitability page text ("3Y Average ROIC"); falls back to the computed value
   Q2 Worst-year ROIC      second-lowest yearly ROIC of the last 5 FY (ROIC_MIN_RANK = 2; 1 = the very worst), computed from the statements
@@ -25,6 +25,7 @@ from html.parser import HTMLParser
 STRIP_LONG_TERM_INVESTMENTS = False
 ROIC_SUBTRACT_CASH = False   # v2: same basis as AlphaSpread's own ROIC (see docstring)
 ROIC_CALIBRATE_TO_PAGE = True  # v4: scale the computed ROIC series so its last-3-year average equals the page value
+VERSION = "as_quality_metrics v6"
 ROIC_MIN_RANK = 2            # v3: 1 = worst year of the last 5, 2 = second-worst (robust to one shock year such as COVID); chosen by the user
 TAX_MIN, TAX_MAX, TAX_DEFAULT = 0.15, 0.30, 0.21
 SHARE_JUMP_LIMIT = 0.30
@@ -292,6 +293,25 @@ def compute_metrics(profitability_html, income_html, balance_html, cashflow_html
         positives += 1 if c - abs(cap) > 0 else 0
         fcf_rows.append({"year": y, "cfo": c, "capex": abs(cap), "fcf": c - abs(cap)})
     fcf_years = positives if (len(last5) == 5 and known >= 4) else None
+    # v6: yearly margins (percent) from the statements, used by the Quality Model when the AlphaSpread profitability page has no card for a margin
+    try:
+        mar = {}
+        for y in last5:
+            rv = _g(inc, "Revenue", y)
+            if not rv:
+                continue
+            row = {}
+            op_, gp_, ni_ = _g(inc, "Operating Income", y), _g(inc, "Gross Profit", y), _g(inc, "Net Income", y)
+            c_, cap_ = _g(cfs, "Cash from Operating Activities", y), _g(cfs, "Capital Expenditures", y)
+            if op_ is not None: row["opm"] = 100.0 * op_ / rv
+            if gp_ is not None: row["gm"] = 100.0 * gp_ / rv
+            if ni_ is not None: row["nm"] = 100.0 * ni_ / rv
+            if c_ is not None and cap_ is not None: row["fcfm"] = 100.0 * (c_ - abs(cap_)) / rv
+            if row:
+                mar[str(y)] = {k: round(v, 2) for k, v in row.items()}
+        details["margins"] = mar
+    except Exception:
+        details["margins"] = {}
     diag["fcf_years_known"] = known
     details["fcf_years"] = {"rows": fcf_rows, "known": known}
 
