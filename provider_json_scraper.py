@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v55: Quality Model spec 2026-10-21: insider bought/sold USD (0-12 months) read on the summary visit (as_qm_data v1.11 read_insider -> qm.ins); capex/OCF/SG&A TTM levels (as_ttm_metrics v1.5 -> qm.ttm); buyback block with only zeros is retried and never stored as 0 (_bb_ready).
   v54: completion pass: when the Quality Model payload still lacks inputs the missing parts are read again in a fresh browser (up to AS_QM_FILL_PASSES=2) and posted again; as_qm_data v1.9 qm_missing().
   v53: qm.fin = True for financials (profile FIN of the quality step); Apps Script then skips ND/EBITDA scoring and its exclusion.
   v52: margins missing on the AlphaSpread page are computed from the statements (as_quality_metrics v6 details['margins'], as_qm_data v1.8); metrics neither source can give are listed in qm.na so Apps Script does not re-scrape for them.
@@ -1644,6 +1645,14 @@ def _as_extract_buyback(text):
     return out
 
 
+def _bb_ready(values):
+    """v55: the buyback numbers are usable only when current and average are read and are not the all-zero placeholder of a block that has not rendered yet (a real 0.00 is never stored)."""
+    if values.get("current") is None or values.get("avg") is None:
+        return False
+    nums = [v for v in values.values() if isinstance(v, (int, float))]
+    return not (nums and all(abs(v) < 1e-9 for v in nums))
+
+
 def fetch_as_buyback(sb, abbrev_as):
     """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
     url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(str(abbrev_as).strip().strip("/"))
@@ -1656,7 +1665,7 @@ def fetch_as_buyback(sb, abbrev_as):
         values = _as_extract_buyback(_as_strip_text(source))
         # v44: the block renders lazily - up to 3 extra tries (scroll to the block, wait, re-read; last try reloads the page)
         for attempt in range(3):
-            if values.get("current") is not None and values.get("avg") is not None:
+            if _bb_ready(values):
                 break
             try:
                 if attempt == 2:
@@ -1669,11 +1678,11 @@ def fetch_as_buyback(sb, abbrev_as):
                 values = _as_extract_buyback(_as_strip_text(sb.get_page_source()))
             except Exception:
                 pass
-        if values.get("current") is not None and values.get("avg") is not None:
+        if _bb_ready(values):
             _AS_RATIOS["buyback"] = values
             step("buyback", "OK", **values)
         else:
-            step("buyback", "FAIL", reason="no buyback numbers on the page", got=",".join(sorted(values.keys())))
+            step("buyback", "FAIL", reason="no buyback numbers on the page (or only zeros: not stored as 0)", got=",".join(sorted(values.keys())))
     except Exception as buyback_error:
         step("buyback", "FAIL", reason=type(buyback_error).__name__)
 
@@ -2918,7 +2927,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v54"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v55"   # bump on every change to this file
 
 
 def module_versions():
