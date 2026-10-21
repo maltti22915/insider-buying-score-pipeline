@@ -34,6 +34,8 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v52: margins missing on the AlphaSpread page are computed from the statements (as_quality_metrics v6 details['margins'], as_qm_data v1.8); metrics neither source can give are listed in qm.na so Apps Script does not re-scrape for them.
+  v51: ROIC missing on the AlphaSpread page (UNH has no ROIC card) -> the yearly ROIC computed from the statements (Quality step) is used for the Quality Model (as_qm_data v1.7, step qm_roic_computed).
   v50: the Wall St widget counts as read only when it has values (else the Quality Model step reads summary again); solvency retry; qm_prof diagnostics; version index printed at run start and in RUN_SUMMARY ("versions"), every module has VERSION.
   v49: each AlphaSpread URL is opened once per stock: the Wall St Estimates widget is read during the summary visit of fetch_as_hist (as_qm_data.read_wall_st); as_qm_data opens summary only when that visit did not happen or was blocked.
   v48: Quality Model (QL / Dir / Outl / Q) replaces Quality v2: new step fetch_as_qm (as_qm_data.py) reads the analyst-estimates and solvency pages and bundles them with the profitability checklist, buyback, moat and TTM block already read; posted as target ASQM (fn_91_12) into "QM JSON". The 10-year statement scrape (fetch_as_fin / as_fin_data) is retired. Env AS_FIN="0" still skips it.
@@ -2462,7 +2464,9 @@ def fetch_as_qm(sb, abbrev_as):
                                     buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
                                     moat=(_AS_QUALITY.get("moat") or _QM_SRC.get("moat")),
                                     now_block=(_AS_QUALITY.get("now") or _QM_SRC.get("now")),
-                                    wall=(dict(_QM_WALL) if _QM_WALL.get("visited") else None))
+                                    wall=(dict(_QM_WALL) if _QM_WALL.get("visited") else None),
+                                    roic_series=((((_AS_QUALITY.get("details") or {}).get("roic") or {}).get("raw")) or None),
+                                    margin_series=(((_AS_QUALITY.get("details") or {}).get("margins")) or None))
         if qm:
             _AS_QM.update(qm)
             step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
@@ -2866,13 +2870,13 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v50"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v52"   # bump on every change to this file
 
 
 def module_versions():
     """Version index of this script and the helper modules (each module has a VERSION constant); '?' when a module is missing."""
     out = [SCRIPT_VERSION]
-    for name in ("as_dcf_extractor", "as_qm_data", "as_moat", "as_ttm_metrics"):
+    for name in ("as_dcf_extractor", "as_qm_data", "as_quality_metrics", "as_moat", "as_ttm_metrics"):
         try:
             mod = __import__(name)
             out.append(str(getattr(mod, "VERSION", name + " ?")))
