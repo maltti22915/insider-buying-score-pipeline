@@ -10,6 +10,9 @@ page any more (the tags shown belong to the peers), so "advantages" stays empty 
 Tags seen: Network Effects, Intangible Assets, (High) Switching Costs, Efficient Scale, Low-Cost Production (= Cost Advantage).
 AlphaSpread's moat text looks generated, so it is one input next to the financial numbers, never a substitute for them.
 """
+
+VERSION = "as_moat v1.2"
+
 import re
 
 TAGS = [("Network Effects", "Network Effects"), ("Intangible Assets", "Intangible Assets"), ("Switching Costs", "Switching Costs"),
