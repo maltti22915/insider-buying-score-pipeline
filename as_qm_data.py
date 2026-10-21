@@ -59,6 +59,17 @@ def parse_profitability(html_or_text):
     return out
 
 
+def parse_wall_st(text):
+    """Summary page widget "Wall St Estimates" (up to 3 selected indicators): 'Revenue Forecast +3%', 'Earnings Forecast +25%', 'Operating Income Forecast +x%'.
+    The indicator menu lists the same names without numbers, so a number must follow the label directly. Returns {rev, opi, earn} in percent (None when not shown)."""
+    out = {"rev": None, "opi": None, "earn": None}
+    for key, label in (("rev", "Revenue Forecast"), ("opi", "Operating Income Forecast"), ("earn", "Earnings Forecast")):
+        m = re.search(re.escape(label) + r"\s*([+-]?\d+(?:[.,]\d+)?)\s*%", text or "")
+        if m:
+            out[key] = _f(m.group(1))
+    return out
+
+
 def _block_after(text, marker):
     """Text of the 'In N years' block that starts at marker, up to the next 'In N years' block."""
     i = text.find(marker)
@@ -111,7 +122,32 @@ def _open(sb, url, ready_pattern, open_page):
     return open_page(sb, url, ready_pattern) if open_page else ""
 
 
-def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None):
+def read_wall_st(sb, step):
+    """Scrolls the already open summary page to the 'Wall St Estimates' widget (lazy block) and reads Rev / OpInc / Earnings forecast %. Never raises."""
+    wall = {"rev": None, "opi": None, "earn": None}
+    try:
+        for tick in range(14):
+            try:
+                sb.execute_script("var w=null;document.querySelectorAll('h1,h2,h3,h4,div,span').forEach(function(e){if(!w&&e.children.length===0&&(e.textContent||'').trim()==='Wall St Estimates'){w=e;}});"
+                                  "if(w){w.scrollIntoView({block:'center'});}else{window.scrollBy(0,600);}")
+            except Exception:
+                pass
+            sb.sleep(2.0)
+            wall = parse_wall_st(plain_text(sb.get_page_source()))
+            if wall.get("rev") is not None or wall.get("earn") is not None:
+                sb.sleep(1.5)
+                wall = parse_wall_st(plain_text(sb.get_page_source()))
+                break
+        if wall.get("rev") is None and wall.get("earn") is None:
+            t = plain_text(sb.get_page_source())
+            i = t.find("Wall St Estimates")
+            step("qm_wall_debug", "INFO", text=t[i:i + 220] if i >= 0 else "no widget text")
+    except Exception as e:
+        step("qm_wall_debug", "FAIL", reason=type(e).__name__)
+    return wall
+
+
+def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None, wall=None):
     """Opens analyst-estimates (+ Revenue / Operating Income tabs) and solvency; assembles the QM payload. Never raises; returns {} when nothing was read."""
     base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
     qm = {"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": []}
@@ -155,6 +191,19 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
                  rev3=r.get("three"), opi3=o.get("three"), rev_lt=r.get("cagr_hist"), only=(r.get("only"), o.get("only")))
     except Exception as e:
         step("qm_est", "FAIL", reason=type(e).__name__ + ": " + str(e)[:60])
+    # Wall St Estimates widget on the summary page: normally read during the summary visit of fetch_as_hist (wall passed in);
+    # the page is opened here only when that visit did not happen / was blocked
+    try:
+        if wall is not None and wall.get("visited"):
+            w = wall
+        else:
+            wsrc = _open(sb, base + "summary", r"Wall St Estimates", open_page)
+            w = read_wall_st(sb, step) if wsrc else {"rev": None, "opi": None, "earn": None}
+        est_extra = {"rev_w": w.get("rev"), "opi_w": w.get("opi"), "earn_w": w.get("earn")}
+        qm.setdefault("est", {}).update(est_extra)
+        step("qm_wall", "OK" if (w.get("rev") is not None or w.get("earn") is not None) else "FAIL", **{k: v for k, v in est_extra.items() if v is not None})
+    except Exception as e:
+        step("qm_wall", "FAIL", reason=type(e).__name__ + ": " + str(e)[:60])
     # solvency
     try:
         src = _open(sb, base + "solvency", r"Net\s+Debt|Altman", open_page)
