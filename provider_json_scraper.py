@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v53: qm.fin = True for financials (profile FIN of the quality step); Apps Script then skips ND/EBITDA scoring and its exclusion.
   v52: margins missing on the AlphaSpread page are computed from the statements (as_quality_metrics v6 details['margins'], as_qm_data v1.8); metrics neither source can give are listed in qm.na so Apps Script does not re-scrape for them.
   v51: ROIC missing on the AlphaSpread page (UNH has no ROIC card) -> the yearly ROIC computed from the statements (Quality step) is used for the Quality Model (as_qm_data v1.7, step qm_roic_computed).
   v50: the Wall St widget counts as read only when it has values (else the Quality Model step reads summary again); solvency retry; qm_prof diagnostics; version index printed at run start and in RUN_SUMMARY ("versions"), every module has VERSION.
@@ -2468,6 +2469,7 @@ def fetch_as_qm(sb, abbrev_as):
                                     roic_series=((((_AS_QUALITY.get("details") or {}).get("roic") or {}).get("raw")) or None),
                                     margin_series=(((_AS_QUALITY.get("details") or {}).get("margins")) or None))
         if qm:
+            qm["fin"] = bool(((_AS_QUALITY.get("v4") or {}).get("profile")) == "FIN")   # v53: financials are not scored / excluded on ND/EBITDA
             _AS_QM.update(qm)
             step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
         else:
@@ -2870,7 +2872,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v52"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v53"   # bump on every change to this file
 
 
 def module_versions():
