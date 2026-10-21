@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v49: each AlphaSpread URL is opened once per stock: the Wall St Estimates widget is read during the summary visit of fetch_as_hist (as_qm_data.read_wall_st); as_qm_data opens summary only when that visit did not happen or was blocked.
   v48: Quality Model (QL / Dir / Outl / Q) replaces Quality v2: new step fetch_as_qm (as_qm_data.py) reads the analyst-estimates and solvency pages and bundles them with the profitability checklist, buyback, moat and TTM block already read; posted as target ASQM (fn_91_12) into "QM JSON". The 10-year statement scrape (fetch_as_fin / as_fin_data) is retired. Env AS_FIN="0" still skips it.
   v47: Quality v2 -- new step fetch_as_fin (as_fin_data.py): annual income statement / balance sheet / cash flow (unit selector set to Millions), solvency, moat and 3Y ROIC pages become the "AS Fin JSON" posted as target ASFIN (fn_91_11). Env AS_FIN="0" skips it (the sheet keeps a JSON younger than 30 days).
   v46: AlphaSpread run blocked by Cloudflare (DCF failed + 2 blocked pages): stops at once and is retried with a fresh browser after 30-60 s (up to 3 attempts, budget 800 s); the scores step no longer waits 20 s on a challenge page.
@@ -2137,6 +2138,7 @@ def fetch_as_hist(sb, abbrev_as):
     _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
     scrolls in steps until it appears. On failure it saves diagnostics/as_hist_row<N>.html. Never raises."""
     url = "https://www.alphaspread.com/security/{}/summary".format(str(abbrev_as).strip().strip("/"))
+    _QM_WALL.clear()   # v49: never reuse the widget of the previous stock
     try:
         _as_open_cf(sb, url, 5)
         if "just a moment" in (sb.get_title() or "").lower():
@@ -2171,6 +2173,14 @@ def fetch_as_hist(sb, abbrev_as):
                 pass
             sb.sleep(1.5)
         _as_fetch_scores_on_page(sb, url)  # v35: Profitability / Solvency cards, same page visit
+        if os.environ.get("AS_FIN", "1") != "0":   # v49: Wall St Estimates widget, same page visit (the summary page is opened once)
+            try:
+                import as_qm_data
+                _QM_WALL.clear()
+                _QM_WALL.update(as_qm_data.read_wall_st(sb, step))
+                _QM_WALL["visited"] = True
+            except Exception:
+                pass
         headline = (probe.get("headline") or "").strip()
         context = (probe.get("context") or "").strip()
         if not headline:
@@ -2237,6 +2247,7 @@ def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
 # ----------------------------------------------------------------------------
 _AS_QUALITY = {}
 _QM_SRC = {}   # v48: moat block + TTM "now" block, kept even when an annual statement page is blocked and fetch_as_quality gives up
+_QM_WALL = {}   # v49: Wall St Estimates widget read during the summary visit of fetch_as_hist
 _QM_PROF = {"html": ""}   # v48: profitability page of the current stock, reused by the Quality Model step
 AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/income-statement"),
                     ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
@@ -2449,7 +2460,8 @@ def fetch_as_qm(sb, abbrev_as):
         qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
                                     buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
                                     moat=(_AS_QUALITY.get("moat") or _QM_SRC.get("moat")),
-                                    now_block=(_AS_QUALITY.get("now") or _QM_SRC.get("now")))
+                                    now_block=(_AS_QUALITY.get("now") or _QM_SRC.get("now")),
+                                    wall=(dict(_QM_WALL) if _QM_WALL.get("visited") else None))
         if qm:
             _AS_QM.update(qm)
             step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
