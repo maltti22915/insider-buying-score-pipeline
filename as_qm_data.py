@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.4"   # v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.8"   # v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -57,6 +57,42 @@ def parse_profitability(html_or_text):
             m = re.search(r"(?<!Average )(?<!Average\s)\b" + lab + r"\s+" + NUM + r"\s*%(?!\s*>)", t)
             if m:
                 rec["now"] = _f(m.group(1))
+        out[key] = rec
+    return out
+
+
+CARD_LABELS = {   # card layout of the profitability page (no "Due Diligence Checks" list): big value, LABEL, "3Y Avg x%"
+    "gm": [r"GROSS MARGIN"], "opm": [r"OPERATING MARGIN", r"OPERATING PROFIT MARGIN", r"EBIT MARGIN"], "nm": [r"NET MARGIN", r"NET PROFIT MARGIN"],
+    "fcfm": [r"FREE CASH FLOW MARGIN", r"FCF MARGIN"], "roe": [r"ROE"], "roic": [r"ROIC", r"RETURN ON INVESTED CAPITAL"],
+}
+
+
+def parse_profitability_cards(html_or_text):
+    """v1.5: card layout (seen on UNH): '+2% 15 .9 % ROE <chart> 3Y Avg 18% 5Y Avg 21% ...'. Returns {key: {now, avg3, prev}}; prev = now - the green/red badge change.
+    Values are read as printed (one decimal); a number split over elements ('3' '.5%') is joined."""
+    t = html_or_text if "<" not in (html_or_text or "")[:200] else plain_text(html_or_text)
+    out = {}
+    for key, labels in CARD_LABELS.items():
+        rec = {"now": None, "avg3": None, "prev": None}
+        for lab in labels:
+            for m in re.finditer(r"(?<![A-Za-z])" + lab + r"(?![A-Za-z])", t, re.I):
+                after = t[m.end():m.end() + 160]
+                avg = re.search(r"3Y\s*Avg\.?\s*" + NUM + r"\s*%", after, re.I)
+                if not avg:
+                    continue
+                before = t[max(0, m.start() - 40):m.start()]
+                num = re.search(r"(\d+)\s*(?:\.\s*(\d+))?\s*%?\s*$", before)
+                if not num:
+                    continue
+                rec["now"] = _f(num.group(1) + ("." + num.group(2) if num.group(2) else ""))
+                rec["avg3"] = _f(avg.group(1))
+                pre = before[:num.start()]
+                d = re.search(r"([+-]\d+(?:[.,]\d+)?)\s*%\s*$", pre)
+                if d and rec["now"] is not None:
+                    rec["prev"] = rec["now"] - _f(d.group(1))
+                break
+            if rec["now"] is not None:
+                break
         out[key] = rec
     return out
 
@@ -149,13 +185,23 @@ def read_wall_st(sb, step):
     return wall
 
 
-def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None, wall=None):
+def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None, wall=None, roic_series=None, margin_series=None):
     """Opens analyst-estimates (+ Revenue / Operating Income tabs) and solvency; assembles the QM payload. Never raises; returns {} when nothing was read."""
     base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
     qm = {"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": []}
     # profitability (page already loaded by fetch_as_quality)
     try:
         qm["prof"] = parse_profitability(prof_html) if prof_html else {}
+        if prof_html and sum(1 for v in qm["prof"].values() if v.get("now") is not None) < 4:   # v1.5: card layout (no checklist)
+            cards = parse_profitability_cards(prof_html)
+            for k, v in cards.items():
+                if v.get("now") is not None and (qm["prof"].get(k) or {}).get("now") is None:
+                    qm["prof"][k] = v
+            step("qm_prof_cards", "INFO", metrics=sum(1 for v in cards.values() if v.get("now") is not None), got=[k for k, v in cards.items() if v.get("now") is not None])
+            if (qm["prof"].get("roic") or {}).get("now") is None:   # ROIC is on the page: show the text around it so the label can be matched
+                pt = plain_text(prof_html)
+                hits = [pt[max(0, m.start() - 70):m.start() + 130] for m in re.finditer(r"ROIC|Invested Capital", pt, re.I)][:3]
+                step("qm_prof_roic_debug", "INFO", hits=len(hits), text=" || ".join(hits)[:600])
         got = sum(1 for v in qm["prof"].values() if v.get("now") is not None)
         if got >= 4:
             step("qm_prof", "OK", metrics=got)
@@ -167,6 +213,39 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     except Exception as e:
         qm["prof"] = {}
         step("qm_prof", "FAIL", reason=type(e).__name__)
+    # ROIC missing on the page (UNH: no ROIC card) -> computed yearly ROIC from the statements (same basis as the Quality step)
+    try:
+        if (qm["prof"].get("roic") or {}).get("now") is None and roic_series:
+            ys = sorted(roic_series.keys(), key=lambda y: str(y))
+            vals = [float(roic_series[y]) for y in ys]
+            if vals:
+                qm["prof"]["roic"] = {"now": round(vals[-1], 1), "avg3": round(sum(vals[-3:]) / len(vals[-3:]), 1) if len(vals) >= 3 else None,
+                                      "prev": round(vals[-2], 1) if len(vals) >= 2 else None, "src": "computed from statements, FY " + str(ys[-1])}
+                step("qm_roic_computed", "OK", now=qm["prof"]["roic"]["now"], prev=qm["prof"]["roic"]["prev"], fy=ys[-1])
+    except Exception as e:
+        step("qm_roic_computed", "FAIL", reason=type(e).__name__)
+    # margins missing on the page (card layout shows only some) -> yearly margins computed from the statements
+    try:
+        if margin_series:
+            ys = sorted(margin_series.keys(), key=lambda y: str(y))
+            filled = []
+            for key in ("opm", "gm", "fcfm", "nm"):
+                if (qm["prof"].get(key) or {}).get("now") is not None:
+                    continue
+                vals = [float(margin_series[y][key]) for y in ys if key in margin_series[y]]
+                if vals:
+                    qm["prof"][key] = {"now": round(vals[-1], 1), "avg3": round(sum(vals[-3:]) / len(vals[-3:]), 1) if len(vals) >= 3 else None,
+                                       "prev": round(vals[-2], 1) if len(vals) >= 2 else None, "src": "computed from statements, FY " + str(ys[-1])}
+                    filled.append(key)
+            if filled:
+                step("qm_margins_computed", "OK", filled=filled)
+        # metrics that neither the page nor the statements can give (e.g. no Gross Profit line for an insurer): not "missing", do not re-scrape for them
+        if margin_series or roic_series:
+            qm["na"] = [k for k in ("roic", "opm", "fcfm", "gm") if (qm["prof"].get(k) or {}).get("now") is None]
+            if qm["na"]:
+                step("qm_not_available", "INFO", metrics=qm["na"])
+    except Exception as e:
+        step("qm_margins_computed", "FAIL", reason=type(e).__name__)
     # analyst estimates
     est = {}
     try:
