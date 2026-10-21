@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.11"   # v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.13"   # v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -203,17 +203,32 @@ def _usd(txt):
 
 
 def parse_insider(text):
-    """v1.11: the summary page 'Insider Trading' block, window 0-12 months: {'bought': USD, 'sold': USD} (None when not readable)."""
+    """v1.11/v1.12: the summary page 'Insider Trading' block, window 0-12 months: {'bought': USD, 'sold': USD} (None when not readable).
+    Tries every occurrence of 'Insider Trading' (the first is often only a header)."""
     out = {"bought": None, "sold": None}
-    i = (text or "").find("Insider Trading")
-    if i < 0:
-        return out
-    seg = text[i:i + 900]
-    for key, word in (("bought", "Bought"), ("sold", "Sold")):
-        m = re.search(word + r"[^0-9$\-]{0,40}\$?\s*(-?\d[\d,]*\.?\d*\s*(?:\u4e07\u4ebf|\u5341\u4ebf|\u767e\u4e07|\u4ebf|\u4e07|[KMBkmb])?)", seg)
-        if m:
-            out[key] = _usd(m.group(1))
+    text = text or ""
+    for hit in re.finditer(r"Insider Trading", text):
+        seg = text[hit.start():hit.start() + 1200]
+        got = {"bought": None, "sold": None}
+        for key, word in (("bought", r"(?:Bought|Purchased|Buys?|Purchases)"), ("sold", r"(?:Sold|Sales|Sells?)")):
+            m = re.search(word + r"[^0-9$\-]{0,40}\$?\s*(-?\d[\d,]*\.?\d*\s*(?:\u4e07\u4ebf|\u5341\u4ebf|\u767e\u4e07|\u4ebf|\u4e07|[KMBkmb])?)", seg)
+            if m:
+                got[key] = _usd(m.group(1))
+        if got["bought"] is not None or got["sold"] is not None:
+            return got
     return out
+
+
+def insider_debug_text(text):
+    """v1.12: windows around the words that should sit in the insider block, to see its real layout in the log."""
+    wins = []
+    for m in re.finditer(r"(?i)bought|sold|insider (?:buy|sell|trad)|12 months|0-12|last year", text or ""):
+        a = max(0, m.start() - 80)
+        if not wins or a > wins[-1][1]:
+            wins.append((a, m.start() + 260))
+        if len(wins) >= 4:
+            break
+    return " || ".join((text[a:b]) for a, b in wins) if wins else "no insider words on the page"
 
 
 def read_insider(sb, step):
@@ -233,8 +248,7 @@ def read_insider(sb, step):
                 break
         if ins.get("bought") is None and ins.get("sold") is None:
             t = plain_text(sb.get_page_source())
-            i = t.find("Insider Trading")
-            step("qm_insider_debug", "INFO", text=t[i:i + 400] if i >= 0 else "no insider block text")
+            step("qm_insider_debug", "INFO", text=insider_debug_text(t)[:1400])
         else:
             step("qm_insider", "OK", bought=ins.get("bought"), sold=ins.get("sold"))
     except Exception as e:
@@ -264,7 +278,6 @@ def read_wall_st(sb, step):
             step("qm_wall_debug", "INFO", text=t[i:i + 220] if i >= 0 else "no widget text")
     except Exception as e:
         step("qm_wall_debug", "FAIL", reason=type(e).__name__)
-    wall["ins"] = read_insider(sb, step)   # v1.11
     return wall
 
 
@@ -413,9 +426,6 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     except Exception as e:
         step("qm_moat", "FAIL", reason=type(e).__name__)
     # data the scraper already holds
-    ins = (wall or {}).get("ins") or {}
-    if ins.get("bought") is not None or ins.get("sold") is not None:
-        qm["ins"] = {"bought": ins.get("bought"), "sold": ins.get("sold")}
     if buyback:
         qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
     if moat:
