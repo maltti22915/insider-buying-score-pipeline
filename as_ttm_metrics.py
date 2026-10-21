@@ -19,6 +19,9 @@ Signals (latest TTM vs the TTM window ending exactly 12 months earlier):
 Each signal scores 0 at the weak end, 60 at "no change", 100 at the strong end (NOW_SPEC); Now = mean of available signals.
 Also returns TTM levels and TTM net debt / EBITDA and interest cover (net debt from the latest quarter).
 """
+
+VERSION = "as_ttm_metrics v1.4"
+
 import re
 from html.parser import HTMLParser
 
