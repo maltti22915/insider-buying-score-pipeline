@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v58: Earn LT (long-term operating-income CAGR, fallback net income: est.earn_lt, earn_lt_years, earn_lt_basis) and Earn g (TTM operating income growth: ttm.earn_g) in the Quality Model payload (as_qm_data v1.15, as_ttm_metrics v1.6).
   v57: stricter COMPOUNDER gates: Net Income long-term CAGR (analyst-estimates page) and 10Y price change (summary page) stored in the Quality Model payload (as_qm_data v1.14).
   v56: AlphaSpread insider block no longer read (all insider data comes from InsiderScreener); as_qm_data v1.13.
   v55: Quality Model spec 2026-10-21: insider bought/sold USD (0-12 months) read on the summary visit (as_qm_data v1.11 read_insider -> qm.ins); capex/OCF/SG&A TTM levels (as_ttm_metrics v1.5 -> qm.ttm); buyback block with only zeros is retried and never stored as 0 (_bb_ready).
@@ -2929,7 +2930,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v57"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v58"   # bump on every change to this file
 
 
 def module_versions():
