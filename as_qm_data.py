@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.14"   # v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.15"   # v1.15 est.earn_lt / earn_lt_years / earn_lt_basis (Operating Income, fallback Net Income) and ttm.earn_g / earn_g_nm | v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -414,6 +414,9 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
                 step("qm_ni", "OK" if ni.get("cagr_hist") is not None else "INFO", ni_lt=ni.get("cagr_hist"), years=ni.get("cagr_hist_years"), opi_lt=o.get("cagr_hist"))
             except Exception as e_ni:
                 step("qm_ni", "FAIL", reason=type(e_ni).__name__)
+            _e_basis = "OpInc" if o.get("cagr_hist") is not None else ("NI" if ni.get("cagr_hist") is not None else None)   # v1.15
+            _e_src = o if _e_basis == "OpInc" else ni
+            qm["est"].update({"earn_lt": _e_src.get("cagr_hist") if _e_basis else None, "earn_lt_years": _e_src.get("cagr_hist_years") if _e_basis else None, "earn_lt_basis": _e_basis})
             qm["est"].update({"ni_lt": ni.get("cagr_hist"), "ni_lt_years": ni.get("cagr_hist_years"), "opi_lt": o.get("cagr_hist"), "opi_lt_years": o.get("cagr_hist_years")})
             if o.get("three") is None and not o.get("only"):
                 step("qm_est_debug", "INFO", opi_block=(_block_after(text, "In 3 years") or "")[:200], tab_click=how)
@@ -483,7 +486,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
         lv, sg = now_block.get("levels") or {}, now_block.get("signals") or {}
         qm["ttm"] = {"rev_growth": sg.get("rev_growth"), "rev_accel": sg.get("rev_accel"), "nd_ebitda": lv.get("nd_ebitda_ttm"),
                      "nd_ebitda_prev": lv.get("nd_ebitda_prev"), "int_cover": lv.get("interest_cover_ttm"), "sbc_pct_rev": lv.get("sbc_pct_rev"),
-                     "capex_ttm": lv.get("capex_ttm"), "ocf_ttm": lv.get("ocf_ttm"), "sga_ttm": lv.get("sga_ttm"), "sga_prev": lv.get("sga_prev"),
+                     "capex_ttm": lv.get("capex_ttm"), "ocf_ttm": lv.get("ocf_ttm"), "earn_g": lv.get("earn_g"), "earn_g_nm": lv.get("earn_g_nm"), "sga_ttm": lv.get("sga_ttm"), "sga_prev": lv.get("sga_prev"),
                      "warnings": now_block.get("warnings")}
     if not qm.get("prof") and not qm.get("est"):
         return {}
