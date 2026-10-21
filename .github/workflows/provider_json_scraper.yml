@@ -10,6 +10,7 @@
 # (Insider Buying Score + AlphaSpread), so this new functionality can be
 # tested on its own and can never affect that already-working chain.
 #
+# VERSION 12: job timeout 35 minutes (the Quality Model completion pass of provider_json_scraper v54 runs missing parts again in a fresh browser).
 # VERSION 11: new optional input as_fin ("1" = read the six AlphaSpread pages for Quality v2 = AS Fin JSON, "0" = skip); env AS_FIN. Sent by fn_24_73 v6.
 #
 # VERSION 9: SW_MAX_ATTEMPTS = 2 in the normal run, 3 in the SW-only follow-up run (a fresh runner is a better second chance than a third try on the same blocked address).
@@ -125,7 +126,7 @@ permissions:
 jobs:
   scrape-provider-json:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
 
     steps:
       - name: Check out repository
