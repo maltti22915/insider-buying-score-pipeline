@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v50: the Wall St widget counts as read only when it has values (else the Quality Model step reads summary again); solvency retry; qm_prof diagnostics; version index printed at run start and in RUN_SUMMARY ("versions"), every module has VERSION.
   v49: each AlphaSpread URL is opened once per stock: the Wall St Estimates widget is read during the summary visit of fetch_as_hist (as_qm_data.read_wall_st); as_qm_data opens summary only when that visit did not happen or was blocked.
   v48: Quality Model (QL / Dir / Outl / Q) replaces Quality v2: new step fetch_as_qm (as_qm_data.py) reads the analyst-estimates and solvency pages and bundles them with the profitability checklist, buyback, moat and TTM block already read; posted as target ASQM (fn_91_12) into "QM JSON". The 10-year statement scrape (fetch_as_fin / as_fin_data) is retired. Env AS_FIN="0" still skips it.
   v47: Quality v2 -- new step fetch_as_fin (as_fin_data.py): annual income statement / balance sheet / cash flow (unit selector set to Millions), solvency, moat and 3Y ROIC pages become the "AS Fin JSON" posted as target ASFIN (fn_91_11). Env AS_FIN="0" skips it (the sheet keeps a JSON younger than 30 days).
@@ -2178,7 +2179,7 @@ def fetch_as_hist(sb, abbrev_as):
                 import as_qm_data
                 _QM_WALL.clear()
                 _QM_WALL.update(as_qm_data.read_wall_st(sb, step))
-                _QM_WALL["visited"] = True
+                _QM_WALL["visited"] = (_QM_WALL.get("rev") is not None or _QM_WALL.get("earn") is not None)   # empty (widget still "Loading") -> the QM step reads the page again
             except Exception:
                 pass
         headline = (probe.get("headline") or "").strip()
@@ -2731,6 +2732,7 @@ def print_run_summary(trace, sheet_name, row_number, run_started, run_started_ut
 
         summary = {
             "v": "v47",
+            "versions": module_versions(),
             "sheet": sheet_name,
             "row": row_number,
             "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -2864,8 +2866,24 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
+SCRIPT_VERSION = "provider_json_scraper v50"   # bump on every change to this file
+
+
+def module_versions():
+    """Version index of this script and the helper modules (each module has a VERSION constant); '?' when a module is missing."""
+    out = [SCRIPT_VERSION]
+    for name in ("as_dcf_extractor", "as_qm_data", "as_moat", "as_ttm_metrics"):
+        try:
+            mod = __import__(name)
+            out.append(str(getattr(mod, "VERSION", name + " ?")))
+        except Exception:
+            out.append(name + " MISSING")
+    return out
+
+
 def run_bot():
     print("🤖 Booting up the provider-JSON scraper v26 (single-row mode)...")
+    print("📦 VERSIONS | " + " | ".join(module_versions()))
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
