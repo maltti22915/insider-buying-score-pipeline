@@ -20,7 +20,7 @@ Each signal scores 0 at the weak end, 60 at "no change", 100 at the strong end (
 Also returns TTM levels and TTM net debt / EBITDA and interest cover (net debt from the latest quarter).
 """
 
-VERSION = "as_ttm_metrics v1.5"   # v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
+VERSION = "as_ttm_metrics v1.6"   # v1.6 levels earn_g / earn_g_nm (TTM operating income vs the previous 12 months) | v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
 
 import re
 from html.parser import HTMLParser
@@ -256,6 +256,12 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
         return out
     if "_sbc" in out:
         out["levels"]["sbc_pct_rev"] = out.pop("_sbc")
+    _oi_now, _oi_prev = now_w.get("operating_income"), prev_w.get("operating_income")   # v1.6: Earn g (display only)
+    if _oi_now is not None and _oi_prev is not None:
+        if _oi_prev > 0:
+            out["levels"]["earn_g"] = 100.0 * (_oi_now / _oi_prev - 1.0)
+        else:
+            out["levels"]["earn_g_nm"] = True
     sig = out["signals"]
     if now_w["revenue"] and prev_w["revenue"]:
         growth = 100.0 * (now_w["revenue"] / prev_w["revenue"] - 1.0)
