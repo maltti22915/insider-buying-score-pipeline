@@ -126,7 +126,7 @@ def read_wall_st(sb, step):
     """Scrolls the already open summary page to the 'Wall St Estimates' widget (lazy block) and reads Rev / OpInc / Earnings forecast %. Never raises."""
     wall = {"rev": None, "opi": None, "earn": None}
     try:
-        for tick in range(14):
+        for tick in range(18):
             try:
                 sb.execute_script("var w=null;document.querySelectorAll('h1,h2,h3,h4,div,span').forEach(function(e){if(!w&&e.children.length===0&&(e.textContent||'').trim()==='Wall St Estimates'){w=e;}});"
                                   "if(w){w.scrollIntoView({block:'center'});}else{window.scrollBy(0,600);}")
@@ -155,7 +155,13 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     try:
         qm["prof"] = parse_profitability(prof_html) if prof_html else {}
         got = sum(1 for v in qm["prof"].values() if v.get("now") is not None)
-        step("qm_prof", "OK" if got >= 4 else "FAIL", metrics=got)
+        if got >= 4:
+            step("qm_prof", "OK", metrics=got)
+        else:
+            t = plain_text(prof_html) if prof_html else ""
+            i = t.find("Due Diligence Checks")
+            step("qm_prof", "FAIL", metrics=got, have=[k for k, v in qm["prof"].items() if v.get("now") is not None],
+                 text=(t[i:i + 700] if i >= 0 else "no 'Due Diligence Checks' text; page chars=%d" % len(t)))
     except Exception as e:
         qm["prof"] = {}
         step("qm_prof", "FAIL", reason=type(e).__name__)
@@ -204,11 +210,29 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
         step("qm_wall", "OK" if (w.get("rev") is not None or w.get("earn") is not None) else "FAIL", **{k: v for k, v in est_extra.items() if v is not None})
     except Exception as e:
         step("qm_wall", "FAIL", reason=type(e).__name__ + ": " + str(e)[:60])
-    # solvency
+    # solvency (one retry with a short wait when the first read gives nothing: blocked page or lazy block)
     try:
-        src = _open(sb, base + "solvency", r"Net\s+Debt|Altman", open_page)
-        qm["solv"] = parse_solvency(plain_text(src)) if src else {}
-        step("qm_solv", "OK" if (qm["solv"].get("bankr") is not None or qm["solv"].get("net_cash") is not None) else "FAIL", **{k: v for k, v in qm["solv"].items() if v is not None})
+        solv = {}
+        for attempt in (1, 2):
+            src = _open(sb, base + "solvency", r"Net\s+Debt|Altman", open_page) if attempt == 1 else None
+            if attempt == 2:
+                sb.sleep(6.0)
+                try:
+                    sb.execute_script("window.scrollBy(0,700);")
+                except Exception:
+                    pass
+                sb.sleep(3.0)
+                src = sb.get_page_source()
+            solv = parse_solvency(plain_text(src)) if src else {}
+            if solv.get("bankr") is not None or solv.get("net_cash") is not None:
+                break
+        qm["solv"] = solv
+        if solv.get("bankr") is not None or solv.get("net_cash") is not None:
+            step("qm_solv", "OK", **{k: v for k, v in solv.items() if v is not None})
+        else:
+            t = plain_text(src) if src else ""
+            i = max(t.find("Net Debt"), t.find("Altman"))
+            step("qm_solv", "FAIL", reason=("page empty/blocked" if not src else "no values parsed"), text=(t[i:i + 160] if i >= 0 else t[:100]))
     except Exception as e:
         qm["solv"] = {}
         step("qm_solv", "FAIL", reason=type(e).__name__)
