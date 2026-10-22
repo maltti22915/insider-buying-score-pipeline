@@ -793,7 +793,7 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
     if not abbrev:
         raise AsDcfError("EMPTY_ABBREV_AS")
 
-    url = DCF_URL_TEMPLATE.format(abbrev=abbrev)
+    url = DCF_URL_TEMPLATE.format(abbrev=__import__("re").sub(r"\s+", "-", str(abbrev).strip().strip("/")))
     _log("opening {}".format(url))
 
     try:
