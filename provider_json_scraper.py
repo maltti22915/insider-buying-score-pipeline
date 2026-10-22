@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v61: AlphaSpread URLs use '-' instead of spaces in the path (sto/atco a -> sto/atco-a); as_qm_data v1.16 / as_ttm_metrics v1.7: capex and operating-cash-flow of the previous year + OCF margins (CAPEX_SURGE), Wall St widget value 0 = missing.
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
   v60: Cloudflare fast stop: after a failed DCF the first blocked page ends the AlphaSpread session at once (pages are tried once, no 12/24/36 s waits; the remaining ratio pages are skipped) so run_bot retries with a fresh browser inside its time budget (NOW 2026-10-22 took 1030 s, all blocked).
   v59: the old Quality v4 post (target ASQ) is no longer sent: the sheet has no such columns and refused it on every run (NO_QUALITY_COLUMNS). Env AS_POST_QUALITY_V4=1 brings it back.
@@ -1624,7 +1625,7 @@ def _as_extract_ratio(text):
 def fetch_as_ratios(sb, abbrev_as):
     """Never raises: the DCF must not depend on it. Fills _AS_RATIOS = {pe|pocf|pfcf: {current, avg3y, ...}}."""
     _AS_RATIOS.clear()
-    base = "https://www.alphaspread.com/security/{}/relative-valuation/ratio/".format(str(abbrev_as).strip().strip("/"))
+    base = "https://www.alphaspread.com/security/{}/relative-valuation/ratio/".format(as_path(abbrev_as))
     for name, slug in AS_RATIO_PAGES:
         try:
             _as_open_cf(sb, base + slug, 4)
@@ -1667,7 +1668,7 @@ def _bb_ready(values):
 
 def fetch_as_buyback(sb, abbrev_as):
     """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
-    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(str(abbrev_as).strip().strip("/"))
+    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
     try:
         _as_open_cf(sb, url, 5)
         source = sb.get_page_source()
@@ -2100,7 +2101,7 @@ def fetch_as_score_details(sb, abbrev_as):
     scores = _AS_RATIOS.get("scores")
     if not isinstance(scores, dict):
         return
-    base = "https://www.alphaspread.com/security/{}".format(str(abbrev_as).strip().strip("/"))
+    base = "https://www.alphaspread.com/security/{}".format(as_path(abbrev_as))
     for kind, page in (("profit", "profitability"), ("solv", "solvency")):
         card = scores.get(kind)
         if not isinstance(card, dict):
@@ -2163,7 +2164,7 @@ def fetch_as_hist(sb, abbrev_as):
     """v30/v31: reads the AlphaSpread 'valuation history' sentence (.../summary) and stores {rank, headline, context, url} under
     _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
     scrolls in steps until it appears. On failure it saves diagnostics/as_hist_row<N>.html. Never raises."""
-    url = "https://www.alphaspread.com/security/{}/summary".format(str(abbrev_as).strip().strip("/"))
+    url = "https://www.alphaspread.com/security/{}/summary".format(as_path(abbrev_as))
     _QM_WALL.clear()   # v49: never reuse the widget of the previous stock
     try:
         _as_open_cf(sb, url, 5)
@@ -2323,7 +2324,7 @@ def fetch_as_quality(sb, abbrev_as):
     except Exception as import_error:
         step("quality", "FAIL", reason="as_quality_metrics.py missing: " + type(import_error).__name__)
         return
-    base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
+    base = "https://www.alphaspread.com/security/{}/".format(as_path(abbrev_as))
     pages, ttm_pages, q_pages = {}, {}, {}
     for name, path in AS_QUALITY_PAGES:
         try:
@@ -2945,7 +2946,12 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v60"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v61"   # bump on every change to this file
+
+
+def as_path(abbrev_as):
+    """v61: AlphaSpread URL path of an abbreviation: spaces become '-' (sto/atco a -> sto/atco-a); the original abbreviation stays unchanged for posting."""
+    return re.sub(r"\s+", "-", str(abbrev_as or "").strip().strip("/"))
 
 
 def module_versions():
