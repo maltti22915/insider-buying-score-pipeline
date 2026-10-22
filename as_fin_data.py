@@ -343,7 +343,7 @@ def fetch_as_fin(sb, abbrev_as, step, open_page, moat_hint=None):
     """Browser routine. open_page(sb, url) must open the URL and return the page source ('' when blocked). Returns the AS Fin JSON dict or None.
     Never raises.
     moat_hint: rating already read by the quality step (as_moat) in this same run; when given, the moat page is not opened again.""" 
-    base = BASE.format(str(abbrev_as).strip().strip("/"))
+    base = BASE.format(__import__("re").sub(r"\s+", "-", str(abbrev_as).strip().strip("/")))
     parts, rounded = {}, False
     for group, path in PAGES.items():
         try:
