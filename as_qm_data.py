@@ -10,7 +10,7 @@ QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.15"   # v1.15 est.earn_lt / earn_lt_years / earn_lt_basis (Operating Income, fallback Net Income) and ttm.earn_g / earn_g_nm | v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.16"   # v1.16 ttm capex_prev, ocf_prev, ocfm_now/prev/3y (CAPEX_SURGE); widget value 0 = missing | v1.15 est.earn_lt / earn_lt_years / earn_lt_basis (Operating Income, fallback Net Income) and ttm.earn_g / earn_g_nm | v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -316,7 +316,7 @@ def read_wall_st(sb, step):
 
 def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, moat=None, now_block=None, wall=None, roic_series=None, margin_series=None):
     """Opens analyst-estimates (+ Revenue / Operating Income tabs) and solvency; assembles the QM payload. Never raises; returns {} when nothing was read."""
-    base = "https://www.alphaspread.com/security/{}/".format(str(abbrev_as).strip().strip("/"))
+    base = "https://www.alphaspread.com/security/{}/".format(__import__("re").sub(r"\s+", "-", str(abbrev_as).strip().strip("/")))
     qm = {"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": []}
     # profitability (page already loaded by fetch_as_quality)
     try:
@@ -433,6 +433,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
             wsrc = _open(sb, base + "summary", r"Wall St Estimates", open_page)
             w = read_wall_st(sb, step) if wsrc else {"rev": None, "opi": None, "earn": None}
         est_extra = {"rev_w": w.get("rev"), "opi_w": w.get("opi"), "earn_w": w.get("earn")}
+        est_extra = {k: (None if v == 0 else v) for k, v in est_extra.items()}   # v1.16: a widget value of exactly 0 is a failed read, not a forecast
         qm.setdefault("est", {}).update(est_extra)
         step("qm_wall", "OK" if (w.get("rev") is not None or w.get("earn") is not None) else "FAIL", **{k: v for k, v in est_extra.items() if v is not None})
     except Exception as e:
@@ -487,6 +488,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
         qm["ttm"] = {"rev_growth": sg.get("rev_growth"), "rev_accel": sg.get("rev_accel"), "nd_ebitda": lv.get("nd_ebitda_ttm"),
                      "nd_ebitda_prev": lv.get("nd_ebitda_prev"), "int_cover": lv.get("interest_cover_ttm"), "sbc_pct_rev": lv.get("sbc_pct_rev"),
                      "capex_ttm": lv.get("capex_ttm"), "ocf_ttm": lv.get("ocf_ttm"), "earn_g": lv.get("earn_g"), "earn_g_nm": lv.get("earn_g_nm"), "sga_ttm": lv.get("sga_ttm"), "sga_prev": lv.get("sga_prev"),
+                     "capex_prev": lv.get("capex_prev"), "ocf_prev": lv.get("ocf_prev"), "ocfm_now": lv.get("ocfm_now"), "ocfm_prev": lv.get("ocfm_prev"), "ocfm_3y": lv.get("ocfm_3y"),
                      "warnings": now_block.get("warnings")}
     if not qm.get("prof") and not qm.get("est"):
         return {}
