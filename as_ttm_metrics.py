@@ -20,7 +20,7 @@ Each signal scores 0 at the weak end, 60 at "no change", 100 at the strong end (
 Also returns TTM levels and TTM net debt / EBITDA and interest cover (net debt from the latest quarter).
 """
 
-VERSION = "as_ttm_metrics v1.6"   # v1.6 levels earn_g / earn_g_nm (TTM operating income vs the previous 12 months) | v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
+VERSION = "as_ttm_metrics v1.7"   # v1.7 levels capex_prev, ocf_prev, ocfm_now, ocfm_prev, ocfm_3y (CAPEX_SURGE) | v1.6 levels earn_g / earn_g_nm (TTM operating income vs the previous 12 months) | v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
 
 import re
 from html.parser import HTMLParser
@@ -251,6 +251,17 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     out["levels"]["ocf_ttm"] = _ocf
     out["levels"]["sga_ttm"] = _sga(inc, latest)
     out["levels"]["sga_prev"] = _sga(inc, prev)
+    # v1.7: prior-year capex / OCF and operating-cash-flow margins (CAPEX_SURGE flag of the Quality Model)
+    _capex_p, _ocf_p = _g(cfs, "Capital Expenditures", prev), _g(cfs, "Cash from Operating Activities", prev)
+    out["levels"]["capex_prev"] = None if _capex_p is None else abs(_capex_p)
+    out["levels"]["ocf_prev"] = _ocf_p
+    _ocfm = []
+    for _p in (latest, prev, prev2):
+        _r, _o = _g(inc, "Revenue", _p), _g(cfs, "Cash from Operating Activities", _p)
+        _ocfm.append(_margin(_o, _r))
+    out["levels"]["ocfm_now"], out["levels"]["ocfm_prev"] = _ocfm[0], _ocfm[1]
+    _have = [m for m in _ocfm if m is not None]
+    out["levels"]["ocfm_3y"] = sum(_have) / len(_have) if len(_have) == 3 else None
     if prev not in ip:
         out["warnings"].append("no TTM window 12 months before {}: no change signals".format(latest))
         return out
