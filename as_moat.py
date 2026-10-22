@@ -11,7 +11,7 @@ Tags seen: Network Effects, Intangible Assets, (High) Switching Costs, Efficient
 AlphaSpread's moat text looks generated, so it is one input next to the financial numbers, never a substitute for them.
 """
 
-VERSION = "as_moat v1.2"
+VERSION = "as_moat v1.3"   # v1.3 looser rating match + page text near "Moat" in the warnings when nothing matches
 
 import re
 
@@ -47,7 +47,22 @@ def parse_moat(html):
             out["reason"] = n.group(3).strip()[:400]
             out["warnings"].append("new page layout: company advantage tags are not on the page")
             return out
+        # v1.3: looser reading when the two known layouts do not match -- "<Company> has a wide / narrow / no economic moat" anywhere on the page
+        g = re.search(r"\bhas\s+(?:an?\s+)?(wide|narrow|no)\s+(?:economic\s+)?moat\b", t, re.I)
+        if g:
+            out["rating"] = {"wide": "wide", "narrow": "narrow", "no": "none"}[g.group(1).lower()]
+            out["score"] = SCORES[out["rating"]]
+            out["reason"] = t[g.end():g.end() + 300].strip()
+            out["warnings"].append("loose layout match: rating read from the sentence 'has a ... moat'")
+            return out
         out["warnings"].append("moat header not found")
+        # v1.3: show what the page says around the word Moat so the next layout change can be read from the log
+        ctx = []
+        for mm in re.finditer(r"Moat", t):
+            ctx.append(t[max(0, mm.start() - 70):mm.start() + 110])
+            if len(ctx) >= 3:
+                break
+        out["warnings"].append("page text near 'Moat': " + (" || ".join(ctx) if ctx else "the word Moat is not on the page (chars=%d)" % len(t)))
         return out
     out["rating"] = {"wide": "wide", "narrow": "narrow", "none": "none", "no": "none"}[m.group(1).lower()]
     out["score"] = SCORES[out["rating"]]
