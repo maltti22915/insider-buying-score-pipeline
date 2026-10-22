@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v59: the old Quality v4 post (target ASQ) is no longer sent: the sheet has no such columns and refused it on every run (NO_QUALITY_COLUMNS). Env AS_POST_QUALITY_V4=1 brings it back.
   v58: Earn LT (long-term operating-income CAGR, fallback net income: est.earn_lt, earn_lt_years, earn_lt_basis) and Earn g (TTM operating income growth: ttm.earn_g) in the Quality Model payload (as_qm_data v1.15, as_ttm_metrics v1.6).
   v57: stricter COMPOUNDER gates: Net Income long-term CAGR (analyst-estimates page) and 10Y price change (summary page) stored in the Quality Model payload (as_qm_data v1.14).
   v56: AlphaSpread insider block no longer read (all insider data comes from InsiderScreener); as_qm_data v1.13.
@@ -2560,6 +2561,9 @@ def post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info):
         return
     quality = dict(_AS_QUALITY)
     _AS_QUALITY.clear()
+    if os.environ.get("AS_POST_QUALITY_V4", "0") != "1":   # v59
+        info["quality"] = {"posted": False, "struct": quality.get("partial_structural"), "cov": quality.get("coverage_pct"), "reason": "not sent (Quality v4 columns removed)"}
+        return
     saved_post = dict(_LAST_POST)
     try:
         posted = post_provider_json(webhook_url, "ASQ", row_number, abbrev, sheet_name, {"quality": quality})
@@ -2930,7 +2934,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v58"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v59"   # bump on every change to this file
 
 
 def module_versions():
