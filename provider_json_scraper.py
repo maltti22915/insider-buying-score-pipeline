@@ -34,6 +34,7 @@ VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v60: Cloudflare fast stop: after a failed DCF the first blocked page ends the AlphaSpread session at once (pages are tried once, no 12/24/36 s waits; the remaining ratio pages are skipped) so run_bot retries with a fresh browser inside its time budget (NOW 2026-10-22 took 1030 s, all blocked).
   v59: the old Quality v4 post (target ASQ) is no longer sent: the sheet has no such columns and refused it on every run (NO_QUALITY_COLUMNS). Env AS_POST_QUALITY_V4=1 brings it back.
   v58: Earn LT (long-term operating-income CAGR, fallback net income: est.earn_lt, earn_lt_years, earn_lt_basis) and Earn g (TTM operating income growth: ttm.earn_g) in the Quality Model payload (as_qm_data v1.15, as_ttm_metrics v1.6).
   v57: stricter COMPOUNDER gates: Net Income long-term CAGR (analyst-estimates page) and 10Y price change (summary page) stored in the Quality Model payload (as_qm_data v1.14).
@@ -1579,15 +1580,20 @@ def _as_num(text):
     return float(found.group(0).replace(",", "")) if found else None
 
 
+_FAST_BLOCK = {"on": False}   # v60: set after a failed DCF: one quick try per page, no long Cloudflare waits
+
+
 def _as_open_cf(sb, url, reconnect=4, attempts=3):
     """v48: opens an AlphaSpread page; when Cloudflare shows ("Just a moment") it waits, clicks the verification box and opens the page
     again (up to `attempts` times). Returns True when the page is not a Cloudflare page. Never raises."""
+    if _FAST_BLOCK.get("on"):
+        attempts = 1   # v60
     for attempt in range(1, attempts + 1):
         try:
             sb.uc_open_with_reconnect(url, reconnect)
             if "just a moment" not in (sb.get_title() or "").lower():
                 return True
-            sb.sleep(12 * attempt)
+            sb.sleep(3 if _FAST_BLOCK.get("on") else 12 * attempt)
             try:
                 sb.uc_gui_click_captcha()
                 sb.sleep(4.0)
@@ -1625,6 +1631,8 @@ def fetch_as_ratios(sb, abbrev_as):
             source = sb.get_page_source()
             if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
                 step("ratio_" + name, "FAIL", reason="blocked")
+                if _FAST_BLOCK.get("on"):
+                    break   # v60: blocked right after a failed DCF -> skip the remaining ratio pages
                 continue
             values = _as_extract_ratio(_as_strip_text(source))
             if values.get("current") is not None:
@@ -2596,6 +2604,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         print("⚠️ could not set window size: {}".format(size_error))
 
     dcf_failed = False
+    _FAST_BLOCK["on"] = False
     try:
         step("run_extractor", "INFO", abbrev=abbrev_as)
         data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
@@ -2604,6 +2613,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
 
     except Exception as error:
         dcf_failed = True
+        _FAST_BLOCK["on"] = True   # v60
         failure_report(sb, "as_dcf_" + (str(error).split(":")[0].strip().lower() or "failed")[:40],
                        str(error), looking_for="view calculation|full model|calculation|dcf")
         log_as_page_state(sb)
@@ -2624,7 +2634,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         # v46: when the DCF failed AND two following pages show the Cloudflare page, stop at once and let run_bot retry with a fresh browser
         # (the old run kept opening pages for 3-4 minutes, all blocked, and was never retried: Amazon, MercadoLibre 2026-10-19).
         def _stop_if_blocked():
-            if dcf_failed and _STEP_CTX.get("blocked", 0) >= 2:
+            if dcf_failed and _STEP_CTX.get("blocked", 0) >= 1:   # v60: was 2
                 raise CloudflareBlocked("AlphaSpread shows the Cloudflare page on {} steps after the DCF failed".format(_STEP_CTX.get("blocked", 0)))
         if os.environ.get("AS_RATIOS", "1") != "0":
             fetch_as_ratios(sb, abbrev_as)
@@ -2642,6 +2652,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
             _stop_if_blocked()
             fetch_as_qm(sb, abbrev_as)
 
+    _FAST_BLOCK["on"] = False
     if SAVE_DIAGNOSTICS_ALWAYS:
         save_as_diagnostics(sb, row_number, "always-on")
 
@@ -2934,7 +2945,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v59"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v60"   # bump on every change to this file
 
 
 def module_versions():
