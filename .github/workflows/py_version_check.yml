@@ -1,0 +1,21 @@
+# py_version_check.yml
+# Manual run: compares the version of every listed repository file with the version it should have (py_version_check.py EXPECTED).
+# VERSION 1: new (2026-10-23).
+name: py_version_check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compare file versions
+        run: python py_version_check.py
