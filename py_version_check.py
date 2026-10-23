@@ -20,14 +20,15 @@ HOW TO KEEP IT CURRENT
   Every time a listed file gets a new version, the number in EXPECTED changes with it (this file is delivered together with that change).
   Version lines read:  VERSION = "name v66" / SCRIPT_VERSION = "name v66"  |  "VERSION: name v3" in the docstring  |  "# VERSION 13" in a workflow.
 
-VERSION: py_version_check v1 -- (2026-10-23) new.
+VERSION: py_version_check v2 -- (2026-10-23) workflow files are looked up in .github/workflows/ as well (v1 reported provider_json_scraper.yml as MISSING).
+  v1 -- new.
 ============================================================================
 """
 import os
 import re
 import sys
 
-VERSION = "py_version_check v1"
+VERSION = "py_version_check v2"
 
 # file -> expected version (a number such as 66 or 1.16)
 EXPECTED = {
@@ -68,7 +69,10 @@ def main():
     print("📦 VERSIONS | " + VERSION)
     bad = 0
     for name, expected in EXPECTED.items():
-        actual = read_version(os.path.join(here, name))
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            path = os.path.join(here, ".github", "workflows", name)   # v2: workflows live here in the repository
+        actual = read_version(path)
         if actual == "MISSING":
             status, shown = "MISSING", ""
         elif actual is None:
