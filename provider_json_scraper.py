@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v66: PARTIAL Quality Model refresh (env QM_ONLY = workflow input qm_only, e.g. 'Shr chg' or 'ROIC,Moat'): the stage groups statement pages / analyst estimates / buyback run only when one of their inputs is missing; a buyback-only run opens no extra page; the payload is posted with partial=True and the sheet keeps all stored values it does not carry (fn_91_11 v7).
   v65: buyback also readable from the summary-page 'Investor Returns' widget ('Buyback Yield -6.44%', next to 'Dividend Yield 1.62%' which v62 had taken as the buyback for ORCL); no 5Y average there (avg5 stays empty).
   v64: Quality Model completion pass also starts when the main pass produced NO Quality Model payload at all (ORCL 2026-10-23: hist blocked, quality/qm steps did not run, Row JSON stayed without QM data); a 'stages after the DCF' log line shows which stages run.
   v63: AlphaSpread buyback is read from .../investor-returns/i/buybacks (fallback: old dividends page) and ONLY from the 'Buyback Yield' block - the dividend block's Current/Average Yield is never taken (fixes dividend payers CSU/NKE/UNH/JPM/META/PM showing dividend yield as Shr chg).
@@ -2497,6 +2498,25 @@ def _as_fin_open_page(sb, url, ready_pattern):
     return ""
 
 
+# v66: PARTIAL Quality Model refresh. The sheet (fn_94_03 refresh plan -> fn_24_05 -> fn_24_73 input qm_only) lists the inputs that are missing in the
+# stored Row JSON ("Shr chg,ROIC,..."); only the pages that can give them are read, the payload is posted with partial=True and the sheet
+# (fn_91_11) keeps every stored value the payload does not carry.
+QM_STATEMENT_LABELS = {"ROIC", "Op mgn", "FCF mgn", "Gross Margin", "Rev g", "ND/EBITDA", "Moat"}   # statement + profitability + moat pages (fetch_as_quality)
+QM_EST_LABELS = {"Rev LT", "Rev est", "OpInc est", "Earn est"}                                      # analyst-estimates page + Wall St widget
+QM_BUYBACK_LABELS = {"Shr chg"}                                                                       # buyback block (read in the ratio stage)
+
+
+def qm_only_labels():
+    """Labels from env QM_ONLY ('' = the whole Quality Model is read)."""
+    return {part.strip() for part in os.environ.get("QM_ONLY", "").split(",") if part.strip()}
+
+
+def qm_need(group):
+    """True when the stage of this label group has to run: always without QM_ONLY, else only when one of its labels is missing."""
+    only = qm_only_labels()
+    return (not only) or bool(only & group)
+
+
 def fetch_as_qm(sb, abbrev_as):
     """v48: Quality Model raw data (QM JSON): profitability checklist, analyst estimates, solvency + buyback / moat / TTM already read. Never raises.
     Env AS_FIN="0" (workflow input as_fin) skips it."""
@@ -2515,6 +2535,19 @@ def fetch_as_qm(sb, abbrev_as):
             fetch_as_buyback(sb, abbrev_as)
     except Exception:
         pass
+    only = qm_only_labels()
+    if only and not (only & (QM_STATEMENT_LABELS | QM_EST_LABELS)):
+        # v66: only the buyback is missing: nothing else is opened, the value read in the ratio stage is posted alone
+        bb = _AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None
+        if isinstance(bb, dict) and bb.get("current") is not None:
+            _AS_QM.update({"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": [], "partial": True,
+                           "bb": {"cur": bb.get("current"), "avg5": bb.get("avg")}})
+            _QM_LAST["missing"] = []
+            step("qm", "OK", partial="Shr chg only", bb=bb.get("current"))
+        else:
+            _QM_LAST["missing"] = ["Shr chg"]
+            step("qm", "FAIL", reason="partial: buyback not read", partial="Shr chg only")
+        return
     try:
         qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
                                     buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
@@ -2523,10 +2556,17 @@ def fetch_as_qm(sb, abbrev_as):
                                     wall=(dict(_QM_WALL) if _QM_WALL.get("visited") else None),
                                     roic_series=((((_AS_QUALITY.get("details") or {}).get("roic") or {}).get("raw")) or None),
                                     margin_series=(((_AS_QUALITY.get("details") or {}).get("margins")) or None))
+        if qm and only and not (only & QM_STATEMENT_LABELS):
+            # v66: partial run for analyst-estimate inputs: keep only what this run really read (prof / ttm / moat / fin of the stored JSON stay)
+            qm = {k: qm[k] for k in ("v", "fetched", "flags", "est", "warnings") if k in qm}
+            qm["partial"] = True
         if qm:
-            qm["fin"] = bool(((_AS_QUALITY.get("v4") or {}).get("profile")) == "FIN")   # v53: financials are not scored / excluded on ND/EBITDA
+            if not qm.get("partial"):
+                qm["fin"] = bool(((_AS_QUALITY.get("v4") or {}).get("profile")) == "FIN")   # v53: financials are not scored / excluded on ND/EBITDA
             try:
                 _QM_LAST["missing"] = as_qm_data.qm_missing(qm)   # v54: drives the completion pass
+                if only:   # v66: a partial run is judged only on the inputs it was asked for
+                    _QM_LAST["missing"] = [m for m in _QM_LAST["missing"] if m in only or (m == "OpInc est" and "Earn est" in only)]
             except Exception:
                 _QM_LAST["missing"] = []
             _AS_QM.update(qm)
@@ -2551,7 +2591,7 @@ def qm_completion_passes(webhook_url, row_number, abbrev_as, sheet_name, info, h
     # v64: the main pass did not produce any Quality Model payload (ORCL 2026-10-23: summary page blocked, quality + qm steps never ran,
     # the Row JSON stayed without QM data and "missing" was empty, so no completion pass started) -> everything counts as missing.
     if not _QM_LAST.get("missing") and not info.get("qm") and not _AS_QM:
-        _QM_LAST["missing"] = sorted(statement_inputs | {"Shr chg"})
+        _QM_LAST["missing"] = sorted(qm_only_labels() or (statement_inputs | {"Shr chg"}))
         print("🧩 v64: no Quality Model data came from the main pass -- completion pass will read it in a fresh browser")
     for n in range(1, passes + 1):
         missing = list(_QM_LAST.get("missing") or [])
@@ -2691,7 +2731,7 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
         print("🧭 v64: stages after the DCF | ratios={} quality={} qm={} | blocked steps={} dcf_failed={} dcf_cf={}".format(
             os.environ.get("AS_RATIOS", "1") != "0", os.environ.get("AS_QUALITY", "1") != "0", os.environ.get("AS_FIN", "1") != "0",
             _STEP_CTX.get("blocked", 0), dcf_failed, dcf_cf))
-        if os.environ.get("AS_QUALITY", "1") != "0" and not dcf_cf:
+        if os.environ.get("AS_QUALITY", "1") != "0" and not dcf_cf and qm_need(QM_STATEMENT_LABELS):   # v66: skipped when the partial list has no statement input
             _stop_if_blocked()
             fetch_as_quality(sb, abbrev_as)
         if os.environ.get("AS_FIN", "1") != "0" and not dcf_cf:   # v48: Quality Model raw data (QM JSON)
@@ -2991,7 +3031,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v65"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v66"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
