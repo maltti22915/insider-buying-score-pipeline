@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v65: buyback also readable from the summary-page 'Investor Returns' widget ('Buyback Yield -6.44%', next to 'Dividend Yield 1.62%' which v62 had taken as the buyback for ORCL); no 5Y average there (avg5 stays empty).
   v64: Quality Model completion pass also starts when the main pass produced NO Quality Model payload at all (ORCL 2026-10-23: hist blocked, quality/qm steps did not run, Row JSON stayed without QM data); a 'stages after the DCF' log line shows which stages run.
   v63: AlphaSpread buyback is read from .../investor-returns/i/buybacks (fallback: old dividends page) and ONLY from the 'Buyback Yield' block - the dividend block's Current/Average Yield is never taken (fixes dividend payers CSU/NKE/UNH/JPM/META/PM showing dividend yield as Shr chg).
   v62: a DCF page that is still the Cloudflare page ends the attempt at once (as_dcf_extractor v7 AsDcfCloudflare -> CloudflareBlocked, no ratio/quality pages, no 45 s wait); pause before an ASDCF relaunch 15-30 s (was 30-60 s).
@@ -1668,6 +1669,12 @@ def _as_extract_buyback(text):
         if found:
             out[key] = _as_num(found.group(1))
     if "current" not in out:
+        # v65: summary-page widget "Investor Returns": 'Dividend Yield 1.62%' / 'Buyback Yield -6.44%' (no Current/Min/Max labels)
+        found = re.search(r"Buyback Yield\s*:?\s*(-?[\d.,]+)\s*%", text)
+        if found:
+            out["current"] = _as_num(found.group(1))
+            out["src"] = "summary"
+    if "current" not in out:
         found = re.search(r"[Cc]urrent buyback yield for .{1,40}? is\s*(-?[\d.,]+)\s*%", text)
         if found:
             out["current"] = _as_num(found.group(1))
@@ -1676,7 +1683,7 @@ def _as_extract_buyback(text):
 
 def _bb_ready(values):
     """v55: the buyback numbers are usable only when current and average are read and are not the all-zero placeholder of a block that has not rendered yet (a real 0.00 is never stored)."""
-    if values.get("current") is None or values.get("avg") is None:
+    if values.get("current") is None or (values.get("avg") is None and values.get("src") != "summary"):   # v65: the summary widget has no 5Y average
         return False
     nums = [v for v in values.values() if isinstance(v, (int, float))]
     return not (nums and all(abs(v) < 1e-9 for v in nums))
@@ -2984,7 +2991,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v64"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v65"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
