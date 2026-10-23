@@ -33,6 +33,8 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 22
+  v64: Quality Model completion pass also starts when the main pass produced NO Quality Model payload at all (ORCL 2026-10-23: hist blocked, quality/qm steps did not run, Row JSON stayed without QM data); a 'stages after the DCF' log line shows which stages run.
+  v63: AlphaSpread buyback is read from .../investor-returns/i/buybacks (fallback: old dividends page) and ONLY from the 'Buyback Yield' block - the dividend block's Current/Average Yield is never taken (fixes dividend payers CSU/NKE/UNH/JPM/META/PM showing dividend yield as Shr chg).
   v62: a DCF page that is still the Cloudflare page ends the attempt at once (as_dcf_extractor v7 AsDcfCloudflare -> CloudflareBlocked, no ratio/quality pages, no 45 s wait); pause before an ASDCF relaunch 15-30 s (was 30-60 s).
   v61: AlphaSpread URLs use '-' instead of spaces in the path (sto/atco a -> sto/atco-a); as_qm_data v1.16 / as_ttm_metrics v1.7: capex and operating-cash-flow of the previous year + OCF margins (CAPEX_SURGE), Wall St widget value 0 = missing.
   v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
@@ -1645,11 +1647,24 @@ def fetch_as_ratios(sb, abbrev_as):
 
 
 def _as_extract_buyback(text):
-    """v28: headline numbers of the AlphaSpread buyback block (Current / Min / Max / Average / Median yield, % of market value, 5Y view)."""
+    """v63: headline numbers of the AlphaSpread BUYBACK block only. The text is cut at the heading "Buyback Yield" (and stops at the
+    next "Dividend" heading), so the Current/Min/Max/Average/Median yield of the dividend block is never read (that was the cause of
+    dividend payers showing their dividend yield as share change)."""
     out = {}
+    start = None
+    for found in re.finditer(r"Buyback Yield", text):
+        start = found.start()
+        break
+    if start is None:
+        scope = ""
+    else:
+        scope = text[start:start + 2500]
+        stop = re.search(r"Dividend\s+(?:Yield|History|Payout|Growth)", scope[12:], re.I)
+        if stop:
+            scope = scope[:12 + stop.start()]
     for label, key in (("Current Yield", "current"), ("Min Yield", "min"), ("Max Yield", "max"),
                        ("Average Yield", "avg"), ("Median Yield", "median")):
-        found = re.search(re.escape(label) + r"\s*:?\s*(-?[\d.,]+)\s*%", text, re.I)
+        found = re.search(re.escape(label) + r"\s*:?\s*(-?[\d.,]+)\s*%", scope, re.I)
         if found:
             out[key] = _as_num(found.group(1))
     if "current" not in out:
@@ -1669,7 +1684,8 @@ def _bb_ready(values):
 
 def fetch_as_buyback(sb, abbrev_as):
     """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
-    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
+    url = "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))
+    fallback_url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
     try:
         _as_open_cf(sb, url, 5)
         source = sb.get_page_source()
@@ -1677,6 +1693,12 @@ def fetch_as_buyback(sb, abbrev_as):
             step("buyback", "FAIL", reason="blocked")
             return
         values = _as_extract_buyback(_as_strip_text(source))
+        if "Buyback Yield" not in source and values.get("current") is None:
+            # v63: the buyback page is not there (404 / other layout): old page, buyback block only
+            url = fallback_url
+            _as_open_cf(sb, url, 5)
+            source = sb.get_page_source()
+            values = _as_extract_buyback(_as_strip_text(source))
         # v44: the block renders lazily - up to 3 extra tries (scroll to the block, wait, re-read; last try reloads the page)
         for attempt in range(3):
             if _bb_ready(values):
@@ -2519,6 +2541,11 @@ def qm_completion_passes(webhook_url, row_number, abbrev_as, sheet_name, info, h
     if os.environ.get("AS_FIN", "1") == "0" or passes <= 0:
         return
     statement_inputs = {"ROIC", "Op mgn", "FCF mgn", "Gross Margin", "Rev g", "ND/EBITDA", "Moat"}
+    # v64: the main pass did not produce any Quality Model payload (ORCL 2026-10-23: summary page blocked, quality + qm steps never ran,
+    # the Row JSON stayed without QM data and "missing" was empty, so no completion pass started) -> everything counts as missing.
+    if not _QM_LAST.get("missing") and not info.get("qm") and not _AS_QM:
+        _QM_LAST["missing"] = sorted(statement_inputs | {"Shr chg"})
+        print("🧩 v64: no Quality Model data came from the main pass -- completion pass will read it in a fresh browser")
     for n in range(1, passes + 1):
         missing = list(_QM_LAST.get("missing") or [])
         if not missing:
@@ -2654,6 +2681,9 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
                 fetch_as_hist(sb, abbrev_as)  # v30
                 _stop_if_blocked()
                 fetch_as_score_details(sb, abbrev_as)  # v39
+        print("🧭 v64: stages after the DCF | ratios={} quality={} qm={} | blocked steps={} dcf_failed={} dcf_cf={}".format(
+            os.environ.get("AS_RATIOS", "1") != "0", os.environ.get("AS_QUALITY", "1") != "0", os.environ.get("AS_FIN", "1") != "0",
+            _STEP_CTX.get("blocked", 0), dcf_failed, dcf_cf))
         if os.environ.get("AS_QUALITY", "1") != "0" and not dcf_cf:
             _stop_if_blocked()
             fetch_as_quality(sb, abbrev_as)
@@ -2954,7 +2984,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v62"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v64"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
