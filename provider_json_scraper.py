@@ -1,396 +1,290 @@
 """
-============================================================================
-insider_score_scraper.py
+provider_json_scraper.py
 ============================================================================
 
 PURPOSE
 ----------------------------------------------------------------------------
-Triggered ON DEMAND, for exactly ONE company at a time, via GitHub's own
-workflow_dispatch API -- called directly from this project's own Google
-Apps Script row-refresh pipeline (fn_24_05) whenever the user refreshes a
-specific row, rather than running on a fixed daily schedule for every
-configured company at once. Uses SeleniumBase's uc
-("undetected-chromedriver") mode to fetch that one company's own real
-InsiderScreener company page, and POSTs the resulting raw HTML to a
-Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
-which scores it using that project's own already-built, already-verified
-"Insider Buying Score" logic.
+Triggered ON DEMAND, for exactly ONE sheet row at a time, via GitHub's own
+workflow_dispatch API (see provider_json_scraper.yml and Apps Script's
+fn_24_73_TriggerProviderJsonRefresh_StockData_60). Uses a real browser
+(SeleniumBase uc mode, same as insider_score_scraper.py) to open a data
+provider's page, open the provider's own "Data" dialog, convert the tables
+inside it to a JSON object, and POST that object to the Apps Script webhook
+(doPost -> fn_91_01_ProviderJsonWebhook_StockData_60), which writes it as
+one JSON string into the sheet cell reserved for that provider.
 
-VERSION 15 (2026-10-23): AlphaSpread (AS Price + AS Hist) is blocked by Cloudflare on about two thirds of the rows
-(real logs 22-23 Oct: 57 of 88 rows failed, each failure burned ~5 minutes of waiting in the SAME blocked browser session).
-Changes, AlphaSpread part only (the InsiderScreener part is unchanged):
-  * AlphaSpread gets its own browser launch, HEADED (virtual display) by default: in provider_json_scraper headless was blocked
-    7 of 7 times and headed passed far more often. Env AS_LAUNCH_MODES (default "headed,headed,headless") = one fresh browser
-    launch per entry; a new launch is a new browser fingerprint, which works better than waiting in a blocked session.
-  * Inside one launch: the page is opened with uc_open_with_reconnect (v14 used a plain open on the first try), then on the
-    Cloudflare page one uc_gui_click_captcha() click and two short re-checks (about 25 s) instead of 4 tries with 20/40/60/80 s sleeps.
-  * Diagnostics (screenshot/HTML) are saved only on the last launch.
-  * The run prints a version line: "📦 VERSIONS | insider_score_scraper v15".
+Deliberately SEPARATE from insider_score_scraper.py (Insider Buying Score +
+AlphaSpread) so this new functionality can be tested on its own and can
+never affect that already-working chain.
 
-VERSION 14 (2026-10-19): scrape_alphaspread_html retries (up to 4 tries) when
-AlphaSpread answers with its Cloudflare page ("Just a moment", ~29 KB) instead of
-the real summary, and raises instead of posting that page (AS Price was MISSING
-on many rows). Nothing else changed from v13.
-
-VERSION 13 (REQUESTED DIRECTLY, TWO SMALL OBSERVABILITY FIXES, NO
-BEHAVIOUR CHANGE): 
-  (1) save_alphaspread_diagnostics no longer reports a false
-      "looks like interstitial/blocked: True". The markers "consent" and
-      "challenge-platform" appear on perfectly normal AlphaSpread pages
-      (confirmed on real Row 18 and Row 28 runs whose headline loaded
-      fine), so they were removed from the marker list. The remaining
-      markers ("just a moment", "access denied", "captcha",
-      "cookie consent") are unchanged.
-  (2) The "AS webhook reply:" log line now carries a UTC timestamp
-      (HH:MM:SS). The reply itself says the webhook wrote the value, but
-      without a time the run log could not show whether that write landed
-      before or after the Apps Script row refresh's own final write
-      (Apps Script logs are in local time, UTC+3 for this project; this
-      log is UTC). The timestamp is taken when the reply is received.
-  No change to scraping, waiting, the modal click, posting, or the
-  Insider Buying Score path. No .yml change needed.
-
-VERSION 12 (REQUESTED DIRECTLY, REAL CONFIRMED ROOT CAUSE): the saved
-diagnostics HTML (Row 28, nasdaq/amzn) shows the lazy Livewire component
-wire:name="valuation.history-context.block" (x-intersect lazy load,
-class valuation-history-context--loading, aria-busy) is rendered INSIDE the
-"More details" modal of the Intrinsic Value History widget
-(x-teleport="body", style="display: none;"). A hidden element never
-intersects the viewport, so the headline can never load by scrolling --
-which is why Rows 18 and 28 stayed at the loading placeholder after 26-27
-scrolls. (v10/v11's "block" scroll target was also the wrong element: the
-selector [class*='valuation-history-context'] matched the verdict widget
-first.) The wait now clicks .intrinsic-value-history__details ("More
-details") to open the modal, then waits for the real headline with text,
-re-clicking every ALPHASPREAD_OPEN_EVERY_SECONDS. The verdict element is
-still never accepted. UNCONFIRMED until run: that opening the modal
-actually completes the lazy load from the GitHub runner. (CONFIRMED on
-real Row 28 and Row 18 runs: the headline appeared 1.5-1.9s after the
-first click.)
-
-VERSION 11 (REQUESTED DIRECTLY, DIAGNOSTICS ONLY): the AS webhook's full
-JSON reply (trimmed to 1500 characters) is now printed after every AS post,
-because the webhook's own Apps Script execution log was not visible and
-"accepted but did not write (VALUE_NULL)" alone does not say which column
-failed or why. No behaviour change otherwise.
-
-VERSION 10 (REQUESTED DIRECTLY, REAL CONFIRMED MISTAKE): removed the v9
-verdict fallback. A real Alibaba run (Row 22, nyse/baba) waited 25s, then
-accepted .intrinsic-value-history__verdict (its text said the valuation
-was in line with its history), and the webhook correctly answered
-VALUE_NULL: that element belongs to the Intrinsic Value History widget,
-not the Valuation History headline "AS vs usual" is meant to capture (see
-fn_22_30 v88). The wait now accepts ONLY
-.valuation-history-context__headline with non-empty text, for the full
-ALPHASPREAD_WAIT_TIMEOUT_SECONDS, and scrolls the lazy Livewire block into
-view every ALPHASPREAD_SCROLL_EVERY_SECONDS seconds while waiting
-(UNCONFIRMED hypothesis: the block loads on viewport entry). The log
-reports how long the headline took and how many scrolls had happened.
-If the headline never appears the wait does NOT raise: the page is posted
-anyway so AS Price can still land, and diagnostics are saved. No .yml
-change needed.
-
-VERSION 9 (REQUESTED DIRECTLY, REAL CONFIRMED RISK): the AlphaSpread wait
-no longer ends on "whichever of the two selectors appears first". v6 waited
-on both as one CSS list. A real Row 34 (Chemometec) run matched
-.intrinsic-value-history__verdict and the webhook then reported
-VALUE_NULL; the Apps Script side treats the verdict element as the wrong
-widget for "AS vs usual", and on the same page the real
-.valuation-history-context__headline can still be loading when the verdict
-is already present, so the combined wait could end too early.
-  (1) The scraper now waits for the headline element ALONE for
-      ALPHASPREAD_FALLBACK_AFTER_SECONDS (25s).
-  (2) Only if the headline has not appeared by then, it keeps polling for
-      the rest of ALPHASPREAD_WAIT_TIMEOUT_SECONDS (60s) and accepts the
-      verdict element ONLY when it holds real, non-empty text; the headline
-      still wins if it shows up at any point. This keeps the page-markup
-      fallback from v6 (some pages may serve only the new component) while
-      removing the early-exit on an empty verdict shell.
-  (3) To go strictly headline-only, set ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
-      = False (the wait then runs the full timeout for the headline alone).
-  (4) The matched-element logging (v7/v8) and failure diagnostics are
-      unchanged; no .yml change is needed (the selectors are not in it).
-
-VERSION 8 (REQUESTED DIRECTLY, REAL CONFIRMED BUG): the v7 element
-diagnostic never actually worked. A real Row 34 (Chemometec) run printed
-"could not read element content: SyntaxError: Illegal return statement"
-(column 58 of the script, exactly where its own "return null;" sat)
-instead of the matched element's text. In this script's own uc-mode
-session, sb.execute_script evaluates the string as a bare expression
-(the error object is a DevTools-protocol evaluation result), NOT as a
-function body the way plain Selenium does, so a top-level "return" is
-illegal and "arguments[0]" would not exist either. The same flaw sat in
-save_alphaspread_diagnostics' own visible-text read (its error was
-swallowed, so it only ever reported "unavailable").
-  (1) New run_js helper: wraps a function body in an immediately-invoked
-      function, JSON.stringify's the result inside the page (so objects
-      survive either evaluation mode), and tries a "return (...)" form
-      first (classic Selenium) then a bare-expression form (uc/CDP
-      evaluation), JSON-decoding whatever comes back. Selectors are
-      embedded with json.dumps instead of passed as arguments[0].
-  (2) describe_matched_elements and the diagnostics' visible-text read
-      now both use run_js.
-  (3) Behaviour otherwise unchanged: both helpers stay fully guarded and
-      can never affect the scrape, the webhook POST or the other
-      provider's own scrape. Only the log output changes -- it should
-      now finally show whether a matched element had real text or was
-      an empty/loading shell (the question v7 was built to answer).
-
-VERSION 7 (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOTS): three
-observability fixes, found by reading a real Row 34 (Chemometec) run
-where v6 correctly matched the new .intrinsic-value-history__verdict
-element but the AS webhook then answered "accepted but did not write
-(VALUE_NULL)", and the log could not say why.
-  (1) EVERY AS scrape now prints the matched element's own visible text
-      (and whether that text is empty) plus an HTML snippet, not just
-      the selector that matched. This is what distinguishes "the element
-      was still empty/loading when the wait returned" from "the element
-      had real text the webhook's parser could not read".
-  (2) AS diagnostics (page summary, screenshot, HTML) are now also saved
-      when the webhook answers "not written" or refuses/fails -- not only
-      when the scrape itself throws. v6 only covered the timeout case, so
-      the VALUE_NULL run left nothing to inspect.
-  (3) When a webhook response is not valid JSON, the HTTP status code,
-      content type, redirect count, body length and the first 200
-      characters of the body are now logged (shared read_webhook_json
-      helper, used by both the IS and AS posts), and the message no
-      longer implies the write failed. The real Row 34 IS run printed
-      "webhook POST itself failed: Expecting value: line 1 column 1"
-      while Apps Script's own log showed the score had in fact been
-      written -- an unreadable response is not the same as a failed
-      write, and the log must not say so.
-
-VERSION 6 (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): the AlphaSpread
-scrape now waits for EITHER of AlphaSpread's two known "valuation
-history" markup shapes, and saves real diagnostics when the wait fails.
-A real GitHub Actions run for Row 34 (Chemometec, cse/chemm) showed the
-Insider Buying Score half succeeding while the AS half failed with
-"Element {.valuation-history-context__headline} was not found after 60
-seconds" -- while fn_22_30 v87 (Apps Script side) had already learned
-that AlphaSpread can serve a second, structurally different component
-(intrinsic-value-history__verdict) INSTEAD of the original headline for
-some stock pages. v4/v5 waited only for the original selector, so on a
-page using the newer component this script could wait its full timeout
-for an element that would never appear, no matter how long it waited.
-v6 waits for either selector (one combined CSS selector list) and logs
-which one matched. On any AS scrape failure it now also prints a compact
-page summary into the run log (title, URL, which selectors are present,
-whether the page looks like a Cloudflare/consent interstitial, and the
-first part of the visible text) and writes the page's own screenshot and
-HTML into ./diagnostics/ so the workflow can upload them as an artifact
-(see insider_score_scraper.yml's own matching v6 entry). The cause of
-the Row 34 failure itself is NOT yet confirmed -- the new selector is the
-leading hypothesis, and the diagnostics exist so the next failure
-explains itself instead of ending in a bare "not found".
-
-VERSION 5 (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is is now ALSO
-optional (default '', mirroring abbrev_as's own v4 treatment exactly),
-rather than a required environment variable read. Previously a row with
-a real, resolved AlphaSpread abbreviation but NO InsiderScreener coverage
-at all (a genuine, real possibility -- these are two independent
-providers with independent company coverage) could never trigger this
-workflow at all, since the required ABBREV_IS read would raise a
-KeyError the moment it was left blank. See run_bot's own real logic for
-the full detail; insider_score_scraper.yml's own matching VERSION 5 entry
-covers the input-declaration side of this same fix.
-
-VERSION 4 (REQUESTED DIRECTLY, NEW WORK): this same script, and the same
-already-running browser session, now ALSO optionally scrapes AlphaSpread's
-own "valuation history" block for the "AS vs usual" column -- see
-scrape_alphaspread_html's own docstring for the full motivation. This
-project's own earlier attempts to get this one field via Google Apps
-Script's own Scrape.do-based fetch pipeline (a headless-render API with a
-CSS-selector wait, bounded by that API's own request-level timeout) were
-shown, across an extensive real diagnostic investigation
-(fn_99_01-fn_99_04), to fail unpredictably even at a 40-second wait,
-because the underlying AlphaSpread component is a genuinely LAZY-LOADED
-Livewire component whose real load time varies between a few seconds and
-longer than any bounded API timeout can reliably wait for. A real browser
-here has no equivalent per-request timeout/proxy-rotation cost, so it can
-simply wait as long as this one page genuinely needs. This is entirely
-optional per run (an empty/missing ABBREV_AS input skips it cleanly) and
-completely independent of the existing Insider Buying Score scrape --
-either one failing can never block the other.
-
-VERSION 2 (REQUESTED DIRECTLY, ARCHITECTURE CHANGE): the original v1 of
-this script ran on a fixed daily schedule, reading EVERY configured
-company's own abbrevIS directly from the sheet via the Sheets API, and
-scraping all of them in one run. Replaced entirely -- the actual intent
-was always an on-demand, single-row refresh, triggered as part of the
-existing per-row refresh pipeline already used throughout this whole
-project, not a separate, independent daily bulk job. This version scrapes
-exactly the one company it is told to, via its own row_number/abbrev_is
-GitHub Actions inputs -- it no longer reads the sheet at all, and no
-longer requires Sheets API credentials or a Service Account of any kind.
-
-WHY THIS EXISTS AT ALL (unchanged from v1)
+PROVIDER MODULES
 ----------------------------------------------------------------------------
-Every fetch approach reachable from Google Apps Script itself (Scrape.do's
-own render+super, a targeted wait/networkidle2 variant, a direct no-proxy
-request, and ZenRows' own dedicated antibot=true engine) consistently
-failed InsiderScreener's own real Cloudflare challenge-platform
-protection. Apps Script's own UrlFetchApp has no real browser capability
-at all, and neither Scrape.do's nor ZenRows' own remote browser instances
-passed this specific site's own fingerprint check either.
+Each provider is one small scrape function plus one entry in PROVIDERS
+(see bottom of the configuration section / run_bot). Today only:
 
-SeleniumBase's uc mode runs a genuinely patched Chromium instance built
-specifically to defeat this exact class of detection -- confirmed
-directly against the person's own already-working example project
-scraping this same site's own /en/explore/{country} pages, and now
-confirmed directly working against the specific /en/company/{slug} pages
-this project's own scoring logic actually needs (14 of 16 companies
-scored correctly on this script's own first real run, in its own earlier
-v1 form).
+    SW -- Simply Wall St: /stocks/{abbrevSW}/valuation -> "Data" button ->
+          "Share Price vs. Fair Value" dialog.
 
-ASYNCHRONOUS TIMING -- WORTH KNOWING
+Adding GF later = one new scrape_gf_data() function, one new optional
+abbrev_gf workflow input, one new PROVIDERS entry here, and one new handler
+on the Apps Script side (fn_91_03). Providers are fully isolated from one
+another: one failing never blocks another.
+
+VERSION HISTORY
 ----------------------------------------------------------------------------
-fn_24_05 triggers this workflow via GitHub's own workflow_dispatch API,
-which returns immediately once the run has been queued -- it does not
-wait for this script to actually finish. This means the rest of a row's
-own refresh (SW/GF/MS/AS/everything else) completes and is visible on the
-sheet well before this script has even finished launching its own
-browser, let alone scraping the page and posting back. "Insider Buying
-Score" will visibly update a little later than the rest of that same
-row, once this run actually completes and the webhook writes the value --
-not instantly alongside everything else. This is an accepted, deliberate
-trade-off, not a bug -- blocking the whole row refresh until a real
-browser-based scrape finishes would cost far more time than it is worth.
+VERSION 22
+  v62: a DCF page that is still the Cloudflare page ends the attempt at once (as_dcf_extractor v7 AsDcfCloudflare -> CloudflareBlocked, no ratio/quality pages, no 45 s wait); pause before an ASDCF relaunch 15-30 s (was 30-60 s).
+  v61: AlphaSpread URLs use '-' instead of spaces in the path (sto/atco a -> sto/atco-a); as_qm_data v1.16 / as_ttm_metrics v1.7: capex and operating-cash-flow of the previous year + OCF margins (CAPEX_SURGE), Wall St widget value 0 = missing.
+  v40: Simply Wall St gives only the SW Price value and the SW JSON: the future / dividend pages (target SWP) are no longer opened (env SW_SUBPAGES=future,dividend brings them back).
+  v60: Cloudflare fast stop: after a failed DCF the first blocked page ends the AlphaSpread session at once (pages are tried once, no 12/24/36 s waits; the remaining ratio pages are skipped) so run_bot retries with a fresh browser inside its time budget (NOW 2026-10-22 took 1030 s, all blocked).
+  v59: the old Quality v4 post (target ASQ) is no longer sent: the sheet has no such columns and refused it on every run (NO_QUALITY_COLUMNS). Env AS_POST_QUALITY_V4=1 brings it back.
+  v58: Earn LT (long-term operating-income CAGR, fallback net income: est.earn_lt, earn_lt_years, earn_lt_basis) and Earn g (TTM operating income growth: ttm.earn_g) in the Quality Model payload (as_qm_data v1.15, as_ttm_metrics v1.6).
+  v57: stricter COMPOUNDER gates: Net Income long-term CAGR (analyst-estimates page) and 10Y price change (summary page) stored in the Quality Model payload (as_qm_data v1.14).
+  v56: AlphaSpread insider block no longer read (all insider data comes from InsiderScreener); as_qm_data v1.13.
+  v55: Quality Model spec 2026-10-21: insider bought/sold USD (0-12 months) read on the summary visit (as_qm_data v1.11 read_insider -> qm.ins); capex/OCF/SG&A TTM levels (as_ttm_metrics v1.5 -> qm.ttm); buyback block with only zeros is retried and never stored as 0 (_bb_ready).
+  v54: completion pass: when the Quality Model payload still lacks inputs the missing parts are read again in a fresh browser (up to AS_QM_FILL_PASSES=2) and posted again; as_qm_data v1.9 qm_missing().
+  v53: qm.fin = True for financials (profile FIN of the quality step); Apps Script then skips ND/EBITDA scoring and its exclusion.
+  v52: margins missing on the AlphaSpread page are computed from the statements (as_quality_metrics v6 details['margins'], as_qm_data v1.8); metrics neither source can give are listed in qm.na so Apps Script does not re-scrape for them.
+  v51: ROIC missing on the AlphaSpread page (UNH has no ROIC card) -> the yearly ROIC computed from the statements (Quality step) is used for the Quality Model (as_qm_data v1.7, step qm_roic_computed).
+  v50: the Wall St widget counts as read only when it has values (else the Quality Model step reads summary again); solvency retry; qm_prof diagnostics; version index printed at run start and in RUN_SUMMARY ("versions"), every module has VERSION.
+  v49: each AlphaSpread URL is opened once per stock: the Wall St Estimates widget is read during the summary visit of fetch_as_hist (as_qm_data.read_wall_st); as_qm_data opens summary only when that visit did not happen or was blocked.
+  v48: Quality Model (QL / Dir / Outl / Q) replaces Quality v2: new step fetch_as_qm (as_qm_data.py) reads the analyst-estimates and solvency pages and bundles them with the profitability checklist, buyback, moat and TTM block already read; posted as target ASQM (fn_91_12) into "QM JSON". The 10-year statement scrape (fetch_as_fin / as_fin_data) is retired. Env AS_FIN="0" still skips it.
+  v47: Quality v2 -- new step fetch_as_fin (as_fin_data.py): annual income statement / balance sheet / cash flow (unit selector set to Millions), solvency, moat and 3Y ROIC pages become the "AS Fin JSON" posted as target ASFIN (fn_91_11). Env AS_FIN="0" skips it (the sheet keeps a JSON younger than 30 days).
+  v46: AlphaSpread run blocked by Cloudflare (DCF failed + 2 blocked pages): stops at once and is retried with a fresh browser after 30-60 s (up to 3 attempts, budget 800 s); the scores step no longer waits 20 s on a challenge page.
+  v45: AS Profitability / Solvency cards: scrolls the card heading into view and reloads the page once when no score shows (AMZN had empty cards).
+  v45: Trend fix: the AlphaSpread TTM view click retries 3 x 12 s; "Now" is computed from the income TTM alone when the cash-flow TTM is missing (only the FCF-margin signal is dropped).
+  v44: a Cloudflare block (or any error) inside the SB context manager is no longer swallowed: it is re-raised after the browser closes, so the run counts it as "blocked" (and retries) instead of 'cannot access local variable posted'.
+  v44: the AlphaSpread buyback read retries up to 3 more times (scroll to the buybacks block, wait, re-read; the last try reloads the page) before it reports FAIL 'no buyback numbers on the page'.
+  v43: SW run also reads the SW Management + Ownership pages after the valuation dialog and posts the "Skin" score + note (target SKIN, handler fn_91_10; scoring in sw_skin.py; env SW_SKIN=0 switches it off).
+  v42: Simply Wall St now runs on SeleniumBase CDP mode (CdpSB adapter, sb.cdp.solve_captcha): sw_probe v2 passed 12 of 12 for CDP against 2 of 6 for the old uc engine (hour 12 UTC, normally the worst). SW_ENGINE=uc switches back.
+  v41: the 'View All' details read is OFF by default (AS_SCORE_DETAILS=1 turns it on): the live runs showed that AlphaSpread hides the score and checks on /profitability and /solvency for the logged-out bot ('score is Hidden', fewer than 3 checks), and each try cost 20-40 s per row.
+  v39: after AS Hist the scraper opens the AlphaSpread Profitability and Solvency analysis pages, clicks 'View All' and reads ALL due-diligence checks (name, value such as '90% > 91%', green/yellow/red status) into ratios.scores.<kind>.checks; the cell notes then list every check. AS_SCORE_DETAILS=0 disables. A failure keeps the 4 reasons from the summary card.
+  v38: the score's font colour is read from the deepest element whose whole text is 'NN' or 'NN / 100' (v37 log: scores OK but profitColor/solvColor empty because the number is not a leaf element).
+  v37: score cards are read from the card's visible text lines (title, reasons, 'NN' or 'NN / 100', 'View ... Analysis') instead of one element per number; the FAIL step prints the first lines it saw. v36 log: both headings were in the page text but no number was found.
+  v36: the font colour AlphaSpread itself uses for the score number (computed style of the '99' / '80') is read too (card.color, '#rrggbb') so the sheet can show the score in the same colour.
+  v35: AlphaSpread 'Profitability Score' and 'Solvency Score' cards (0-100 plus the tick-mark reasons, e.g. 'Exceptional 3Y Average ROIC') are read from the same summary page visit as AS Hist and sent in the ASRP payload as ratios.scores = {profit, solv}. Columns 'AS Profit' / 'AS Solv' (fn_91_07 v6, fn_24_69). AS_SCORES=0 disables.
+  v34: SW gives up on a Cloudflare challenge after SW_CF_WAIT_SECONDS (default 15, env override) instead of 25. Log analysis of 240 SW attempts: every challenge that cleared did so within 7-11 s; the others never cleared, so the extra 10 s only delayed the next retry. Other providers still use CF_CHALLENGE_WAIT_SECONDS (25).
+  v26: one final row recalculation per parallel run instead of four (handlers get skipRecalc; the parent sends ASRP recalcOnly last). SINGLE_RECALC=0 restores the old behaviour.
+  v25: MarketScreener 'Access Denied' (Akamai block of the runner address) is no longer final: home-page warm-up, then Scrape.do fallback (steps ms_warmup / ms_scrapedo); SW retries capped at SW_MAX_ATTEMPTS (3; blocks come in clusters per runner address, later tries rarely pass).
+  v24: GuruFocus off by default (GF_ENABLED=1); providers run in parallel child processes (PARALLEL=0 = old sequential run), webhook posts serialised by a file lock. v23: the quality_v4 step prints the scorer version (scorer=v5.0). Q v4 + Moat: fetch_as_quality also opens the AlphaSpread Economic Moat page, computes Q v4 (as_quality_v4.py) and the moat
+  rating (as_moat.py) and sends them in the ASQ payload as quality.v4 / quality.moat; the Now block is computed with the Q v4
+  profile (financials skip FCF and gross margin). Needs as_quality_v4.py, as_moat.py, as_ttm_metrics.py in the repo root.
+VERSION 11
+  Requested directly: get MarketScreener (MS) data through GitHub instead of
+  Scrape.do. A probe (ms_probe.py) showed a headed browser loads the MS page in
+  about 7 s with the price and consensus blocks present, and fn_22_30's MS parser
+  extracts every field from that HTML. New third provider "MS" (env ABBREV_MS,
+  workflow input abbrev_ms): scrape_ms_data opens
+  https://www.marketscreener.com/quote/stock/<abbrevMS>/, waits for any
+  challenge to clear and posts the page HTML as data.html (target "MS", payload key
+  abbrevMS) to the same webhook; Apps Script (fn_91_04) parses it with fn_22_30.
+  Uses the same Cloudflare retry, step log, RUN_SUMMARY and re-post logic as SW.
+  The Apps Script side starts in SHADOW mode (compares, writes nothing).
+  NOT VERIFIED LIVE.
 
-WHAT THIS SCRIPT DOES NOT DO
-----------------------------------------------------------------------------
-- Does not compute the score itself. The webhook it posts to reuses this
-  project's own existing fn_22_30 parsing/scoring logic directly.
-- Does not write anything to the spreadsheet directly. All writes happen
-  through the webhook, which also re-verifies the row's own abbrevIS has
-  not changed since the caller (fn_24_05) last resolved it, before
-  writing anything.
-- Does not read the spreadsheet at all, in this version -- row_number and
-  abbrev_is are provided directly as inputs by the caller that triggered
-  this workflow, which already has that row's own current data in hand.
+VERSION 10
+  Requested directly ("fix first"). Log 84 had 3 unreadable webhook replies in
+  13 runs (Rows 10 SW/AS: HTTP 200 text/html; Row 36 SW: HTTP 404 text/html)
+  although Apps Script logged SUCCESS for Row 36. The scraper counted those as
+  failures. Now post_provider_json re-posts the identical payload (up to 2 more
+  times, 6 s apart, env POST_UNREADABLE_RETRIES) when the reply is unreadable or
+  the POST itself fails; the write is idempotent (fixed cell), so it is safe. A
+  readable reply is final. If every try is unreadable the reason becomes
+  reply_unreadable_after_retries. NOT VERIFIED LIVE.
 
-REQUIRED GITHUB ACTIONS SECRETS
-----------------------------------------------------------------------------
-GAS_WEBHOOK_URL       -- this project's own deployed
-                         fn_90_01_InsiderScoreWebhook_StockData_60 Web App
-                         URL.
+VERSION 9
+  Requested directly ("optimize the process further"). Changes are based on
+  the real log of 19 Simply Wall St launches (Oct 7), not on guesses:
+    * headless was blocked 7 times out of 7 and never passed; headed passed
+      5 of 12 launches. So the default LAUNCH_MODES is now just "headed"
+      (override with env LAUNCH_MODES="headed,headless"). Each wasted headless
+      launch cost about 60 s.
+    * every Cloudflare challenge that cleared did so after 7.2-8.8 s, every other
+      one was still there at 45 s. CF_CHALLENGE_WAIT_SECONDS is now 25 (about 3x
+      the slowest observed clearing; env override CF_CHALLENGE_WAIT_SECONDS).
+    * the time saved is spent on more attempts: DEFAULT_CF_RETRY_ATTEMPTS 3 -> 5
+      (one headed launch each), pause 15-40 s -> 10-25 s, per-provider budget
+      330 s -> 400 s. At the observed ~42% chance per headed attempt, 3 attempts
+      succeed about 80% of the time, 5 attempts about 93%.
+    * the 4 identical "Tried uc_gui_click_captcha()" lines per blocked launch
+      are now one line with a count.
+  Expected effect per row: a blocked launch costs about 55 s instead of about
+  120 s (two modes of 45+ s each); a row that passes first time is unchanged.
+  NOT VERIFIED LIVE beyond the log statistics above (small sample).
 
-REQUIRED GITHUB ACTIONS INPUTS (provided by the caller triggering this
-workflow, not read from anywhere by this script itself)
-----------------------------------------------------------------------------
-row_number  -- the specific row on the target sheet this run is for.
-abbrev_is   -- OPTIONAL as of VERSION 5. That row's own current
-               InsiderScreener company slug. When absent or empty, the
-               Insider Buying Score scrape is skipped entirely.
-sheet_name  -- the real sheet this row lives on (e.g. "Salkku", "Watch") --
-               VERSION 3 addition, see that version's own changelog entry
-               below for why this is now required rather than assumed.
-abbrev_as   -- OPTIONAL, VERSION 4 addition. That row's own current
-               AlphaSpread abbreviation (e.g. "nasdaq/adsk"). When absent
-               or empty, the AlphaSpread scrape is skipped entirely and
-               this run behaves exactly as it did before v4 -- Insider
-               Buying Score only.
+VERSION 8
+  Requested directly: a much more detailed report in the log, so a failure says
+  WHICH step failed and WHAT the page looked like ("button not found" plus the
+  buttons that WERE there). Two additions, no scraping logic changed:
+    * STEP lines. Every provider attempt prints, in order, lines like
+        🔹 STEP SW a1/headed | 03 find_data_button | OK | count=1 | +14.2s
+      (provider, attempt, browser mode, step number, step name, OK/FAIL/INFO,
+      details, seconds since this browser launch). The same step names appear
+      in the RUN_SUMMARY attempts as "step" (the last step reached).
+    * FAILURE REPORT. Every failure that reaches the log now prints one block,
+      "🔬 FAILURE REPORT | <provider> | step=<name> | reason=<text>", followed
+      by indented lines: where the page is (URL, title, readyState, scroll),
+      counts (buttons, links, visible buttons, inputs), every control whose text
+      matches what the step was looking for (with visible/disabled flags), the
+      texts of the visible buttons, any dialogs/overlays/consent banners that
+      are showing, the page headings, a visible password field, and the first
+      400 characters of page text. SW failures that used to print only counts
+      ("no 'Data' button", "dialog never appeared") now print this block too.
+  The report is read-only (it only reads the page), never raises, and is capped
+  in size. A failure inside the report prints one warning line.
 
-REQUIRED PYTHON PACKAGES (requirements.txt)
-----------------------------------------------------------------------------
-seleniumbase
-requests
+VERSION 7
+  Requested directly: make the log easier for an AI to read as one picture of
+  the run. At the end of every run (also when nothing was scraped) ONE line is
+  printed, starting with the fixed marker "📋 RUN_SUMMARY " followed by a single
+  JSON object (no line breaks, so one search finds it):
+    {"v":"v7","sheet","row","runId","startedUtc","secondsTotal","providers":{
+       "SW":{"abbrev","status","attempts":[{"n","mode","result","sec"}],
+             "seconds","chars","column","reason"},
+       "ASDCF":{...same fields..., "extractor":"as_dcf_extractor v3"}}}
+  status is one of: ok | blocked (Cloudflare in every attempt) | error (the
+  scrape or webhook failed) | not_written (scraped, webhook did not write) |
+  skipped (no abbreviation). attempt result is: ok | blocked | error:<short>.
+  The line is built from facts the run already has; no scraping logic changed,
+  and building it can never raise (it is wrapped, a failure prints one warning).
+  The summary reaches the Drive log through gh_log_uploader like every other
+  line, so  grep RUN_SUMMARY  lists every run, one line each.
 
-VERSION
-----------------------------------------------------------------------------
-v13 -- Requested directly, observability only: the diagnostics'
-  "looks like interstitial/blocked" check no longer counts the markers
-  "consent" and "challenge-platform" (false positive on normal
-  AlphaSpread pages), and the "AS webhook reply:" line now carries a UTC
-  timestamp so the write order against the Apps Script row refresh can
-  be read from the logs. See this file's own top PURPOSE section's own
-  VERSION 13 paragraph.
+VERSION 6
+  Requested directly: Simply Wall St was blocked by Cloudflare in both
+  browser modes on several recent runs (Rows 34 and 30), while the same row
+  can pass minutes later. A provider that is blocked in EVERY launch mode is
+  now retried with a fresh browser: up to CF_RETRY_ATTEMPTS attempts in total
+  (default 3, env override), with a random pause of CF_RETRY_WAIT_MIN..MAX
+  seconds between attempts, and never starting a new attempt once
+  CF_RETRY_BUDGET_SECONDS (default 330) have passed since the provider
+  started, so a run stays inside the workflow timeout (raised to 20 minutes
+  in provider_json_scraper.yml v3). Only a Cloudflare block is retried: any
+  other failure (page changed, button missing, webhook error) behaves exactly
+  as before and is NOT repeated. A success on any attempt stops the retries.
+  The SW and AlphaSpread scraping code itself is unchanged.
+  NOT VERIFIED LIVE: whether a retry actually passes a challenge that blocked
+  the earlier attempt (same-row pass/fail minutes apart suggests it often does).
 
-v12 -- Requested directly, real confirmed root cause (Row 28, nasdaq/amzn):
-  the lazy valuation-history block lives inside the hidden "More details"
-  modal, so the wait now clicks .intrinsic-value-history__details
-  immediately and every ALPHASPREAD_OPEN_EVERY_SECONDS until the headline
-  has text. Does not raise on timeout (posts the page anyway, saves
-  diagnostics). Scrolling removed from use.
+VERSION 5
+  Second provider: AlphaSpread DCF (target "ASDCF"). New optional env var
+  ABBREV_AS (e.g. "nasdaq/adsk"); when set, as_dcf_extractor.py (repo root,
+  next to this file) opens alphaspread.com/security/<abbrev>/dcf-valuation,
+  clicks "View Calculation" then "Full Model" and returns the whole model table
+  (every year column, every row), the modal header and the selected row's side
+  panel. This file posts it with target "ASDCF"; fn_90_00 routes that to
+  fn_91_01, whose registry sends it to fn_91_03, which stores it in the "AS
+  JSON" cell. Changes here:
+    * ABBREV_AS env var, a "ASDCF" entry in the providers list, scrape_as_dcf().
+    * post_provider_json: the abbreviation key was built as "abbrev" + target,
+      which for ASDCF would be "abbrevASDCF"; the webhook reads "abbrevAS".
+      ABBREV_KEY_BY_TARGET now names the exact key (SW still "abbrevSW").
+    * as_dcf_extractor is imported inside try/except: if the file is missing
+      from the repository only the AS provider fails, SW is unaffected.
+    * AlphaSpread diagnostics: the full page HTML (modal included) and a
+      screenshot go to ./diagnostics (as_row<N>_page.html / .png) on every run
+      while SAVE_DIAGNOSTICS_ALWAYS is True, and on every AS failure together
+      with a one-line page-state log (title, URL, first 300 text characters).
+    * First log line now carries the version.
+  NOT VERIFIED LIVE: the AlphaSpread clicks, what a logged-out browser may
+  open, and the AS page under the headed/headless launch modes.
 
-v11 -- Diagnostics only: prints the AS webhook's full JSON reply
-  (trimmed to 1500 characters) after every AS post.
+VERSION 4
+  Third real run (Alibaba, row 32): headed mode passed Cloudflare (cleared
+  after 10.7s), the Data button was found, the dialog opened and 6 sections
+  were extracted. The saved dialog HTML (first look at the real DOM) shows
+  a clean structure: <section role="dialog" aria-label="Share Price vs.
+  Fair Value"> holding 6 <table>s, each with a <caption> (e.g. "NYSE:BABA
+  Discounted Cash Flow Data Sources"), a <thead> and a <tbody>. The v1-v3
+  extractor already handled this correctly (verified by running it against
+  that HTML in a headless browser: 6 sections, ~4.7 KB of JSON), but it
+  never read <caption>, the real section label, and its "before"/"after"
+  sibling text was mostly wrong (e.g. every table's "after" was the same
+  "Learn more about our DCF calculations" footer). Changes:
+    * Each section now carries "caption" (the table's <caption> text).
+    * "before"/"after" are no longer sent (misleading; the caption replaces
+      them). fn_91_01 only deletes them when over the size limit, so it
+      does not depend on them; fn_91_02 (not seen when this was written)
+      should be checked.
+    * DEFAULT_LAUNCH_MODES is now "headed,headless": headless was blocked in
+      both real runs and only wastes ~45s before the headed attempt.
 
-v10 -- Removed the v9 verdict fallback (the verdict element is the
-  Intrinsic Value History widget, not the headline "AS vs usual" needs);
-  waits for the headline with non-empty text only.
+VERSION 3
+  Second real run (Alibaba, row 32) showed the v2 page-state probe:
+  title "Just a moment...", body "Performing security verification ...
+  Cloudflare". The runner was stopped by a Cloudflare challenge, so there
+  was never a "Data" button to find (the v2 scroll/attribute fixes could
+  not matter yet). insider_score_scraper.py uses the SAME launch
+  (SB(uc=True, headless=True) + uc_open_with_reconnect) and passes
+  InsiderScreener's Cloudflare, so SW's challenge is simply stricter or
+  slower; the launch line alone is not the difference. Changes:
+    * After navigating, the page is checked for a Cloudflare challenge
+      (title / body text). While it is showing, the script waits up to
+      CF_CHALLENGE_WAIT_SECONDS for it to clear on its own and, in a
+      HEADED browser only, also tries sb.uc_gui_click_captcha() every
+      CF_CAPTCHA_CLICK_EVERY_SECONDS (it needs a real display; it cannot
+      work headless).
+    * A page that stays blocked raises CloudflareBlocked (a clear message
+      plus screenshot) instead of the misleading "no Data button".
+    * run_bot tries LAUNCH_MODES in order (default: headless, then
+      headed). Headed on a Linux runner relies on SeleniumBase starting
+      xvfb itself; if the headed browser cannot start, that is logged.
+      Override with env LAUNCH_MODES="headed" or "headless,headed".
+    * uc_open_with_reconnect uses reconnect_time=CF_RECONNECT_SECONDS (6).
+    * The window is resized only AFTER the challenge has cleared (the
+      working IS script never resizes).
+  NOT verified: that either extra step actually clears SW's challenge from
+  a GitHub Actions IP. Datacenter IPs are often challenged regardless of
+  browser mode; if both modes stay blocked, the realistic options are a
+  different network path (e.g. a residential proxy) or a self-hosted
+  runner, not more code here.
 
-v9 -- Headline-first wait with an opt-in, non-empty-only verdict fallback
-  (superseded by v10).
+VERSION 2
+  First real run (Alibaba, row 32) failed with "Visible 'Data' buttons
+  found: 0". The page's own DevTools markup showed the button as
+      <button data-cy-id="chart-action-toggle-data-dcf-chart"
+              aria-label="Data"> ... <span class="hidden md:inline">Data
+  inside a data-testid="intersection-renderer" block, i.e. a lazily
+  rendered section that probably does not exist in the DOM until it has
+  been scrolled into view. The scraper never scrolled. Changes:
+    * wait_for_data_buttons() now scrolls down a step on every poll, so
+      lazy "intersection-renderer" sections actually render.
+    * SW_TAG_DATA_BUTTONS_JS now also matches a button by aria-label
+      "Data" or a data-cy-id containing "toggle-data", not only by its
+      visible text (the text span is hidden below the md breakpoint).
+    * The browser window is set to 1600x1200 before navigating, so the
+      layout matches the desktop view the markup was inspected in.
+    * When no Data button is found, a "page state" probe is logged
+      (title, URL, button counts, lazy-block count, page height, first
+      300 chars of body text) so the next failure explains itself, e.g.
+      a Cloudflare/consent wall versus a lazy-render problem.
+  NOT verified against the real page: that the data-cy-id stays stable,
+  and that the "dcf-chart" Data button opens the dialog titled
+  "Share Price vs. Fair Value". The dialog title check below still
+  guards against saving the wrong dialog.
 
-v8 -- Requested directly, real confirmed bug: run_js helper (IIFE plus
-  JSON.stringify, two call shapes) replaces execute_script calls that
-  used a top-level "return" / arguments[0] and failed with "Illegal
-  return statement" in uc mode.
-
-v7 -- Requested directly, real confirmed blind spots (Row 34,
-  cse/chemm): every AS scrape now logs the matched element's text and
-  an HTML snippet (describe_matched_elements); AS diagnostics are also
-  saved when the webhook answers "not written" or refuses/fails, via
-  post_alphaspread_to_webhook now returning whether it wrote; and
-  non-JSON webhook responses now log status code, content type,
-  redirect count, body length and the first 200 body characters
-  (read_webhook_json), with wording that no longer claims the write
-  failed. Insider Buying Score scraping and scoring unchanged. See this
-  file's own top PURPOSE section's own VERSION 7 paragraph.
-
-v6 -- Requested directly, real confirmed failure (Row 34, cse/chemm): the
-  AS scrape now waits for either known valuation-history markup shape
-  (.valuation-history-context__headline OR
-  .intrinsic-value-history__verdict) instead of only the first, logs
-  which one matched, and on any AS scrape failure prints a compact page
-  summary to the run log and saves the page's screenshot and HTML to
-  ./diagnostics/ (uploaded as a workflow artifact by the matching
-  insider_score_scraper.yml v6 step). Insider Buying Score path
-  unchanged. See this file's own top PURPOSE section's own VERSION 6
-  paragraph for the full detail.
-
-v5 -- Requested directly, real confirmed gap: abbrev_is is now ALSO
-  optional, mirroring abbrev_as's own v4 treatment. See this file's own
-  top PURPOSE section's own VERSION 5 paragraph for the full detail.
-
-v4 -- Requested directly, new work: added an entirely
-  optional, independent AlphaSpread "valuation history" scrape
-  (scrape_alphaspread_html/post_alphaspread_to_webhook), reusing this same
-  script's own already-running browser session. See this file's own top
-  PURPOSE section's own VERSION 4 paragraph for the full motivation and
-  fn_90_01's own matching VERSION 5 changelog entry for the receiving
-  webhook side. Only runs when a real ABBREV_AS environment variable is
-  provided; the existing Insider Buying Score path is completely
-  unchanged and unaffected either way.
-
-v3 -- Requested directly, real confirmed bug: SHEET_NAME used to be a
-  hardcoded module-level constant, always "Salkku", regardless of which
-  real sheet a given row-refresh actually came from. A real production
-  run showed the receiving webhook (fn_90_01) refusing a genuinely
-  correct write, reporting a completely unrelated company for a row that
-  in truth only ever held the expected one -- because the webhook's own
-  mismatch check was comparing against Column D on the WRONG sheet
-  entirely (always "Salkku", never the row's own real sheet, e.g.
-  "Watch"). Fixed: sheet_name is now a real, required GitHub Actions
-  input (see insider_score_scraper.yml's own matching changelog entry),
-  read here via a real environment variable and passed through to the
-  webhook explicitly, the same way row_number/abbrev_is already were.
-
-v2 -- Requested directly, architecture change: on-demand single-row
-  trigger (via GitHub's own workflow_dispatch inputs), replacing v1's own
-  daily bulk-scrape-everything design entirely. No longer reads the sheet
-  at all; no longer requires Sheets API credentials or a Service Account.
-
-v1 -- First version -- read every configured company's own abbrevIS from
-  the sheet directly (Sheets API), scraped each one's own real company
-  page with SeleniumBase's uc mode, and posted the resulting HTML to the
-  webhook for scoring, on a fixed daily schedule.
-============================================================================
+VERSION 1 (NEW WORK)
+  First version. The dialog's real DOM was NOT available when this was
+  written (only screenshots), so the extraction is deliberately generic:
+  every <table> / role="table" inside the dialog becomes one section with
+  its own headers and rows, plus the text just before and after it. If the
+  dialog has no table-like elements at all, its visible text lines are
+  sent instead (sections stay empty, textLines is filled), so something
+  still lands in the sheet. The dialog's own HTML and a screenshot are
+  saved to ./diagnostics on every run (SAVE_DIAGNOSTICS_ALWAYS) and
+  uploaded by the workflow as an artifact -- use them to tighten the
+  extraction after the first real run, then flip that constant to False.
 """
 
-import contextlib
+import html
+import fcntl
+import sys
+import threading
+import tempfile
+import subprocess
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -400,136 +294,192 @@ from seleniumbase import SB
 
 import gh_log_uploader
 
+# AlphaSpread DCF extractor (v5). Optional: if the file is not in the
+# repository root, only the AS provider fails; SW keeps working.
+try:
+    import as_dcf_extractor
+except ImportError:
+    as_dcf_extractor = None
 
 # ----------------------------------------------------------------------------
 # CONFIGURATION
 # ----------------------------------------------------------------------------
-# VERSION 3 FIX (REQUESTED DIRECTLY, REAL CONFIRMED BUG): SHEET_NAME used
-# to be a hardcoded constant here, always "Salkku" -- regardless of which
-# real sheet (e.g. "Watch") a given row-refresh actually came from. A real
-# production run showed the receiving webhook (fn_90_01) refusing a
-# genuinely correct write, reporting a completely unrelated company for a
-# row that in truth only ever held the expected one -- because the
-# webhook's own mismatch check was comparing against Column D on the
-# WRONG sheet entirely (always "Salkku", never the row's own real sheet).
-# Now read directly from the real "sheet_name" GitHub Actions input (see
-# insider_score_scraper.yml's own matching v3 changelog entry, and
-# fn_24_71's own matching v2 entry on the Apps Script side) inside run_bot
-# below, not hardcoded here at all.
+# --- Cloudflare handling (v3) ---------------------------------------------
+# Browser launch modes tried in order for each provider. "headless" is what
+# insider_score_scraper.py uses; "headed" runs a real (virtual-display)
+# window, which Cloudflare challenges less often (headless was blocked in
+# both real runs, so headed goes first). Override with the env var
+# LAUNCH_MODES, e.g. "headed" or "headless,headed".
+DEFAULT_LAUNCH_MODES = "headed"  # v9: headless was blocked 7/7 in the real log
 
-# Real Cloudflare-protected challenges can take a genuine few seconds to
-# resolve even inside a real, patched browser -- confirmed necessary
-# directly, since this project's own earlier Apps Script-side experiments
-# (a Scrape.do-based customWait=8000/waitUntil=networkidle2 variant)
-# already established that this specific challenge needs real time to
-# settle, not just a real browser.
-PAGE_LOAD_SETTLE_SECONDS = 6
+# --- Cloudflare retry (v6) -------------------------------------------------
+# A provider blocked in EVERY launch mode is tried again with a fresh browser.
+DEFAULT_CF_RETRY_ATTEMPTS = 5        # total attempts (env CF_RETRY_ATTEMPTS)
+CF_RETRY_WAIT_MIN_SECONDS = 10       # random pause between attempts
+CF_RETRY_WAIT_MAX_SECONDS = 25
+CF_RETRY_BUDGET_SECONDS = 400        # no new attempt after this long per provider
 
-# VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): the maximum time to
-# wait for AlphaSpread's own "valuation history" block to render, using a
-# REAL, condition-based wait (SeleniumBase's own wait_for_element) rather
-# than a fixed sleep -- the core advantage this approach has over the
-# project's own earlier Scrape.do-based attempts, which were bounded by
-# Scrape.do's own request-level ceiling and were shown, across several
-# real diagnostic runs, to sometimes fail even at a 40-second wait while
-# a separate, fresh attempt succeeded in as little as 3-5 seconds. A real
-# browser with no per-request proxy/rotation cost can simply wait longer,
-# with no equivalent penalty for doing so.
-ALPHASPREAD_WAIT_TIMEOUT_SECONDS = 60
+# Seconds to wait for a Cloudflare challenge to clear on its own.
+try:
+    CF_CHALLENGE_WAIT_SECONDS = int(os.environ.get("CF_CHALLENGE_WAIT_SECONDS", "25"))
+except ValueError:
+    CF_CHALLENGE_WAIT_SECONDS = 25  # v9: clearing took 7-9 s whenever it cleared
 
-# VERSION 6 CHANGE (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE):
-# AlphaSpread appears to serve at least two structurally different markup
-# shapes for the "valuation history" block (see fn_22_30 v87 on the Apps
-# Script side, which already falls back from the original headline to
-# intrinsic-value-history__verdict). v4/v5 waited only for the first, so
-# a page using the second could never satisfy the wait. Both selectors
-# are now waited on together as one CSS selector list -- whichever
-# appears first ends the wait.
-ALPHASPREAD_HEADLINE_SELECTORS = [
-    ".valuation-history-context__headline",
-    ".intrinsic-value-history__verdict",
-]
-ALPHASPREAD_WAIT_SELECTOR = ", ".join(ALPHASPREAD_HEADLINE_SELECTORS)
+# v34: SW only -- every challenge that cleared in the logs did so within 7-11 s.
+try:
+    SW_CF_WAIT_SECONDS = int(os.environ.get("SW_CF_WAIT_SECONDS", "15"))
+except ValueError:
+    SW_CF_WAIT_SECONDS = 15
 
-# VERSION 9 ADDITION: the headline is the real target; the verdict element
-# is only an opt-in fallback, accepted only with non-empty text after the
-# headline has had ALPHASPREAD_FALLBACK_AFTER_SECONDS to appear on its own.
-ALPHASPREAD_PRIMARY_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[0]
-ALPHASPREAD_FALLBACK_SELECTOR = ALPHASPREAD_HEADLINE_SELECTORS[1]
-# VERSION 10: the verdict element is the Intrinsic Value History widget,
-# NOT the Valuation History headline "AS vs usual" needs (fn_22_30 v88).
-# Kept False and no longer used by the wait; only the diagnostics
-# still look at it.
-ALPHASPREAD_ACCEPT_VERDICT_FALLBACK = False
-ALPHASPREAD_FALLBACK_AFTER_SECONDS = 25   # unused as of v10
+# Seconds given to uc_open_with_reconnect (IS script uses 4).
+CF_RECONNECT_SECONDS = 6
 
-# VERSION 10 (superseded by v12 below): scrolling was tried first.
-ALPHASPREAD_BLOCK_SELECTOR = "[class*='valuation-history-context']"  # unused as of v12
-ALPHASPREAD_SCROLL_EVERY_SECONDS = 2  # unused as of v12
+# Headed mode only: how often to try clicking the challenge checkbox.
+CF_CAPTCHA_CLICK_EVERY_SECONDS = 12
 
-# VERSION 12: confirmed from the saved diagnostics HTML (Row 28, AMZN): the
-# lazy Livewire block (wire:name="valuation.history-context.block",
-# x-intersect lazy load) lives INSIDE the hidden "More details" modal of the
-# Intrinsic Value History widget (style="display: none;"), so it can never
-# intersect the viewport and scrolling cannot load it. Clicking this button
-# opens the modal, which is what triggers the lazy load.
-ALPHASPREAD_OPEN_DETAILS_SELECTOR = ".intrinsic-value-history__details"
-ALPHASPREAD_OPEN_EVERY_SECONDS = 10
-
-# VERSION 10: filled in by wait_for_alphaspread_block so run_bot can save
-# diagnostics when the headline never appeared, even though the page is
-# still posted (AS Price can land without the headline).
-ALPHASPREAD_WAIT_STATE = {"headline_appeared": None}
-
-# VERSION 6 ADDITION: where AS failure diagnostics (screenshot + HTML) are
-# written. Relative to the workflow's working directory; the matching
-# insider_score_scraper.yml v6 step uploads this folder as an artifact.
-DIAGNOSTICS_DIR = "diagnostics"
-
-# VERSION 6 ADDITION: how many characters of the page's visible text to
-# print into the run log when an AS scrape fails.
-DIAGNOSTIC_TEXT_PREVIEW_CHARS = 500
-
-# VERSION 13: markers that make save_alphaspread_diagnostics report
-# "looks like interstitial/blocked: True". "consent" and
-# "challenge-platform" were REMOVED because normal AlphaSpread pages
-# contain them (false positive on real Row 18 / Row 28 runs).
-INTERSTITIAL_MARKERS = (
+# Lower-case fragments that mean "this is a Cloudflare challenge page".
+CF_CHALLENGE_MARKERS = (
     "just a moment",
-    "access denied",
-    "captcha",
-    "cookie consent",
+    "performing security verification",
+    "verify you are human",
+    "attention required",
 )
 
-# VERSION 7 ADDITIONS: how much of a matched valuation-history element's
-# own text / outer HTML to print on every AS scrape, and how much of a
-# non-JSON webhook response body to print (REQUESTED DIRECTLY: first 200
-# characters).
-ELEMENT_TEXT_PREVIEW_CHARS = 300
-ELEMENT_HTML_SNIPPET_CHARS = 600
+# Browser window size set AFTER the page has loaded (desktop layout, above the md
+# breakpoint, so responsive "hidden md:inline" labels are shown).
+WINDOW_WIDTH = 1600
+WINDOW_HEIGHT = 1200
+
+# Seconds to let a freshly opened page settle before looking for buttons.
+PAGE_SETTLE_SECONDS = 4
+
+# How long to wait for the page's own "Data" button(s) to appear.
+SW_DATA_BUTTON_TIMEOUT_SECONDS = 30
+
+# Pixels scrolled down on every poll while waiting for the "Data" button,
+# so lazily rendered sections (intersection-renderer) get built.
+SW_SCROLL_STEP_PIXELS = 700
+
+# How long to wait, after one click on a "Data" button, for the
+# "Share Price vs. Fair Value" dialog (with at least one table) to appear.
+SW_DIALOG_TIMEOUT_SECONDS = 20
+
+# The page can hold several "Data" buttons (one per section). They are tried
+# in document order until one opens the dialog whose title matches
+# SW_DIALOG_TITLE_PATTERN; this caps how many are tried.
+SW_MAX_DATA_BUTTONS_TO_TRY = 6
+
+# Regex (case-insensitive) matched against the dialog's own title text.
+SW_DIALOG_TITLE_PATTERN = r"share price vs\.?\s*fair value"
+
+# Save the dialog HTML + screenshot on EVERY run (true while this is new).
+SAVE_DIAGNOSTICS_ALWAYS = True
+DIAGNOSTICS_DIR = "diagnostics"
+
 WEBHOOK_BODY_PREVIEW_CHARS = 200
+WEBHOOK_TIMEOUT_SECONDS = 120
+
+# v5: the payload key under which the webhook reads each target's abbreviation.
+# Default is "abbrev" + target ("SW" -> "abbrevSW"); targets whose key differs
+# from that rule are listed here (ASDCF reads the row's abbrevAS).
+ABBREV_KEY_BY_TARGET = {"ASDCF": "abbrevAS", "ASRP": "abbrevAS", "ASQ": "abbrevAS", "ASFIN": "abbrevAS", "ASQM": "abbrevAS", "SWP": "abbrevSW", "SKIN": "abbrevSW", "GFP": "abbrevGF"}
+
+# v5: how much of the AlphaSpread page HTML is saved as a diagnostics file.
+AS_DIAGNOSTICS_MAX_HTML_CHARS = 3000000
+
+AS_PAGE_STATE_JS = r"""
+return {
+  title: document.title,
+  url: location.href,
+  text: (document.body ? (document.body.innerText || '') : '')
+          .replace(/\s+/g, ' ').trim().slice(0, 300)
+};
+"""
 
 
 def utc_clock_text():
-    """VERSION 13 ADDITION: current UTC time as HH:MM:SS, for log lines."""
+    """Current UTC time as HH:MM:SS, for log lines."""
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+
+def utc_iso_text():
+    """Current UTC time as an ISO 8601 string (second precision)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----------------------------------------------------------------------------
+# v42: SeleniumBase CDP mode for Simply Wall St (sw_probe v2 result: CDP + solve_captcha passed 12 of 12 at 12:51 UTC, the
+# webdriver "uc" baseline 2 of 6, headless uc 0 of 6). CdpSB gives the CDP browser the few sb.* methods the SW code uses,
+# so the proven SW dialog code stays unchanged. Env SW_ENGINE=uc switches back to the old webdriver engine.
+# ----------------------------------------------------------------------------
+SW_ENGINE = os.environ.get("SW_ENGINE", "cdp").strip().lower()
+
+
+class CdpSB(object):
+    """Thin adapter: the sb.* calls of the SW scraper on top of sb.cdp (pure CDP, no webdriver)."""
+
+    def __init__(self, sb):
+        self.sb = sb
+        self.opened = False
+
+    def uc_open_with_reconnect(self, url, reconnect_time=None):
+        if not self.opened:
+            self.sb.activate_cdp_mode(url)
+            self.opened = True
+        else:
+            self.sb.cdp.open(url)
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+    def execute_script(self, script):
+        return self.sb.cdp.evaluate(script)
+
+    def get_page_source(self):
+        return self.sb.cdp.get_page_source()
+
+    def get_title(self):
+        return self.sb.cdp.get_title()
+
+    def get_current_url(self):
+        return self.sb.cdp.get_current_url()
+
+    def uc_gui_click_captcha(self):
+        self.sb.cdp.solve_captcha()
+
+    def click(self, selector, timeout=None):
+        self.sb.cdp.click(selector)
+
+    def set_window_size(self, width, height):
+        try:
+            self.sb.cdp.set_window_size(width, height)
+        except Exception:
+            pass
+
+    def send_keys(self, selector, text):
+        try:
+            self.sb.cdp.press_keys(selector, text)
+        except Exception:
+            pass
+
+    def save_screenshot(self, name, folder=None):
+        try:
+            return self.sb.cdp.save_screenshot(name, folder)
+        except Exception:
+            return None
 
 
 def run_js(sb, function_body):
     """
-    VERSION 8 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BUG): runs a
-    JavaScript function BODY in the page and returns its JSON-decoded
-    result (None when nothing usable came back).
+    Runs a JavaScript function BODY in the page and returns its
+    JSON-decoded result (None when nothing usable came back).
 
-    WHY: in this script's uc-mode session sb.execute_script can evaluate
-    its string as a bare expression, where a top-level "return" is a
-    SyntaxError ("Illegal return statement") and "arguments" does not
-    exist. Plain Selenium instead wraps the string as a function body,
-    where a bare expression returns nothing. So the body is wrapped in an
-    IIFE, its result is JSON.stringify'd inside the page (objects then
-    survive either mode), and both call shapes are tried in order.
-
-    Raises the last error if neither shape works; callers stay guarded.
+    Same helper, for the same reason, as insider_score_scraper.py's run_js:
+    in uc-mode sb.execute_script can evaluate its string as a bare
+    expression (a top-level "return" is then a SyntaxError), while plain
+    Selenium wraps it as a function body. So the body is wrapped in an
+    IIFE, its result is JSON.stringify'd inside the page, and both call
+    shapes are tried in order.
     """
     iife = (
         "(function(){"
@@ -566,353 +516,12 @@ def run_js(sb, function_body):
     return None
 
 
-def scrape_company_html(sb, abbrev_is):
-    """
-    Fetches the real, complete HTML of one company's own InsiderScreener
-    page, using SeleniumBase's own uc-mode browser.
-    """
-    target_url = "https://www.insiderscreener.com/en/company/{}".format(
-        abbrev_is
-    )
-
-    print("🌐 Navigating to: {}".format(target_url))
-
-    sb.uc_open_with_reconnect(target_url, reconnect_time=4)
-
-    # Give the real Cloudflare challenge time to fully resolve, and the
-    # page's own real content to render, before reading the HTML back out.
-    sb.sleep(PAGE_LOAD_SETTLE_SECONDS)
-
-    return sb.get_page_source()
-
-
-def open_alphaspread_details_modal(sb):
-    """
-    VERSION 12 ADDITION: clicks the "More details" button of the Intrinsic
-    Value History widget. That opens the modal which contains the lazy
-    valuation-history block, so the block finally becomes visible and
-    Livewire loads it. Returns 'clicked', 'no-button' or None (error).
-    Fully guarded.
-    """
-    try:
-        return run_js(
-            sb,
-            "var b = document.querySelector("
-            + json.dumps(ALPHASPREAD_OPEN_DETAILS_SELECTOR)
-            + "); if (!b) { return 'no-button'; }"
-            " b.click(); return 'clicked';",
-        )
-    except Exception:
-        return None
-
-
-def alphaspread_headline_has_text(sb):
-    """VERSION 10 ADDITION: True when the real headline exists AND has text."""
-    try:
-        if not sb.is_element_present(ALPHASPREAD_PRIMARY_SELECTOR):
-            return False
-
-        text = run_js(
-            sb,
-            "var el = document.querySelector("
-            + json.dumps(ALPHASPREAD_PRIMARY_SELECTOR)
-            + "); if (!el) { return ''; }"
-            " return (el.innerText || el.textContent || '');",
-        )
-        return isinstance(text, str) and bool(text.strip())
-    except Exception:
-        return False
-
-
-def wait_for_alphaspread_block(sb):
-    """
-    VERSION 10 REWRITE: waits ONLY for .valuation-history-context__headline
-    with real text, for up to ALPHASPREAD_WAIT_TIMEOUT_SECONDS. The verdict
-    element is never accepted (wrong widget, see fn_22_30 v88).
-
-    VERSION 12: the lazy block sits inside the hidden "More details" modal
-    of the Intrinsic Value History widget, so scrolling (v10/v11) could
-    never load it. The loop now clicks that button right away and again
-    every ALPHASPREAD_OPEN_EVERY_SECONDS seconds until the headline has
-    text. The log says how long the headline took and how many times the
-    modal was opened ('clicked' = button found; 'no-button' = the page
-    has no such button, i.e. the layout changed again).
-
-    Returns True when the headline appeared, False when it did not. It does
-    NOT raise on timeout (unlike the v10 patch notes): the page is still
-    posted so "AS Price" can land from it, and run_bot saves diagnostics
-    using ALPHASPREAD_WAIT_STATE.
-    """
-    started = time.monotonic()
-    deadline = started + ALPHASPREAD_WAIT_TIMEOUT_SECONDS
-    last_open_at = None
-    open_count = 0
-    last_open_result = None
-
-    ALPHASPREAD_WAIT_STATE["headline_appeared"] = None
-
-    while time.monotonic() < deadline:
-        if alphaspread_headline_has_text(sb):
-            ALPHASPREAD_WAIT_STATE["headline_appeared"] = True
-            print(
-                "\u2705 Headline appeared after {:.1f}s | modal opens so far: {}"
-                " (last result: {})".format(
-                    time.monotonic() - started,
-                    open_count,
-                    last_open_result,
-                )
-            )
-            return True
-
-        now = time.monotonic()
-        if (
-            last_open_at is None
-            or now - last_open_at >= ALPHASPREAD_OPEN_EVERY_SECONDS
-        ):
-            last_open_result = open_alphaspread_details_modal(sb)
-            last_open_at = now
-            open_count += 1
-
-        sb.sleep(1)
-
-    ALPHASPREAD_WAIT_STATE["headline_appeared"] = False
-    print(
-        "\u26a0\ufe0f {} (with text) did not appear within {} seconds |"
-        " modal opens: {} (last result: {})".format(
-            ALPHASPREAD_PRIMARY_SELECTOR,
-            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
-            open_count,
-            last_open_result,
-        )
-    )
-    return False
-
-
-def scrape_alphaspread_html(sb, abbrev_as):
-    """
-    VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): fetches the real,
-    complete HTML of one company's own AlphaSpread summary page, waiting
-    for the "valuation history" block's own real headline element to
-    actually appear (via SeleniumBase's own condition-based
-    wait_for_element) rather than a fixed sleep.
-
-    VERSION 6 CHANGE: waits for EITHER known markup shape of that block
-    (see ALPHASPREAD_HEADLINE_SELECTORS) rather than only the original
-    headline element, and logs which one actually matched.
-
-    VERSION 7 CHANGE: also logs the matched element's own text and an
-    HTML snippet (describe_matched_elements), since a selector merely
-    being present does not prove the lazy-loaded block had finished
-    filling in. The original
-    only-first-selector wait could never succeed on a page that serves
-    the newer intrinsic-value-history__verdict component instead.
-
-    WHY THIS EXISTS: this project's own earlier Apps Script pipeline
-    fetched this same page via Scrape.do's own headless-render API with a
-    playWithBrowser WaitSelector action, capped at a fixed timeout
-    (raised progressively from 15s to 40s across several real production
-    fixes). Extensive, real diagnostic testing (this project's own
-    fn_99_01/fn_99_02/fn_99_03/fn_99_04 investigation) confirmed directly
-    that this specific block is a genuinely LAZY-LOADED Livewire
-    component (AlphaSpread's own explicit design choice, not an
-    incidental slow query) whose real load time varies widely between
-    attempts -- as little as 3-5 seconds on one fresh attempt, and still
-    incomplete at a full 40-second wait on another, with no way to
-    predict which in advance. A real browser, running here with no
-    per-request proxy-rotation cost and no arbitrarily-bounded API
-    timeout, can simply wait as long as this one page genuinely needs,
-    the same way a real user's own browser would.
-
-    Does NOT use uc_open_with_reconnect (that mechanism exists
-    specifically to defeat InsiderScreener's own Cloudflare
-    challenge-platform protection) -- AlphaSpread has shown no equivalent
-    challenge in this project's own real fetch history via Scrape.do
-    (confirmed working there without any comparable anti-bot bypass),
-    so a plain sb.open() is used here instead, reusing the SAME already-
-    running uc-mode browser session regardless (uc=True affects how the
-    whole browser session presents itself, not each individual
-    navigation), which costs nothing extra and keeps this function
-    consistent with the rest of this same run.
-
-    VERSION 10 CHANGE: no longer raises when the headline never appears;
-    the page is returned anyway (AS Price does not depend on the headline)
-    and run_bot saves diagnostics via ALPHASPREAD_WAIT_STATE. Other
-    failures (navigation etc.) still raise and are caught by run_bot,
-    exactly as for scrape_company_html, so one scrape failing can never
-    block the other.
-    """
-    target_url = "https://www.alphaspread.com/security/{}/summary".format(
-        abbrev_as
-    )
-
-    # VERSION 14 (2026-10-19): AS Price came out MISSING on many rows because
-    # AlphaSpread sometimes answers with its Cloudflare page (title "Just a
-    # moment", about 29 KB instead of about 2 MB) and that page was posted as if
-    # it were the summary. Up to 4 tries now: a try only counts when the title is
-    # not the challenge and the page is long enough; otherwise wait (longer each
-    # time) and re-open with uc_open_with_reconnect. If every try is blocked this
-    # raises, so nothing is posted and the old cell stays (run_bot logs the error
-    # and saves diagnostics).
-    # VERSION 15: one launch = one short attempt (see the v15 note at the top of the file).
-    last_problem = "unknown"
-    page_ok = False
-    print("🌐 Navigating to: {} (launch attempt)".format(target_url))
-    try:
-        sb.uc_open_with_reconnect(target_url, reconnect_time=6)
-        sb.sleep(2)
-    except Exception as open_error:
-        raise RuntimeError("AlphaSpread open failed: {}".format(open_error))
-
-    def _as_page_state():
-        try:
-            page_title = (sb.get_title() or "").lower()
-        except Exception:
-            page_title = ""
-        try:
-            page_length = len(sb.get_page_source() or "")
-        except Exception:
-            page_length = 0
-        blocked = ("just a moment" in page_title) or page_length < 100000
-        return blocked, page_title, page_length
-
-    blocked, page_title, page_length = _as_page_state()
-    if blocked:
-        print("⚠️ AlphaSpread shows the Cloudflare page (title={!r}, {} chars) -- one verification click, then two short re-checks".format(page_title[:30], page_length))
-        try:
-            sb.sleep(6)
-            sb.uc_gui_click_captcha()
-            print("🖱️ Tried uc_gui_click_captcha()")
-        except Exception as click_error:
-            print("⚠️ uc_gui_click_captcha failed: {}".format(click_error))
-        for wait_seconds in (8, 10):
-            sb.sleep(wait_seconds)
-            blocked, page_title, page_length = _as_page_state()
-            if not blocked:
-                print("✅ Cloudflare cleared after the click")
-                break
-    if blocked:
-        last_problem = "Cloudflare/short page (title={!r}, {} chars)".format(page_title[:30], page_length)
-        raise RuntimeError("AlphaSpread summary not usable in this launch: {}".format(last_problem))
-    page_ok = True
-
-    print(
-        "⏳ Waiting up to {}s for the real valuation-history element"
-        " ({}) to appear (real browser, no fixed sleep)...".format(
-            ALPHASPREAD_WAIT_TIMEOUT_SECONDS,
-            ALPHASPREAD_PRIMARY_SELECTOR
-            + (
-                " (verdict fallback after {}s, non-empty only)".format(
-                    ALPHASPREAD_FALLBACK_AFTER_SECONDS
-                )
-                if ALPHASPREAD_ACCEPT_VERDICT_FALLBACK
-                else ""
-            ),
-        )
-    )
-
-    headline_appeared = wait_for_alphaspread_block(sb)
-
-    if not headline_appeared:
-        print(
-            "\u23e9 Headline never appeared -- posting the page anyway so"
-            " AS Price can still be written from it."
-        )
-
-    # VERSION 7: log which markup shape this page actually served AND
-    # what that element actually contained, on every scrape (not only
-    # failures) -- see describe_matched_elements.
-    describe_matched_elements(sb)
-
-    return sb.get_page_source()
-
-
-def describe_matched_elements(sb):
-    """
-    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED BLIND SPOT):
-    for each known valuation-history selector that is present on the
-    page, prints its own visible text, whether that text is empty, its
-    child-element count, and a snippet of its outer HTML.
-
-    WHY: v6 only printed which selector matched. A real Row 34 run
-    matched .intrinsic-value-history__verdict and the webhook then
-    reported VALUE_NULL, with nothing in the log to show whether the
-    element had real text (a parser problem) or was still an empty or
-    loading shell when the wait returned (a wait problem). This output
-    answers that on every scrape, including successful ones, so a
-    working run can be compared with a failing one.
-
-    Fully guarded -- never raises, never affects the scrape itself.
-    """
-    # VERSION 8: a function BODY run via run_js (no top-level-return
-    # problem in uc mode); the selector is embedded, not "arguments[0]".
-    def build_script(selector):
-        return (
-            "var el = document.querySelector(" + json.dumps(selector) + ");"
-            " if (!el) { return null; }"
-            " return {text: (el.innerText || el.textContent || ''),"
-            " html: (el.outerHTML || ''),"
-            " children: el.children ? el.children.length : 0};"
-        )
-
-    matched_any = False
-
-    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
-        try:
-            if not sb.is_element_present(selector):
-                continue
-        except Exception:
-            continue
-
-        matched_any = True
-        print("🔎 Matched valuation-history element: {}".format(selector))
-
-        try:
-            details = run_js(sb, build_script(selector))
-        except Exception as error:
-            print("   (could not read element content: {})".format(error))
-            continue
-
-        if not details:
-            print("   (element disappeared before its content could be read)")
-            continue
-
-        text = re.sub(r"\s+", " ", details.get("text") or "").strip()
-        html_snippet = re.sub(r"\s+", " ", details.get("html") or "").strip()
-
-        print(
-            "   text length: {} | text empty: {} | child elements: {}".format(
-                len(text), not text, details.get("children")
-            )
-        )
-        print(
-            "   text (first {} chars): {}".format(
-                ELEMENT_TEXT_PREVIEW_CHARS,
-                text[:ELEMENT_TEXT_PREVIEW_CHARS] if text else "(empty)",
-            )
-        )
-        print(
-            "   HTML (first {} chars): {}".format(
-                ELEMENT_HTML_SNIPPET_CHARS,
-                html_snippet[:ELEMENT_HTML_SNIPPET_CHARS],
-            )
-        )
-
-    if not matched_any:
-        print("🔎 No known valuation-history element is present on the page.")
-
-
 def read_webhook_json(response, label):
     """
-    VERSION 7 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED MISLEADING
-    LOG): parses a webhook response as JSON, returning the parsed object,
-    or None if the body is not valid JSON.
-
-    When parsing fails, prints the HTTP status code, content type,
-    redirect count, body length, and the first WEBHOOK_BODY_PREVIEW_CHARS
-    characters of the body, so an empty body, an HTML error page, and a
-    truncated response can be told apart from the log alone.
-
-    label -- a short prefix for the log lines, e.g. "Row 34 (abbrev)".
+    Parses a webhook response as JSON, returning the parsed object, or None
+    when the body is not valid JSON (after printing enough detail --
+    status, content type, redirects, length, a body preview -- to tell an
+    empty body, an HTML error page and a truncated response apart).
     """
     try:
         return response.json()
@@ -945,478 +554,2635 @@ def read_webhook_json(response, label):
     return None
 
 
-def save_alphaspread_diagnostics(sb, row_number, abbrev_as, reason="scrape failed"):
+# ----------------------------------------------------------------------------
+# SW (Simply Wall St) -- JavaScript run inside the page
+# ----------------------------------------------------------------------------
+# Lists every visible element that is a "Data" button -- matched by its own
+# text being exactly "Data", OR by aria-label "Data", OR by a data-cy-id
+# containing "toggle-data" (the text span is hidden below the md breakpoint,
+# and the attributes are the more stable hook). Tags each with
+# data-sw-scrape-idx="<n>" so Python can click a specific one, and returns
+# how many there are.
+SW_TAG_DATA_BUTTONS_JS = r"""
+function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function visible(el) {
+  return !!(el && (el.offsetWidth || el.offsetHeight ||
+    (el.getClientRects && el.getClientRects().length)));
+}
+var old = document.querySelectorAll('[data-sw-scrape-idx]');
+for (var o = 0; o < old.length; o++) {
+  old[o].removeAttribute('data-sw-scrape-idx');
+}
+var nodes = document.querySelectorAll('button, a, [role="button"]');
+var n = 0;
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  var byAttr = /^data$/i.test(clean(el.getAttribute('aria-label') || '')) ||
+    /toggle-data/i.test(el.getAttribute('data-cy-id') || '');
+  if ((/^data$/i.test(clean(el.innerText || el.textContent)) || byAttr) &&
+      visible(el)) {
+    el.setAttribute('data-sw-scrape-idx', String(n));
+    n++;
+  }
+}
+return n;
+"""
+
+# Snapshot of the page's state, logged when no Data button was found, so the
+# failure explains itself (blocked/consent page vs. lazy render vs. wrong
+# markup).
+SW_PAGE_STATE_JS = r"""
+return {
+  title: document.title,
+  url: location.href,
+  buttons: document.querySelectorAll('button').length,
+  dataCyToggleData: document.querySelectorAll('[data-cy-id*="toggle-data"]').length,
+  ariaLabelData: document.querySelectorAll('button[aria-label="Data"]').length,
+  lazyBlocks: document.querySelectorAll('[data-testid="intersection-renderer"]').length,
+  scrollHeight: document.documentElement.scrollHeight,
+  scrollY: window.scrollY,
+  bodyStart: String(document.body ? (document.body.innerText || '') : '')
+    .replace(/\s+/g, ' ').slice(0, 300)
+};
+"""
+
+# Optional, guarded cookie/consent dismissal. Clicks at most one button whose
+# text is a plain "accept"-style label AND which sits inside an element that
+# mentions cookies/consent/privacy. Returns the clicked label or null.
+SW_DISMISS_CONSENT_JS = r"""
+function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+var LABEL = /^(accept( all)?( cookies)?|i agree|agree|allow all|got it)$/i;
+var nodes = document.querySelectorAll('button, [role="button"]');
+for (var i = 0; i < nodes.length; i++) {
+  var el = nodes[i];
+  var label = clean(el.innerText || el.textContent);
+  if (!LABEL.test(label)) { continue; }
+  var p = el.parentElement, hops = 0, banner = false;
+  while (p && hops < 6) {
+    if (/cookie|consent|privacy/i.test(p.textContent || '')) { banner = true; break; }
+    p = p.parentElement; hops++;
+  }
+  if (banner) { el.click(); return label; }
+}
+return null;
+"""
+
+# Finds the open "Share Price vs. Fair Value" dialog and converts its tables
+# to plain data. TITLE_PATTERN is substituted in by Python before running.
+SW_EXTRACT_DIALOG_JS = r"""
+var TITLE_RE = new RegExp(__TITLE_PATTERN__, 'i');
+function clean(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function visible(el) {
+  return !!(el && (el.offsetWidth || el.offsetHeight ||
+    (el.getClientRects && el.getClientRects().length)));
+}
+var TABLE_SEL = 'table, [role="table"], [role="grid"]';
+
+// 1) every visible, near-leaf element whose text IS the dialog title
+var all = document.querySelectorAll('body *');
+var headings = [];
+for (var i = 0; i < all.length; i++) {
+  var el = all[i];
+  if (el.children.length > 3) { continue; }
+  var t = clean(el.textContent);
+  if (t.length < 80 && TITLE_RE.test(t) && visible(el)) { headings.push(el); }
+}
+
+// 2) from each, climb to the smallest ancestor that also holds a table (or
+//    the words "Data Point"); the SMALLEST such ancestor over all headings
+//    is the dialog (the page's own section heading, if it shares the title,
+//    only reaches a much larger container, or none).
+var root = null, rootLen = Infinity, rootHeading = null;
+for (var h = 0; h < headings.length; h++) {
+  var node = headings[h];
+  while (node && node !== document.body) {
+    var tx = node.textContent || '';
+    if (/data point/i.test(tx) || node.querySelector(TABLE_SEL)) {
+      if (tx.length < rootLen) {
+        root = node; rootLen = tx.length; rootHeading = headings[h];
+      }
+      break;
+    }
+    node = node.parentElement;
+  }
+}
+if (!root) { return {found: false, headingCount: headings.length}; }
+
+// Title = the SHORTEST matching heading text inside the dialog (a wrapper
+// element that also holds, e.g., the close button has longer text).
+var title = '';
+for (var q = 0; q < headings.length; q++) {
+  if (root.contains(headings[q])) {
+    var ht = clean(headings[q].textContent);
+    if (!title || ht.length < title.length) { title = ht; }
+  }
+}
+
+function cellTexts(row) {
+  var cells = row.querySelectorAll(
+    'th, td, [role="columnheader"], [role="rowheader"], [role="cell"], [role="gridcell"]');
+  var out = [];
+  for (var c = 0; c < cells.length; c++) {
+    out.push(clean(cells[c].innerText || cells[c].textContent));
+  }
+  return out;
+}
+function isHeaderRow(row) {
+  if (row.closest('thead')) { return true; }
+  if (row.querySelector('th, [role="columnheader"]') &&
+      !row.querySelector('td, [role="cell"], [role="gridcell"]')) { return true; }
+  return false;
+}
+var tableEls = root.querySelectorAll(TABLE_SEL);
+var sections = [];
+for (var k = 0; k < tableEls.length; k++) {
+  var tbl = tableEls[k];
+  var rowEls = tbl.querySelectorAll('tr, [role="row"]');
+  var headers = [], rows = [];
+  for (var r = 0; r < rowEls.length; r++) {
+    var row = rowEls[r];
+    if (row.closest(TABLE_SEL) !== tbl) { continue; }   // skip nested tables' rows
+    var cellsText = cellTexts(row);
+    if (!cellsText.length) { continue; }
+    if (!headers.length && isHeaderRow(row)) { headers = cellsText; }
+    else { rows.push(cellsText); }
+  }
+  if (!headers.length && !rows.length) { continue; }
+  var capEl = tbl.querySelector('caption');
+  sections.push({
+    caption: capEl ? clean(capEl.innerText || capEl.textContent) : '',
+    headers: headers,
+    rows: rows
+  });
+}
+
+var lines = [];
+if (!sections.length) {
+  var rawLines = String(root.innerText || root.textContent || '').split(/\n+/);
+  for (var L = 0; L < rawLines.length; L++) {
+    var line = clean(rawLines[L]);
+    if (line) { lines.push(line); }
+  }
+}
+
+return {
+  found: true,
+  title: title,
+  sections: sections,
+  lines: lines,
+  html: root.outerHTML,
+  headingCount: headings.length
+};
+"""
+
+
+def sw_page_url(abbrev_sw):
+    """Simply Wall St valuation page for one abbrevSW (4 path segments)."""
+    return "https://simplywall.st/stocks/{}/valuation".format(abbrev_sw)
+
+
+def save_sw_diagnostics(sb, row_number, dialog_html, reason):
     """
-    VERSION 6 ADDITION (REQUESTED DIRECTLY, REAL CONFIRMED FAILURE): when
-    the AS scrape fails (typically the wait timing out), records what
-    the browser was actually looking at so the failure explains itself.
-
-    VERSION 7 CHANGE: also called when the scrape succeeded but the
-    webhook answered "not written" or refused/failed (a real Row 34 run
-    ended in VALUE_NULL with nothing saved to inspect). The new reason
-    argument says which situation this is in the log.
-
-    VERSION 13 CHANGE: the "looks like interstitial/blocked" check uses
-    INTERSTITIAL_MARKERS, which no longer contains "consent" or
-    "challenge-platform" (both appear on normal AlphaSpread pages).
-
-    Does two things, each independently guarded so a failure in one (or
-    in this whole function) can never raise out of it or affect the rest
-    of the run:
-
-    1. Prints a compact summary into the run log: page title, current
-       URL, which of the known valuation-history selectors are present,
-       whether the page looks like a Cloudflare/consent/blocked
-       interstitial, the page source length, and the first part of the
-       page's visible text.
-    2. Writes the page's own screenshot and full HTML into
-       DIAGNOSTICS_DIR, for the workflow's own upload-artifact step.
-
-    Not a fix for anything by itself -- it only observes.
+    Writes the dialog's HTML (when known) and a screenshot into
+    DIAGNOSTICS_DIR, so a first real run shows exactly what the page
+    looked like. Fully guarded -- never raises.
     """
-    print(
-        "🩺 AS diagnostics for Row {} ({}) -- reason: {}".format(
-            row_number, abbrev_as, reason
-        )
-    )
-
-    try:
-        print("   title: {}".format(sb.get_title()))
-    except Exception as error:
-        print("   title: (unavailable: {})".format(error))
-
-    try:
-        print("   url: {}".format(sb.get_current_url()))
-    except Exception as error:
-        print("   url: (unavailable: {})".format(error))
-
-    for selector in ALPHASPREAD_HEADLINE_SELECTORS:
-        try:
-            print(
-                "   present {}: {}".format(
-                    selector, sb.is_element_present(selector)
-                )
-            )
-        except Exception as error:
-            print("   present {}: (check failed: {})".format(selector, error))
-
-    page_source = ""
-
-    try:
-        page_source = sb.get_page_source() or ""
-        lowered = page_source.lower()
-        print("   page source length: {} chars".format(len(page_source)))
-        print(
-            "   looks like interstitial/blocked: {}".format(
-                any(marker in lowered for marker in INTERSTITIAL_MARKERS)
-            )
-        )
-        print(
-            "   mentions livewire: {} | mentions wire:snapshot: {}".format(
-                "livewire" in lowered, "wire:snapshot" in lowered
-            )
-        )
-    except Exception as error:
-        print("   page source: (unavailable: {})".format(error))
-
-    try:
-        visible_text = run_js(
-            sb, "return document.body ? document.body.innerText : '';"
-        ) or ""
-        visible_text = re.sub(r"\s+", " ", visible_text).strip()
-        print(
-            "   visible text (first {} chars): {}".format(
-                DIAGNOSTIC_TEXT_PREVIEW_CHARS,
-                visible_text[:DIAGNOSTIC_TEXT_PREVIEW_CHARS],
-            )
-        )
-    except Exception as error:
-        print("   visible text: (unavailable: {})".format(error))
-
-    safe_abbrev = re.sub(r"[^A-Za-z0-9_-]+", "_", abbrev_as)
-    base_name = "as_row{}_{}".format(row_number, safe_abbrev)
-
     try:
         os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+
+        if dialog_html:
+            path = os.path.join(
+                DIAGNOSTICS_DIR, "sw_row{}_dialog.html".format(row_number)
+            )
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(dialog_html)
+            print(
+                "🧾 Saved dialog HTML ({} chars) -> {} [{}]".format(
+                    len(dialog_html), path, reason
+                )
+            )
+
+        shot_name = "sw_row{}_page.png".format(row_number)
+        sb.save_screenshot(shot_name, folder=DIAGNOSTICS_DIR)
+        print("📸 Saved screenshot -> {}/{}".format(DIAGNOSTICS_DIR, shot_name))
+
     except Exception as error:
-        print("   could not create {}: {}".format(DIAGNOSTICS_DIR, error))
-        return
+        print("⚠️ SW diagnostics themselves failed: {}".format(error))
+
+
+# ----------------------------------------------------------------------------
+# v8: step trace and standard failure report
+# ----------------------------------------------------------------------------
+_STEP_CTX = {"provider": "", "attempt": 0, "mode": "", "t0": 0.0, "n": 0, "last": ""}
+
+PAGE_REPORT_JS = r"""
+var norm = function (s) { return String(s == null ? '' : s).replace(/\s+/g, ' ').trim(); };
+var vis = function (el) {
+  var r = el.getClientRects();
+  if (!(r && r.length)) { return false; }
+  var st = window.getComputedStyle(el);
+  return st.visibility !== 'hidden' && st.display !== 'none';
+};
+var txt = function (el) { return norm(el.innerText !== undefined ? el.innerText : el.textContent); };
+var pat = new RegExp(__PATTERN__, 'i');
+var btns = Array.prototype.slice.call(document.querySelectorAll('button, [role="button"]'));
+var links = Array.prototype.slice.call(document.querySelectorAll('a'));
+var visBtns = btns.filter(vis);
+var cands = [];
+Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"], [role="tab"], [aria-label]')).forEach(function (el) {
+  if (cands.length >= 12) { return; }
+  var label = txt(el) + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '');
+  if (pat.test(label)) {
+    cands.push({ tag: el.tagName.toLowerCase(), text: txt(el).slice(0, 60), aria: (el.getAttribute('aria-label') || '').slice(0, 50),
+                 visible: vis(el), disabled: !!el.disabled, id: el.id || '', cls: norm(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className).slice(0, 60) });
+  }
+});
+var overlays = [];
+Array.prototype.slice.call(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [class*="modal"], [class*="cookie"], [class*="consent"], [id*="cookie"], [id*="consent"]')).forEach(function (el) {
+  if (overlays.length >= 8 || !vis(el)) { return; }
+  overlays.push({ tag: el.tagName.toLowerCase(), cls: norm(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className).slice(0, 50), text: txt(el).slice(0, 120) });
+});
+var pw = false;
+Array.prototype.slice.call(document.querySelectorAll('input[type="password"]')).forEach(function (el) { if (vis(el)) { pw = true; } });
+return {
+  url: location.href, title: document.title, readyState: document.readyState,
+  scrollY: Math.round(window.scrollY || 0), scrollHeight: document.documentElement.scrollHeight || 0,
+  buttons: btns.length, links: links.length, visibleButtons: visBtns.length,
+  inputs: document.querySelectorAll('input, textarea, select').length,
+  candidates: cands,
+  buttonTexts: visBtns.slice(0, 30).map(function (b) { return (txt(b) || b.getAttribute('aria-label') || '(no text)').slice(0, 40); }),
+  overlays: overlays,
+  headings: Array.prototype.slice.call(document.querySelectorAll('h1, h2, h3')).filter(vis).slice(0, 8).map(function (h) { return txt(h).slice(0, 60); }),
+  passwordField: pw,
+  bodyStart: norm(document.body ? document.body.innerText : '').slice(0, 400)
+};
+"""
+
+
+def step_begin(provider, attempt, mode):
+    """Starts a new step trace for one browser launch."""
+    _STEP_CTX.update({"provider": provider, "attempt": attempt, "mode": mode,
+                      "t0": time.monotonic(), "n": 0, "last": "", "blocked": 0})
+
+
+def step(name, status="OK", **details):
+    """Prints one numbered STEP line. Never raises."""
+    try:
+        _STEP_CTX["n"] += 1
+        _STEP_CTX["last"] = name
+        if status == "FAIL" and details.get("reason") == "blocked":   # v46: counted so that a blocked AlphaSpread run stops early and is retried
+            _STEP_CTX["blocked"] = _STEP_CTX.get("blocked", 0) + 1
+        extra = "".join(" | {}={}".format(k, v) for k, v in details.items())
+        print("🔹 STEP {} a{}/{} | {:02d} {} | {}{} | +{:.1f}s".format(
+            _STEP_CTX["provider"], _STEP_CTX["attempt"], _STEP_CTX["mode"],
+            _STEP_CTX["n"], name, status, extra, time.monotonic() - _STEP_CTX["t0"]))
+    except Exception:
+        pass
+
+
+def failure_report(sb, step_name, reason, looking_for="."):
+    """
+    Prints the standard FAILURE REPORT block for the current provider. Read-only,
+    never raises. looking_for is a regular expression for the control the step
+    wanted (e.g. "^data$" or "calculation|model|dcf").
+    """
+    provider = _STEP_CTX.get("provider") or "?"
 
     try:
-        sb.save_screenshot(base_name + ".png", folder=DIAGNOSTICS_DIR)
-        print("   saved screenshot: {}/{}.png".format(DIAGNOSTICS_DIR, base_name))
-    except Exception as error:
-        print("   screenshot not saved: {}".format(error))
+        step(step_name, "FAIL", reason=str(reason).replace("\n", " ")[:120])
+        print("🔬 FAILURE REPORT | {} | step={} | reason={}".format(
+            provider, step_name, str(reason).replace("\n", " ")[:200]))
 
-    try:
-        if page_source:
-            with open(
-                os.path.join(DIAGNOSTICS_DIR, base_name + ".html"),
-                "w",
-                encoding="utf-8",
-            ) as html_file:
-                html_file.write(page_source)
-            print("   saved HTML: {}/{}.html".format(DIAGNOSTICS_DIR, base_name))
-    except Exception as error:
-        print("   HTML not saved: {}".format(error))
+        info = run_js(sb, PAGE_REPORT_JS.replace("__PATTERN__", json.dumps(looking_for)))
 
+        if not isinstance(info, dict):
+            print("🔬   (the page returned no readable report)")
+            return
 
-def print_purchase_breakdown(purchase_details):
-    """
-    Prints the full per-purchase breakdown the webhook passed back --
-    each real transaction that fed into the final score, with its own
-    date, role, role points, planned-discount multiplier, magnitude
-    multiplier (added directly, new work: the transaction's own real
-    USD-equivalent value, banded into a 0.7x-1.5x multiplier), and final
-    points. Requested directly, debugging convenience: this print
-    output lands in GitHub Actions' own run log, a single, easy-to-reach
-    place to see exactly which transactions produced a given score,
-    without needing this project's own separate Apps Script Executions
-    panel for the webhook at all.
-    """
-    if not purchase_details:
-        print("   (no purchases counted within the 6-month window)")
-        return
+        print("🔬   where: url={} | title={!r} | readyState={} | scrollY={} of {}".format(
+            info.get("url"), (info.get("title") or "")[:80], info.get("readyState"),
+            info.get("scrollY"), info.get("scrollHeight")))
+        print("🔬   counts: buttons={} (visible {}) | links={} | inputs={} | password field showing={}".format(
+            info.get("buttons"), info.get("visibleButtons"), info.get("links"),
+            info.get("inputs"), info.get("passwordField")))
 
-    for detail in purchase_details:
-        usd_value = detail.get("usdEquivalentValue")
-        currency = detail.get("currency")
+        candidates = info.get("candidates") or []
+        print("🔬   controls matching /{}/: {}".format(looking_for, len(candidates)))
 
-        if usd_value is not None:
-            value_text = "~${:,.0f} ({})".format(usd_value, currency)
-        elif currency:
-            value_text = "unrecognized currency ({})".format(currency)
+        for number, c in enumerate(candidates, 1):
+            print("🔬     {}. <{}> {!r} | aria={!r} | visible={} | disabled={} | id={!r} | class={!r}".format(
+                number, c.get("tag"), c.get("text"), c.get("aria"), c.get("visible"),
+                c.get("disabled"), c.get("id"), c.get("cls")))
+
+        print("🔬   visible button texts: {}".format(json.dumps(info.get("buttonTexts") or [], ensure_ascii=False)[:700]))
+
+        overlays = info.get("overlays") or []
+        if overlays:
+            print("🔬   overlays/dialogs/banners showing: {}".format(json.dumps(overlays, ensure_ascii=False)[:600]))
         else:
-            value_text = "value not found"
+            print("🔬   overlays/dialogs/banners showing: none")
 
+        print("🔬   headings: {}".format(json.dumps(info.get("headings") or [], ensure_ascii=False)[:400]))
+        print("🔬   page text starts: {}".format((info.get("bodyStart") or "")[:400]))
+
+    except Exception as report_error:
+        print("⚠️ could not build the failure report: {}".format(report_error))
+
+
+def log_sw_page_state(sb):
+    """Logs a one-line snapshot of the page's state. Never raises."""
+    try:
+        info = run_js(sb, SW_PAGE_STATE_JS)
         print(
-            "   {} | {} | role={} | rolePoints={} | plannedMultiplier={} | "
-            "value={} | magnitudeMultiplier={} | points={:.1f}".format(
-                detail.get("date"),
-                detail.get("typeText"),
-                detail.get("role"),
-                detail.get("rolePoints"),
-                detail.get("multiplier"),
-                value_text,
-                detail.get("magnitudeMultiplier"),
-                detail.get("points", 0),
+            "🔬 Page state at failure: {}".format(
+                json.dumps(info, ensure_ascii=False)
             )
         )
+    except Exception as info_error:
+        print("⚠️ page-state probe failed: {}".format(info_error))
 
 
-def post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html):
-    """
-    Posts this company's own scraped HTML to the Apps Script webhook,
-    which re-verifies the row still matches and writes the computed
-    score, using this project's own existing fn_22_30 scoring logic.
+class CloudflareBlocked(RuntimeError):
+    """The page is still a Cloudflare challenge after all waiting."""
 
-    sheet_name -- VERSION 3 FIX (REQUESTED DIRECTLY, REAL CONFIRMED
-    BUG): now a real parameter, passed through from run_bot's own real
-    SHEET_NAME environment variable read, rather than a hardcoded
-    module-level constant. A real production run showed the webhook
-    refusing a genuinely correct write, reporting a completely
-    unrelated company for a row that in truth only ever held the
-    expected one -- because this function was always sending
-    "Salkku" regardless of which real sheet the refresh actually came
-    from, so the webhook's own mismatch check was comparing against
-    the wrong sheet's own Column D entirely.
 
-    timeout=120 -- confirmed necessary directly from a real v1 run: two
-    companies with a genuinely large transaction history (AppLovin,
-    Constellation Software) failed at a shorter timeout, one with a
-    clean read timeout and the other with an empty response body (the
-    connection dropping before a timeout could even register cleanly) --
-    both companies' own real InsiderScreener pages are large enough that
-    the whole POST-and-score round trip can genuinely take longer than a
-    short timeout allows.
-    """
-    payload = {
-        "sheetName": sheet_name,
-        "rowNumber": row_number,
-        "abbrevIS": abbrev_is,
-        "html": html,
-    }
+def is_challenge_page(sb):
+    """True when the title or visible text looks like a Cloudflare challenge."""
+    try:
+        title = (sb.get_title() or "").lower()
+    except Exception:
+        title = ""
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=120)
+        body = run_js(
+            sb,
+            "return String(document.body ? (document.body.innerText || '') : '')"
+            ".slice(0, 600);",
+        ) or ""
+    except Exception:
+        body = ""
 
-    except Exception as post_error:
-        print(
-            "❌ Row {} ({}): webhook POST itself failed: {}".format(
-                row_number, abbrev_is, post_error
+    haystack = title + " " + str(body).lower()
+    return any(marker in haystack for marker in CF_CHALLENGE_MARKERS)
+
+
+def wait_past_challenge(sb, headless, wait_seconds=None):
+    """
+    Waits up to CF_CHALLENGE_WAIT_SECONDS for a Cloudflare challenge to
+    clear. In headed mode also tries sb.uc_gui_click_captcha() now and then.
+    Returns True when the challenge is gone (or was never there).
+    """
+    if not is_challenge_page(sb):
+        return True
+
+    print("🛡️ Cloudflare challenge detected -- waiting for it to clear...")
+    started = time.monotonic()
+    last_click_at = None
+    clicks = [0]
+
+    def clicks_note():
+        if clicks[0]:
+            print("🖱️ Tried uc_gui_click_captcha() x{}".format(clicks[0]))
+
+    limit = CF_CHALLENGE_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    while time.monotonic() - started < limit:
+        sb.sleep(2)
+
+        if not is_challenge_page(sb):
+            clicks_note()
+            print(
+                "🛡️ Challenge cleared after {:.1f}s".format(
+                    time.monotonic() - started
+                )
+            )
+            return True
+
+        if not headless:
+            now = time.monotonic()
+            if last_click_at is None or now - last_click_at >= CF_CAPTCHA_CLICK_EVERY_SECONDS:
+                last_click_at = now
+                try:
+                    sb.uc_gui_click_captcha()
+                    clicks[0] += 1
+                except Exception as click_error:
+                    print("⚠️ uc_gui_click_captcha failed: {}".format(click_error))
+
+    clicks_note()
+    return not is_challenge_page(sb)
+
+
+def wait_for_data_buttons(sb):
+    """
+    Polls until at least one visible 'Data' button exists. Returns count.
+
+    Scrolls down a step on every poll: the chart sections live inside
+    lazily rendered "intersection-renderer" blocks that may not exist in
+    the DOM until they have been scrolled into view.
+    """
+    deadline = time.monotonic() + SW_DATA_BUTTON_TIMEOUT_SECONDS
+    consent_tried = False
+    count = 0
+
+    while time.monotonic() < deadline:
+        count = run_js(sb, SW_TAG_DATA_BUTTONS_JS) or 0
+        if count:
+            return count
+
+        if not consent_tried:
+            # A consent banner can cover/replace page content; try once.
+            consent_tried = True
+            try:
+                clicked = run_js(sb, SW_DISMISS_CONSENT_JS)
+                if clicked:
+                    print("🍪 Dismissed a consent banner ({})".format(clicked))
+            except Exception:
+                pass
+
+        try:
+            run_js(
+                sb,
+                "window.scrollBy(0, {}); return window.scrollY;".format(
+                    int(SW_SCROLL_STEP_PIXELS)
+                ),
+            )
+        except Exception:
+            pass
+
+        sb.sleep(1)
+
+    return 0
+
+
+def click_data_button(sb, index):
+    """Native click on the index-th tagged 'Data' button, JS click fallback."""
+    selector = '[data-sw-scrape-idx="{}"]'.format(index)
+
+    try:
+        sb.click(selector, timeout=5)
+        return "native"
+    except Exception:
+        pass
+
+    try:
+        result = run_js(
+            sb,
+            "var b = document.querySelector("
+            + json.dumps(selector)
+            + "); if (!b) { return 'missing'; }"
+            " b.scrollIntoView({block: 'center'}); b.click(); return 'clicked';",
+        )
+        return "js:{}".format(result)
+    except Exception:
+        return None
+
+
+def poll_for_dialog(sb):
+    """
+    Polls for the open dialog (with at least one table, or fallback text
+    lines). Returns the extractor's result dict, or None on timeout.
+    """
+    deadline = time.monotonic() + SW_DIALOG_TIMEOUT_SECONDS
+    pattern = json.dumps(SW_DIALOG_TITLE_PATTERN)
+    extract_js = SW_EXTRACT_DIALOG_JS.replace("__TITLE_PATTERN__", pattern)
+    last = None
+
+    while time.monotonic() < deadline:
+        try:
+            last = run_js(sb, extract_js)
+        except Exception as error:
+            print("⚠️ dialog extraction attempt raised: {}".format(error))
+            last = None
+
+        if last and last.get("found"):
+            if last.get("sections") or last.get("lines"):
+                return last
+
+        sb.sleep(1)
+
+    return last if (last and last.get("found")) else None
+
+
+
+# ----------------------------------------------------------------------------
+# v13: Simply Wall St future / dividend / valuation pages (replace Scrape.do)
+# ----------------------------------------------------------------------------
+_SW_PAGES = {}
+_SW_SKIN = {}
+SW_SKIN_ENABLED = os.environ.get("SW_SKIN", "1") != "0"
+SW_SKIN_SECTIONS = ("Leadership Team", "Board Members", "Ownership Breakdown", "Recent Insider Transactions")
+SW_PAGE_MIN_CHARS = 20000
+# v40: Simply Wall St brings only the valuation dialog (SW Price value + SW JSON). The future / dividend pages are
+# opened only when the env SW_SUBPAGES lists them (e.g. "future,dividend"); default = none.
+SW_SUBPAGES = tuple(x.strip() for x in os.environ.get("SW_SUBPAGES", "").split(",") if x.strip())
+
+
+def slim_html(html):
+    """Drops script/style/noscript/svg blocks: the Apps Script parser only reads the text."""
+    html = re.sub(r"<script\b[^>]*>.*?</script>", " ", html or "", flags=re.S | re.I)
+    html = re.sub(r"<style\b[^>]*>.*?</style>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<noscript\b[^>]*>.*?</noscript>", " ", html, flags=re.S | re.I)
+    html = re.sub(r"<svg\b[^>]*>.*?</svg>", " ", html, flags=re.S | re.I)
+    return html
+
+
+def fetch_sw_subpage(sb, abbrev_sw, name, headless):
+    """Opens https://simplywall.st/stocks/<abbrev>/<name> and returns its slimmed HTML ('' on failure)."""
+    url = "https://simplywall.st/stocks/{}/{}".format(abbrev_sw, name)
+    try:
+        print("🌐 Navigating to: {}".format(url))
+        sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+        sb.sleep(PAGE_SETTLE_SECONDS)
+        if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
+            step("page_" + name, "FAIL", reason="challenge page still showing")
+            return ""
+        sb.sleep(2)
+        html = slim_html(sb.get_page_source() or "")
+        ok = len(html) >= SW_PAGE_MIN_CHARS
+        step("page_" + name, "OK" if ok else "FAIL", chars=len(html))
+        return html if ok else ""
+    except Exception as page_error:
+        print("⚠️ SW {} page failed: {}".format(name, page_error))
+        step("page_" + name, "FAIL", reason=str(page_error).replace("\n", " ")[:80])
+        return ""
+
+
+SKIN_LINES_JS = (
+    "var r = document.querySelector('main') || document.body;"
+    "return String(r.innerText || '').split('\\n').map(function(x){return x.replace(/\\s+/g,' ').trim();}).filter(Boolean);"
+)
+SKIN_SCROLL_TO_JS = (
+    "var label = %s; var els = [].slice.call(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p'));"
+    "for (var i = 0; i < els.length; i++) { var e = els[i]; if (e.children.length > 2) { continue; }"
+    " var tx = (e.innerText || '').replace(/\\s+/g,' ').trim();"
+    " if (tx === label) { e.scrollIntoView({block:'center'}); return 'ok'; } } return 'notfound';"
+)
+
+
+def fetch_sw_skin_lines(sb, abbrev_sw, page, headless):
+    """v43: opens the SW management / ownership page, scrolls its lazy sections in and returns the page text lines."""
+    url = "https://simplywall.st/stocks/{}/{}".format(abbrev_sw, page)
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
+        raise RuntimeError("skin: {} page still a challenge".format(page))
+    sb.sleep(2)
+    height = int(run_js(sb, "return document.body.scrollHeight;") or 6000)
+    y = 0
+    while y < height + 600 and y < 20000:
+        run_js(sb, "window.scrollTo(0, {}); return 1;".format(y))
+        time.sleep(0.8)
+        y += 350
+        height = max(height, int(run_js(sb, "return document.body.scrollHeight;") or height))
+    for label in SW_SKIN_SECTIONS:
+        run_js(sb, SKIN_SCROLL_TO_JS % json.dumps(label))
+        for _ in range(6):
+            time.sleep(1.2)
+            cur = run_js(sb, SKIN_LINES_JS) or []
+            if not any(str(l).startswith("Loading") for l in cur):
+                break
+    return run_js(sb, SKIN_LINES_JS) or []
+
+
+def fetch_sw_skin(sb, abbrev_sw, headless):
+    """v43: Management + Ownership pages -> Skin score dict (sw_skin.score_page_lines). Never raises."""
+    _SW_SKIN.clear()
+    if not SW_SKIN_ENABLED:
+        return
+    try:
+        import sw_skin
+        mgmt = fetch_sw_skin_lines(sb, abbrev_sw, "management", headless)
+        own = fetch_sw_skin_lines(sb, abbrev_sw, "ownership", headless)
+        res = sw_skin.score_page_lines(abbrev_sw, mgmt, own)
+        _SW_SKIN.update(res)
+        step("skin", "OK", score=res["score"], lines="{}/{}".format(len(mgmt), len(own)))
+    except Exception as skin_error:
+        print("⚠️ SW skin failed: {}".format(skin_error))
+        step("skin", "FAIL", reason=str(skin_error).replace("\n", " ")[:80])
+
+
+def scrape_sw_data(sb, abbrev_sw, row_number, headless=True):
+    """
+    Opens the Simply Wall St valuation page for abbrev_sw, clicks the
+    "Data" button, waits for the "Share Price vs. Fair Value" dialog and
+    returns the JSON-ready dict described in the module docstring.
+
+    Raises on navigation problems, a page with no "Data" button, or a
+    dialog that never opened -- run_bot catches that per provider, so one
+    provider's failure can never block another.
+    """
+    url = sw_page_url(abbrev_sw)
+    print("🌐 Navigating to: {}".format(url))
+
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    step("open_page", "OK", url=url)
+
+    if not wait_past_challenge(sb, headless, SW_CF_WAIT_SECONDS):
+        step("cloudflare_check", "FAIL", reason="challenge page still showing")
+        log_sw_page_state(sb)
+        save_sw_diagnostics(sb, row_number, None, "blocked by Cloudflare")
+        raise CloudflareBlocked(
+            "page is still a Cloudflare challenge after {}s ({} browser)".format(
+                SW_CF_WAIT_SECONDS, "headless" if headless else "headed"
             )
         )
-        return
 
-    # VERSION 7: parse separately from the POST, so an unreadable body is
-    # reported as exactly that. A real Row 34 run printed a "POST itself
-    # failed" error here while the webhook had in fact scored and written
-    # the value.
-    response_body = read_webhook_json(
-        response, "Row {} ({})".format(row_number, abbrev_is)
+    step("cloudflare_check", "OK")
+
+    try:
+        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    except Exception as size_error:
+        print("⚠️ could not set window size: {}".format(size_error))
+
+    button_count = wait_for_data_buttons(sb)
+    print("🔎 Visible 'Data' buttons found: {}".format(button_count))
+
+    if not button_count:
+        log_sw_page_state(sb)
+        failure_report(
+            sb, "find_data_button",
+            "no 'Data' button appeared within {}s".format(SW_DATA_BUTTON_TIMEOUT_SECONDS),
+            looking_for="^data$|toggle-data|\\bdata\\b")
+        save_sw_diagnostics(sb, row_number, None, "no Data button")
+        raise RuntimeError("no 'Data' button appeared on the page")
+
+    step("find_data_button", "OK", count=button_count)
+
+    # v13: the three pages the Apps Script SW parser reads. The valuation page is the one open
+    # right now (taken before any dialog is opened); future and dividend are opened afterwards
+    # and the valuation page is then opened again for the "Data" dialog.
+    _SW_PAGES.clear()
+    valuation_html = slim_html(sb.get_page_source() or "")
+    if len(valuation_html) >= SW_PAGE_MIN_CHARS:
+        _SW_PAGES["valuation"] = valuation_html
+    step("page_valuation", "OK" if "valuation" in _SW_PAGES else "FAIL", chars=len(valuation_html))
+    def fetch_sw_subpages_now():
+        # v14: future and dividend are opened AFTER the dialog attempt (success or failure), so
+        # the valuation page is never reloaded before the "Data" dialog (a reload once lost the buttons).
+        for sub_name in SW_SUBPAGES:
+            sub_html = fetch_sw_subpage(sb, abbrev_sw, sub_name, headless)
+            if sub_html:
+                _SW_PAGES[sub_name] = sub_html
+
+    dialog = None
+    last_title = None
+
+    for index in range(min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY)):
+        how = click_data_button(sb, index)
+        print("🖱️ Clicked 'Data' button #{} ({})".format(index, how))
+        step("click_data_button", "OK" if how else "FAIL", index=index, how=how)
+
+        dialog = poll_for_dialog(sb)
+
+        if dialog:
+            last_title = dialog.get("title")
+            print(
+                "✅ Dialog found after button #{} | title={!r} |"
+                " sections={} | fallback lines={}".format(
+                    index,
+                    last_title,
+                    len(dialog.get("sections") or []),
+                    len(dialog.get("lines") or []),
+                )
+            )
+            step("read_dialog", "OK", title=repr(last_title), sections=len(dialog.get("sections") or []))
+            break
+
+        step("read_dialog", "FAIL", index=index, reason="no matching dialog opened")
+        print("⏩ Button #{} opened no matching dialog; trying the next.".format(index))
+
+        # Close whatever may have opened, so the next click is clean.
+        try:
+            sb.send_keys("body", "\ue00c")  # ESCAPE
+            sb.sleep(1)
+        except Exception:
+            pass
+
+        # Re-tag in case the page re-rendered and dropped the markers.
+        run_js(sb, SW_TAG_DATA_BUTTONS_JS)
+
+    if not dialog:
+        failure_report(
+            sb, "read_dialog",
+            "no 'Share Price vs. Fair Value' dialog opened after {} 'Data' button(s)".format(
+                min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY)),
+            looking_for="^data$|fair value|valuation")
+        save_sw_diagnostics(sb, row_number, None, "dialog never appeared")
+        fetch_sw_subpages_now()
+        raise RuntimeError(
+            "no 'Share Price vs. Fair Value' dialog opened after trying"
+            " {} 'Data' button(s)".format(min(button_count, SW_MAX_DATA_BUTTONS_TO_TRY))
+        )
+
+    if SAVE_DIAGNOSTICS_ALWAYS:
+        save_sw_diagnostics(sb, row_number, dialog.get("html"), "always-on")
+
+    fetch_sw_subpages_now()
+    fetch_sw_skin(sb, abbrev_sw, headless)  # v43
+
+    data = {
+        "source": "simplywall.st",
+        "page": "valuation",
+        "url": url,
+        "scrapedAtUtc": utc_iso_text(),
+        "dialogTitle": dialog.get("title"),
+        "sections": dialog.get("sections") or [],
+    }
+
+    if not data["sections"]:
+        data["textLines"] = dialog.get("lines") or []
+
+    return data
+
+
+# ----------------------------------------------------------------------------
+# AlphaSpread DCF provider (v5)
+# ----------------------------------------------------------------------------
+def save_as_diagnostics(sb, row_number, reason):
+    """
+    Writes the AlphaSpread page's full HTML (the open modal included) and a
+    screenshot into DIAGNOSTICS_DIR. Fully guarded -- never raises.
+    """
+    try:
+        os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+
+        html = sb.get_page_source() or ""
+        html_name = "as_row{}_page.html".format(row_number)
+        with open(
+            os.path.join(DIAGNOSTICS_DIR, html_name), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(html[:AS_DIAGNOSTICS_MAX_HTML_CHARS])
+        print(
+            "🧾 Saved AlphaSpread page HTML ({} chars) -> {}/{} [{}]".format(
+                min(len(html), AS_DIAGNOSTICS_MAX_HTML_CHARS),
+                DIAGNOSTICS_DIR, html_name, reason
+            )
+        )
+
+        shot_name = "as_row{}_page.png".format(row_number)
+        sb.save_screenshot(shot_name, folder=DIAGNOSTICS_DIR)
+        print("📸 Saved screenshot -> {}/{}".format(DIAGNOSTICS_DIR, shot_name))
+
+    except Exception as error:
+        print("⚠️ AS diagnostics themselves failed: {}".format(error))
+
+
+def log_as_page_state(sb):
+    """Logs title, URL and the first 300 visible characters. Never raises."""
+    try:
+        info = run_js(sb, AS_PAGE_STATE_JS)
+        print(
+            "🔬 AlphaSpread page state: {}".format(
+                json.dumps(info, ensure_ascii=False)
+            )
+        )
+    except Exception as info_error:
+        print("⚠️ AS page-state probe failed: {}".format(info_error))
+
+
+MS_MIN_HTML_CHARS = 30000
+
+
+def fetch_ms_via_scrapedo(url):
+    """v25: MarketScreener fallback when the runner's browser gets Akamai 'Access Denied'. Returns the page HTML, or '' on failure / no token."""
+    token = (os.environ.get("SCRAPE_DO_TOKEN") or os.environ.get("SCRAPEDO_TOKEN") or "").strip()
+    if not token:
+        print("ℹ️ MS: no SCRAPE_DO_TOKEN in the environment -- Scrape.do route skipped.")
+        return ""
+    from urllib.parse import quote_plus
+    for extra in ("&render=true", "&render=true&super=true"):
+        try:
+            response = requests.get("https://api.scrape.do?token={}&url={}{}".format(token, quote_plus(url), extra), timeout=120)
+            if response.status_code == 200 and len(response.text) >= MS_MIN_HTML_CHARS and any(m in response.text for m in ("Last Close", "Consensus", "Capitalization")):
+                return response.text
+            print("ℹ️ MS Scrape.do ({}): http {} / {} chars -- not usable.".format(extra, response.status_code, len(response.text)))
+        except Exception as request_error:
+            print("ℹ️ MS Scrape.do ({}): {}".format(extra, type(request_error).__name__))
+    return ""
+
+
+def scrape_ms_data(sb, abbrev_ms, row_number, headless=True):
+    """
+    v11: opens the MarketScreener quote page for abbrev_ms, waits for any
+    challenge to clear and returns {"html", "url", "title", "htmlChars"}.
+    The parsing happens in Apps Script (fn_22_30, target MS), not here.
+    """
+    url = "https://www.marketscreener.com/quote/stock/{}/".format(abbrev_ms)
+    print("🌐 Navigating to: {}".format(url))
+    sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+    sb.sleep(PAGE_SETTLE_SECONDS)
+    step("open_page", "OK", url=url)
+
+    if not wait_past_challenge(sb, headless):
+        step("challenge_check", "FAIL", reason="challenge page still showing")
+        raise CloudflareBlocked(
+            "MarketScreener page is still a challenge after {}s ({} browser)".format(
+                CF_CHALLENGE_WAIT_SECONDS, "headless" if headless else "headed"))
+    step("challenge_check", "OK")
+
+    def ms_page_ok(page_html):
+        return len(page_html) >= MS_MIN_HTML_CHARS and any(m in page_html for m in ("Last Close", "Consensus", "Capitalization"))
+
+    html = sb.get_page_source() or ""
+    title = sb.get_title() or ""
+    if not ms_page_ok(html):
+        step("read_page", "FAIL", chars=len(html), title=title[:60])
+        # v25: "Access Denied" (reference #18.xxx, errors.edgesuite.net) is an Akamai block of the runner's address, not a Cloudflare challenge.
+        # 1) warm-up: open the home page first (Akamai sets its cookies there), then the quote page again.
+        # 2) if still denied: fetch the quote page through Scrape.do (residential address, only used on this failure).
+        try:
+            sb.uc_open_with_reconnect("https://www.marketscreener.com/", reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(3)
+            sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(PAGE_SETTLE_SECONDS)
+            html = sb.get_page_source() or ""
+            title = sb.get_title() or ""
+            step("ms_warmup", "OK" if ms_page_ok(html) else "FAIL", chars=len(html), title=title[:60])
+        except Exception as warm_error:
+            step("ms_warmup", "FAIL", reason=type(warm_error).__name__)
+    if not ms_page_ok(html):
+        via_html = fetch_ms_via_scrapedo(url)
+        if via_html:
+            html, title = via_html, "MarketScreener (via Scrape.do)"
+            step("ms_scrapedo", "OK", chars=len(html))
+        else:
+            step("ms_scrapedo", "FAIL", reason="no token, or the page was incomplete")
+    if not ms_page_ok(html):
+        step("read_page", "FAIL", chars=len(html), title=title[:60])
+        failure_report(sb, "read_page", "page too small or without price/consensus blocks ({} chars)".format(len(html)),
+                       looking_for="Last Close|Consensus|Capitalization")
+        raise RuntimeError("MarketScreener page looks incomplete ({} chars, title {!r})".format(len(html), title[:60]))
+    step("read_page", "OK", chars=len(html), title=title[:60])
+    return {"html": html, "url": url, "title": title, "htmlChars": len(html)}
+
+
+# ----------------------------------------------------------------------------
+# v14: GuruFocus term pages (replace Scrape.do) -- posted as target "GFP"
+# ----------------------------------------------------------------------------
+GF_PAGES = (
+    ("pe", "term/pettm/"),
+    ("peForward", "term/forward-pe-ratio/"),
+    ("buyback", "term/buyback-yield/"),
+    ("roce", "term/ROCE/"),
+    ("roe", "term/ROE/"),
+    ("pfcf", "term/price-to-free-cash-flow/"),
+    ("pocf", "term/price-to-operating-cash-flow/"),
+    ("gfValue", "term/gf_value/"),
+    ("gfScore", "term/gf_score/"),
+    ("netMargin", "term/netmargin/"),
+    ("revenue", "term/Revenue/"),
+    ("moat", "term/moat-score/"),
+)
+GF_PAGE_MIN_CHARS = 1500
+GF_MAX_ATTEMPTS = int(os.environ.get("GF_MAX_ATTEMPTS", "2"))  # v15
+# v24: GuruFocus is switched off by default (GF_ENABLED=1 turns it back on). The AlphaSpread ratio pages already give P/E, P/OCF, P/FCF.
+GF_ENABLED = os.environ.get("GF_ENABLED", "0").strip() == "1"
+# v24: providers run in parallel, one browser process each (PARALLEL=0 restores the old one-after-the-other run).
+PARALLEL_PROVIDERS = os.environ.get("PARALLEL", "1").strip() != "0"
+# v26: in a parallel run the four recalculating handlers (MS, SW, SWP, ASRP) each re-did the whole row calculation (20-25 s apiece, under the
+# sheet lock). Now they only write their cells (payload skipRecalc) and ONE recalculation (target ASRP, recalcOnly) runs after all providers finished.
+# Needs the AlphaSpread abbreviation (the recalc request goes through the ASRP handler) and Apps Script fn_91_01 v5, fn_91_04 v6, fn_91_05 v2, fn_91_07 v2.
+SINGLE_RECALC = os.environ.get("SINGLE_RECALC", "1").strip() != "0"
+_POST_FLAGS = {}   # extra payload keys for every post of this process (set in child processes / for the final recalc)
+PARALLEL_START_GAP_SECONDS = float(os.environ.get("PARALLEL_START_GAP", "8"))   # staggered browser starts (undetected-chromedriver patches a shared driver file)
+POST_LOCK_PATH = os.path.join(tempfile.gettempdir(), "provider_json_post.lock")
+
+
+def text_only_page(html):
+    """Title + visible text only (the Apps Script GF parser reads nothing else); keeps the post small."""
+    html = html or ""
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.S | re.I)
+    title = title_match.group(1).strip() if title_match else ""
+    body = slim_html(html)
+    body = re.sub(r"<title[^>]*>.*?</title>", " ", body, flags=re.S | re.I)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return "<html><head><title>{}</title></head><body>{}</body></html>".format(title, body)
+
+
+def fetch_gf_pages_via_scrapedo(abbrev_gf):
+    """
+    v16: GuruFocus sits behind a Cloudflare check that blocks GitHub's browser, but the project's
+    other GitHub scraper reads GuruFocus through Scrape.do (render=true) with the token in the
+    repository secret. Same here: one request per term page, in parallel (max 4 at a time).
+    Returns {subpage: text_only_html}; empty when no token is set or everything failed.
+    """
+    token = (os.environ.get("SCRAPE_DO_TOKEN") or os.environ.get("SCRAPEDO_TOKEN") or "").strip()
+    if not token:
+        print("ℹ️ GF: no SCRAPE_DO_TOKEN in the environment -- Scrape.do route skipped.")
+        return {}
+
+    from concurrent.futures import ThreadPoolExecutor
+    from urllib.parse import quote_plus
+
+    def one(item):
+        name, path = item
+        target = "https://www.gurufocus.com/{}{}".format(path, abbrev_gf)
+        api = "https://api.scrape.do?token={}&url={}&render=true".format(token, quote_plus(target))
+        for attempt in (1, 2):
+            try:
+                response = requests.get(api, timeout=90)
+                if response.status_code == 200 and len(response.text) > 5000:
+                    page = text_only_page(response.text)
+                    if len(page) >= GF_PAGE_MIN_CHARS:
+                        return name, page, "ok", len(page)
+                    return name, "", "too_small", len(page)
+                status = "http{}".format(response.status_code)
+            except Exception as request_error:
+                status = type(request_error).__name__
+            time.sleep(3 * attempt)
+        return name, "", status, 0
+
+    pages = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for name, page, status, chars in pool.map(one, GF_PAGES):
+            step("page_" + name, "OK" if page else "FAIL", via="scrape.do", result=status, chars=chars)
+            if page:
+                pages[name] = page
+    return pages
+
+
+def scrape_gf_data(sb, abbrev_gf, row_number, headless=True):
+    """
+    v14: opens each GuruFocus term page for abbrev_gf in the same browser session and returns
+    {"pages": {subpage: html}}. Parsing happens in Apps Script (fn_22_30, target GF).
+    A Cloudflare block on the FIRST page raises CloudflareBlocked (retried by run_bot);
+    a later page that fails is just left out.
+    """
+    pages = fetch_gf_pages_via_scrapedo(abbrev_gf)
+    if len(pages) >= 6:
+        print("📄 GF pages via Scrape.do: {}".format(", ".join(sorted(pages.keys()))))
+        return {"pages": pages}
+    if pages:
+        print("⚠️ GF: only {} page(s) via Scrape.do -- the browser tries the rest.".format(len(pages)))
+
+    for index, (name, path) in enumerate(GF_PAGES):
+        if name in pages:
+            continue
+        url = "https://www.gurufocus.com/{}{}".format(path, abbrev_gf)
+        print("🌐 Navigating to: {}".format(url))
+        try:
+            sb.uc_open_with_reconnect(url, reconnect_time=CF_RECONNECT_SECONDS)
+            sb.sleep(PAGE_SETTLE_SECONDS)
+            cleared = wait_past_challenge(sb, headless)
+            if not cleared and not headless:
+                # v15: GuruFocus' Cloudflare check is stricter than Simply Wall St's: try SeleniumBase's
+                # newer Turnstile handler (when this version has it) before giving up.
+                for handler_name in ("uc_gui_handle_captcha", "uc_gui_handle_cf"):
+                    handler = getattr(sb, handler_name, None)
+                    if handler is None:
+                        continue
+                    try:
+                        print("🖱️ GF: trying sb.{}()".format(handler_name))
+                        handler()
+                        sb.sleep(4)
+                        if not is_challenge_page(sb):
+                            cleared = True
+                            break
+                    except Exception as handler_error:
+                        print("⚠️ sb.{} failed: {}".format(handler_name, handler_error))
+            if not cleared:
+                step("page_" + name, "FAIL", reason="challenge page still showing")
+                if index == 0:
+                    raise CloudflareBlocked("GuruFocus page is still a challenge ({} browser)".format(
+                        "headless" if headless else "headed"))
+                continue
+            sb.sleep(2)
+            html = text_only_page(sb.get_page_source() or "")
+            ok = len(html) >= GF_PAGE_MIN_CHARS
+            step("page_" + name, "OK" if ok else "FAIL", chars=len(html))
+            if ok:
+                pages[name] = html
+        except CloudflareBlocked:
+            raise
+        except Exception as page_error:
+            print("⚠️ GF {} page failed: {}".format(name, page_error))
+            step("page_" + name, "FAIL", reason=str(page_error).replace("\n", " ")[:80])
+    if not pages:
+        raise RuntimeError("no GuruFocus page could be read")
+    print("📄 GF pages collected: {}".format(", ".join(sorted(pages.keys()))))
+    return {"pages": pages}
+
+
+# ----------------------------------------------------------------------------
+# v17: AlphaSpread ratio pages (P/E, P/OCF, P/FCFE) read in the SAME browser as the DCF
+# ----------------------------------------------------------------------------
+_AS_RATIOS = {}
+AS_RATIO_PAGES = (("pe", "price-to-earnings"), ("pocf", "price-to-ocf"), ("pfcf", "price-to-fcfe"))
+
+
+def _as_strip_text(page_source):
+    page_source = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", page_source)
+    page_source = re.sub(r"(?s)<[^>]+>", " ", page_source)
+    return re.sub(r"\s+", " ", html.unescape(page_source)).strip()
+
+
+def _as_num(text):
+    found = re.search(r"-?\d[\d,]*\.?\d*", text or "")
+    return float(found.group(0).replace(",", "")) if found else None
+
+
+_FAST_BLOCK = {"on": False}   # v60: set after a failed DCF: one quick try per page, no long Cloudflare waits
+
+
+def _as_open_cf(sb, url, reconnect=4, attempts=3):
+    """v48: opens an AlphaSpread page; when Cloudflare shows ("Just a moment") it waits, clicks the verification box and opens the page
+    again (up to `attempts` times). Returns True when the page is not a Cloudflare page. Never raises."""
+    if _FAST_BLOCK.get("on"):
+        attempts = 1   # v60
+    for attempt in range(1, attempts + 1):
+        try:
+            sb.uc_open_with_reconnect(url, reconnect)
+            if "just a moment" not in (sb.get_title() or "").lower():
+                return True
+            sb.sleep(3 if _FAST_BLOCK.get("on") else 12 * attempt)
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            if "just a moment" not in (sb.get_title() or "").lower():
+                return True
+        except Exception:
+            sb.sleep(3.0)
+    return "just a moment" not in (sb.get_title() or "").lower()
+
+
+def _as_extract_ratio(text):
+    """Headline numbers of one AlphaSpread ratio page (verified on the real page text in as_probe v1)."""
+    out = {}
+    found = re.search(r"([\d.,]+)\s*Current\b", text) or re.search(r"Current\s*([\d.,]+)", text)
+    if found:
+        out["current"] = _as_num(found.group(1))
+    for label, key in (("3-y average", "avg3y"), ("5-y average", "avg5y"), ("10-y average", "avg10y"),
+                       ("3-Year Average", "avg3y"), ("5-Year Average", "avg5y"), ("10-Year Average", "avg10y"),
+                       ("Industry Average", "industry"), ("Country Average", "country")):
+        found = re.search(re.escape(label) + r"\s*(?:of\s*)?(-?[\d.,]+)", text, re.I)
+        if found and key not in out:
+            out[key] = _as_num(found.group(1))
+    return out
+
+
+def fetch_as_ratios(sb, abbrev_as):
+    """Never raises: the DCF must not depend on it. Fills _AS_RATIOS = {pe|pocf|pfcf: {current, avg3y, ...}}."""
+    _AS_RATIOS.clear()
+    base = "https://www.alphaspread.com/security/{}/relative-valuation/ratio/".format(as_path(abbrev_as))
+    for name, slug in AS_RATIO_PAGES:
+        try:
+            _as_open_cf(sb, base + slug, 4)
+            source = sb.get_page_source()
+            if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
+                step("ratio_" + name, "FAIL", reason="blocked")
+                if _FAST_BLOCK.get("on"):
+                    break   # v60: blocked right after a failed DCF -> skip the remaining ratio pages
+                continue
+            values = _as_extract_ratio(_as_strip_text(source))
+            if values.get("current") is not None:
+                _AS_RATIOS[name] = values
+            step("ratio_" + name, "OK" if values.get("current") is not None else "FAIL", **{k: v for k, v in values.items() if k in ("current", "avg5y", "industry")})
+        except Exception as ratio_error:
+            step("ratio_" + name, "FAIL", reason=type(ratio_error).__name__)
+
+
+def _as_extract_buyback(text):
+    """v28: headline numbers of the AlphaSpread buyback block (Current / Min / Max / Average / Median yield, % of market value, 5Y view)."""
+    out = {}
+    for label, key in (("Current Yield", "current"), ("Min Yield", "min"), ("Max Yield", "max"),
+                       ("Average Yield", "avg"), ("Median Yield", "median")):
+        found = re.search(re.escape(label) + r"\s*:?\s*(-?[\d.,]+)\s*%", text, re.I)
+        if found:
+            out[key] = _as_num(found.group(1))
+    if "current" not in out:
+        found = re.search(r"[Cc]urrent buyback yield for .{1,40}? is\s*(-?[\d.,]+)\s*%", text)
+        if found:
+            out["current"] = _as_num(found.group(1))
+    return out
+
+
+def _bb_ready(values):
+    """v55: the buyback numbers are usable only when current and average are read and are not the all-zero placeholder of a block that has not rendered yet (a real 0.00 is never stored)."""
+    if values.get("current") is None or values.get("avg") is None:
+        return False
+    nums = [v for v in values.values() if isinstance(v, (int, float))]
+    return not (nums and all(abs(v) < 1e-9 for v in nums))
+
+
+def fetch_as_buyback(sb, abbrev_as):
+    """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
+    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
+    try:
+        _as_open_cf(sb, url, 5)
+        source = sb.get_page_source()
+        if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
+            step("buyback", "FAIL", reason="blocked")
+            return
+        values = _as_extract_buyback(_as_strip_text(source))
+        # v44: the block renders lazily - up to 3 extra tries (scroll to the block, wait, re-read; last try reloads the page)
+        for attempt in range(3):
+            if _bb_ready(values):
+                break
+            try:
+                if attempt == 2:
+                    sb.uc_open_with_reconnect(url, 5)
+                sb.execute_script("var e=document.getElementById('buybacks')||document.querySelector('[id*=buyback]');"
+                                  "if(e){e.scrollIntoView({block:'center'});}else{window.scrollTo(0,document.body.scrollHeight/2);}")
+                sb.sleep(4 + 3 * attempt)
+                sb.execute_script("window.scrollBy(0,400);")
+                sb.sleep(2)
+                values = _as_extract_buyback(_as_strip_text(sb.get_page_source()))
+            except Exception:
+                pass
+        if _bb_ready(values):
+            _AS_RATIOS["buyback"] = values
+            step("buyback", "OK", **values)
+        else:
+            step("buyback", "FAIL", reason="no buyback numbers on the page (or only zeros: not stored as 0)", got=",".join(sorted(values.keys())))
+    except Exception as buyback_error:
+        step("buyback", "FAIL", reason=type(buyback_error).__name__)
+
+
+AS_HIST_HEADLINE_SELECTOR = ".valuation-history-context__headline"
+AS_HIST_CONTEXT_SELECTOR = ".valuation-history-context__headline-context"
+
+
+def _as_parse_hist(headline, context):
+    """v30: turns the AlphaSpread 'valuation history' sentence into a 0-100 rank = share of the past-5-year days on which the
+    stock was MORE expensive (against its AS value) than today. 100 = cheaper than on every day, 0 = dearer than on every day.
+      'It was this cheap or cheaper on just 21% of days ...'     -> 100 - 21 = 79
+      'Still overvalued, but less so than on 88% of days ...'    -> 88
+      'It was this expensive or more expensive on just 9% ...'   -> 9
+      '... more so than on 30% of days ...'                      -> 100 - 30 = 70
+      'valued in line with its history' (no percentage)          -> 50
+    Returns (rank or None, rule text)."""
+    text = re.sub(r"\s+", " ", "{} {}".format(headline or "", context or "")).strip()
+    rules = (
+        (r"this cheap or cheaper on (?:just |only |about )?(\d{1,3})\s*%", lambda n: 100 - n, "cheap-or-cheaper"),
+        (r"less so than on (\d{1,3})\s*%", lambda n: n, "less-so-than"),
+        (r"this expensive or more expensive on (?:just |only |about )?(\d{1,3})\s*%", lambda n: n, "expensive-or-more"),
+        (r"more so than on (\d{1,3})\s*%", lambda n: 100 - n, "more-so-than"),
     )
-
-    if response_body is None:
-        print(
-            "   The response could not be read, so it is unknown whether the"
-            " webhook wrote the score -- check the sheet or Apps Script"
-            " Executions before assuming it failed."
-        )
-        return
-
-    if response_body.get("ok") and response_body.get("written"):
-        print(
-            "✅ Row {} ({}): scored {}".format(
-                row_number,
-                abbrev_is,
-                response_body.get("insiderBuyingScore"),
-            )
-        )
-        print_purchase_breakdown(response_body.get("purchaseDetails"))
-
-    elif response_body.get("ok"):
-        print(
-            "⏩ Row {} ({}): webhook accepted but did not write ({})".format(
-                row_number, abbrev_is, response_body.get("reason")
-            )
-        )
-        print_purchase_breakdown(response_body.get("purchaseDetails"))
-
-    else:
-        print(
-            "❌ Row {} ({}): webhook refused/failed ({})".format(
-                row_number, abbrev_is, response_body.get("reason")
-            )
-        )
+    for pattern, convert, name in rules:
+        found = re.search(pattern, text, re.I)
+        if found:
+            number = int(found.group(1))
+            if 0 <= number <= 100:
+                return convert(number), name
+    if re.search(r"in line with (?:its|their) (?:own )?history", text, re.I):
+        return 50, "in-line"
+    return None, "no-rule"
 
 
-def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, html):
-    """
-    VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): posts this
-    company's own scraped AlphaSpread HTML to the SAME Apps Script
-    webhook URL already used for Insider Buying Score
-    (fn_90_01_InsiderScoreWebhook_StockData_60) -- Apps Script Web Apps
-    support only one doPost entry point per deployment, so rather than
-    deploying and maintaining a second, separate Web App URL (and a
-    second GitHub Actions secret to match), this reuses the existing
-    deployed URL, and the payload's own new "target": "AS" field tells
-    the webhook which of its two scoring paths to run. See that
-    function's own matching VERSION 5 changelog entry for the receiving
-    side of this.
+_AS_HIST_PROBE_JS = (
+    "var h = document.querySelector('.valuation-history-context__headline');"
+    "var c = document.querySelector('.valuation-history-context__headline-context');"
+    "var box = document.querySelector('.valuation-history-context');"
+    "var body = document.body ? (document.body.innerText || '') : '';"
+    "var hasText = /\\bis (valued in line with|cheaper than usual|more expensive than usual|near its usual|above its usual|below its usual)/i.test(body);"
+    "return {headline: h ? (h.innerText || '') : '', context: c ? (c.innerText || '') : '', box: !!box, hasText: hasText,"
+    " loading: !!document.querySelector('.valuation-history-context--loading'),"
+    " y: Math.round(window.scrollY || 0), height: Math.round(document.body.scrollHeight || 0), vh: Math.round(window.innerHeight || 0)};"
+)
 
-    Deliberately a SEPARATE function from post_to_webhook, not a shared
-    one with an if/else inside -- the two payload shapes, response
-    shapes, and log messages are different enough (no purchaseDetails
-    breakdown for AS, a plain vsUsualText field instead) that a shared
-    function would need its own internal branching anyway, and this way
-    each function's own docstring stays focused on the one path it
-    actually handles.
 
-    VERSION 7 CHANGE: returns True only when the webhook confirmed it
-    actually wrote the value, and False for every other outcome (not
-    written, refused/failed, unreadable response, POST failure), so
-    run_bot can save page diagnostics whenever the value did not land.
+def _as_hist_text_fallback(text):
+    """v31/v33: no headline element -> take the sentence from the visible page text. It starts at "<TICKER> is ..." (so menu text
+    before it is not taken along) and runs through the following sentence ('APP is valued in line with its history. A discount of this
+    size has been typical over the past 5 years.')."""
+    text = re.sub(r"[ \t\xa0]+", " ", text or "")
+    found = re.search(r"\b([A-Z0-9][A-Z0-9.\-]{0,11} is (?:valued in line with (?:its|their) (?:own )?history|(?:cheaper|more expensive|pricier|dearer) than usual|(?:near|above|below|well above|well below) its usual valuation)\.?[^\n]{0,300})", text)
+    return found.group(1).strip() if found else ""
 
-    VERSION 13 CHANGE: the "AS webhook reply:" line now includes the UTC
-    time at which the reply was received.
 
-    timeout=120, same reasoning as post_to_webhook's own matching
-    parameter -- not yet confirmed necessary specifically for AS's own
-    payload size (which is a single page's HTML, not a company's own
-    full growing transaction history), but kept consistent since there
-    is no real cost to doing so and it protects against the same class
-    of large-page/slow-round-trip issue if AS's own page size ever grows.
-    """
-    payload = {
-        "target": "AS",
-        "sheetName": sheet_name,
-        "rowNumber": row_number,
-        "abbrevAS": abbrev_as,
-        "html": html,
+_AS_HIST_OPEN_JS = (
+    "var want = 'more details', best = null;"
+    "document.querySelectorAll('a, button, span').forEach(function (e) {"
+    "  if (!best && (e.textContent || '').trim().toLowerCase() === want && e.offsetParent !== null) { best = e; } });"
+    "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';"
+)
+
+
+def _as_parse_hist_modal(text):
+    """v32: the 'More details' window gives the exact figure the one-line sentence often leaves out, e.g.
+    'APP is near its usual valuation / Cheaper than on 63% of days over 5 years / Today - 41% undervalued /
+     When APP was expensive -9% Typical return ... When APP was cheap +25% Typical return ...'.
+    'Cheaper than on N% of days' -> rank N (today is cheaper than on N% of the days); 'More expensive than on N%' -> 100 - N.
+    Returns a dict with whatever was found: rank, label, today (signed %: + undervalued, - overvalued), exp_return, cheap_return."""
+    text = re.sub(r"[ \t\xa0]+", " ", text or "")
+    out = {}
+    found = re.search(r"(Cheaper|More expensive|Dearer|Pricier) than on (\d{1,3})\s*%\s*of days", text, re.I)
+    if found and 0 <= int(found.group(2)) <= 100:
+        n = int(found.group(2))
+        out["rank"] = n if found.group(1).lower() == "cheaper" else 100 - n
+    found = re.search(r"\bis ((?:near|above|below|well above|well below)[^\n.]{0,40}(?:usual|history)[^\n.]{0,30}|(?:cheaper|more expensive|pricier|dearer) than usual|valued in line with[^\n.]{0,30})", text, re.I)
+    if found:
+        out["label"] = found.group(1).strip()
+    found = re.search(r"Today\s*[\u00b7\u2022\-:]?\s*(\d{1,3})\s*%\s*(undervalued|overvalued)", text, re.I)
+    if found:
+        out["today"] = int(found.group(1)) * (1 if found.group(2).lower() == "undervalued" else -1)
+    found = re.search(r"was expensive\s*([+\-\u2212]?\d{1,3})\s*%", text, re.I)
+    if found:
+        out["exp_return"] = int(found.group(1).replace("\u2212", "-"))
+    found = re.search(r"was cheap\s*([+\-\u2212]?\d{1,3})\s*%", text, re.I)
+    if found:
+        out["cheap_return"] = int(found.group(1).replace("\u2212", "-"))
+    return out
+
+
+def _as_hist_open_details(sb):
+    """v32: clicks 'More details' and returns the window's text ('' when it does not open). Never raises."""
+    try:
+        if sb.execute_script(_AS_HIST_OPEN_JS) != "clicked":
+            return ""
+        deadline = time.time() + 12
+        text = ""
+        while time.time() < deadline:
+            sb.sleep(1.0)
+            text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+            if re.search(r"\bof days\b[^\n]{0,20}\bover\b|Typical return", text, re.I):
+                return text
+        return text
+    except Exception:
+        return ""
+
+
+_AS_SCORES_JS = r"""
+var res = {profit: null, solv: null, hasProfit: false, hasSolv: false};
+function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+var body = document.body ? (document.body.innerText || '') : '';
+res.hasProfit = /Profitability Score/i.test(body);
+res.hasSolv = /Solvency Score/i.test(body);
+function okState(el) {
+  var icon = null;
+  try { icon = el.querySelector('svg, i, img, [class*="icon"]'); } catch (e) {}
+  var node = icon || el;
+  var cls = '';
+  try { cls = String((node.className && node.className.baseVal !== undefined) ? node.className.baseVal : node.className) + ' ' + String(el.className || ''); } catch (e) {}
+  cls = cls.toLowerCase();
+  if (/(check|tick|success|positive|green|good)/.test(cls)) { return true; }
+  if (/(times|xmark|cross|close|danger|negative|\bred\b|bad|warning)/.test(cls)) { return false; }
+  try {
+    var st = getComputedStyle(node);
+    var c = (st.color || '') + ' ' + (st.fill || '') + ' ' + (st.stroke || '');
+    var m = c.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (m) {
+      var r = +m[1], g = +m[2], b = +m[3];
+      if (g > r + 30 && g > b) { return true; }
+      if (r > g + 30 && r > b) { return false; }
     }
+  } catch (e) {}
+  return null;
+}
+function findCard(kind) {
+  var re = new RegExp('^.{1,25} ' + kind + ' Score$', 'i');
+  var viewRe = new RegExp('View ' + kind + ' Analysis', 'i');
+  var els = document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,a');
+  for (var i = 0; i < els.length; i++) {
+    var t = norm(els[i].textContent);
+    if (t.length < 60 && re.test(t) && els[i].children.length <= 3) {
+      var node = els[i];
+      for (var up = 0; up < 12 && node; up++) {
+        var tx = norm(node.textContent);
+        if (tx.length < 2500 && viewRe.test(tx)) { return {node: node, title: t}; }
+        node = node.parentElement;
+      }
+    }
+  }
+  return null;
+}
+var SKIP = /( (Profitability|Solvency) Score$|Due Diligence$|^View |^\/ ?100$|^(PROFITABILITY|SOLVENCY|SCORE)$)/i;
+function linesOf(text) { return String(text || '').split(/\n+/).map(norm).filter(function (l) { return l; }); }
+function readCard(kind) {
+  var headRe = new RegExp(kind + ' Score$', 'i');
+  var found = findCard(kind);
+  var card = found ? found.node : null;
+  var lines = card ? linesOf(card.innerText) : null;
+  if (!lines || !lines.length) {
+    lines = linesOf(document.body ? document.body.innerText : '');
+  }
+  var h = -1;
+  for (var i = 0; i < lines.length; i++) { if (headRe.test(lines[i]) && lines[i].length < 60) { h = i; break; } }
+  if (h < 0) { return null; }
+  lines = lines.slice(h);
+  var out = {title: lines[0], score: null, items: [], href: '', color: '', dbg: lines.slice(0, 12).join(' | ').slice(0, 300), cardFound: !!card};
+  var seen = {};
+  for (var n = 1; n < lines.length && n < 40; n++) {
+    var line = lines[n];
+    if (/^View /i.test(line)) { break; }
+    var m = line.match(/^(\d{1,3})(?:\s*\/\s*100)?$/);
+    if (m) { if (out.score === null) { out.score = parseInt(m[1], 10); } continue; }
+    if (!SKIP.test(line) && line.length >= 6 && line.length <= 90 && !seen[line]) { seen[line] = 1; out.items.push({t: line, ok: null}); }
+  }
+  if (card) {
+    var leaves = [];
+    card.querySelectorAll('*').forEach(function (e) { if (e.children.length === 0 && norm(e.textContent)) { leaves.push(e); } });
+    out.items.forEach(function (item) {
+      for (var k = 0; k < leaves.length; k++) {
+        if (norm(leaves[k].textContent) === item.t) { item.ok = okState(leaves[k].parentElement || leaves[k]); break; }
+      }
+    });
+    if (out.score !== null) {
+      // v38: the number often sits next to a "/ 100" child inside one element, so it is not a leaf. Take the deepest element whose
+      // whole text is "NN" or "NN / 100" and read the colour of that element.
+      var scoreRe = /^(\d{1,3})(?:\s*\/\s*100)?$/;
+      var best = null;
+      card.querySelectorAll('*').forEach(function (e) {
+        var m2 = norm(e.textContent).match(scoreRe);
+        if (m2 && parseInt(m2[1], 10) === out.score) {
+          var childMatches = false;
+          for (var c = 0; c < e.children.length; c++) {
+            var m3 = norm(e.children[c].textContent).match(scoreRe);
+            if (m3 && parseInt(m3[1], 10) === out.score) { childMatches = true; break; }
+          }
+          if (!childMatches) { best = e; }
+        }
+      });
+      if (best) {
+        try {
+          var cc = getComputedStyle(best).color || '';
+          var cm = cc.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+          if (cm) {
+            var hx = function (v) { var s2 = Math.max(0, Math.min(255, +v)).toString(16); return s2.length < 2 ? '0' + s2 : s2; };
+            out.color = '#' + hx(cm[1]) + hx(cm[2]) + hx(cm[3]);
+          }
+        } catch (e) {}
+      }
+    }
+    var links = card.querySelectorAll('a[href]');
+    for (var z = 0; z < links.length; z++) {
+      if (/view/i.test(norm(links[z].textContent))) { out.href = links[z].href || ''; break; }
+    }
+  }
+  return out;
+}
+res.profit = readCard('Profitability');
+res.solv = readCard('Solvency');
+return res;
+"""
+
+
+def _as_scores_clean(card):
+    """v35: one card dict from the page script -> {score, title, items:[{t, ok}], href} or None when no usable score."""
+    if not isinstance(card, dict):
+        return None
+    score = card.get("score")
+    if isinstance(score, float) and score == int(score):
+        score = int(score)
+    if not isinstance(score, int) or score < 0 or score > 100:
+        return None
+    items = []
+    for item in (card.get("items") or [])[:8]:
+        if isinstance(item, dict) and str(item.get("t") or "").strip():
+            items.append({"t": str(item["t"]).strip()[:90], "ok": item.get("ok") if item.get("ok") in (True, False) else None})
+    color = str(card.get("color") or "").strip().lower()
+    if not re.match(r"^#[0-9a-f]{6}$", color):
+        color = ""
+    cleaned = {"score": score, "title": str(card.get("title") or "")[:60], "items": items, "href": str(card.get("href") or "")[:300], "color": color}
+    if card.get("checks"):
+        cleaned["checks"] = card.get("checks")
+    return cleaned
+
+
+def _as_fetch_scores_on_page(sb, url, _retry=False):
+    """v35: the summary page is already open (fetch_as_hist). Reads the Profitability and Solvency cards, scrolling down in steps
+    until both show a score (they may be lazy loaded like the history block). Stores _AS_RATIOS['scores']. Never raises."""
+    if os.environ.get("AS_SCORES", "1") == "0":
+        return
+    try:
+        if "just a moment" in (sb.get_title() or "").lower():   # v46: Cloudflare page instead of the summary: do not wait 20 s for cards
+            step("scores", "FAIL", reason="blocked")
+            return
+        deadline = time.time() + int(os.environ.get("AS_SCORES_WAIT", "20"))
+        result = {}
+        scroll_y = 0
+        rounds = 0
+        while time.time() < deadline:
+            rounds += 1
+            try:
+                result = sb.execute_script(_AS_SCORES_JS) or {}
+            except Exception:
+                result = {}
+            profit = _as_scores_clean(result.get("profit"))
+            solv = _as_scores_clean(result.get("solv"))
+            if profit and solv:
+                break
+            try:  # v45: bring the card heading itself into view (a lazy card may stay empty until it is really on screen)
+                if rounds >= 3:
+                    sb.execute_script(
+                        "var t = (arguments[0] % 2) ? 'Profitability Score' : 'Solvency Score', f = null;"
+                        "document.querySelectorAll('h1,h2,h3,h4,div,span').forEach(function (e) {"
+                        "  if (!f && e.children.length === 0 && (e.textContent || '').trim().slice(-t.length) === t) { f = e; } });"
+                        "if (f) { f.scrollIntoView({block: 'center'}); }", rounds)
+                    sb.sleep(1.5)
+            except Exception:
+                pass
+            try:
+                height = int(sb.execute_script("return Math.round(document.body.scrollHeight || 0);") or 0)
+                scroll_y = scroll_y + 600
+                if height and scroll_y > height:
+                    scroll_y = 0
+                sb.execute_script("window.scrollTo(0, {});".format(scroll_y))
+            except Exception:
+                pass
+            sb.sleep(1.2)
+        profit = _as_scores_clean(result.get("profit"))
+        solv = _as_scores_clean(result.get("solv"))
+        if not profit and not solv and not _retry:
+            step("scores", "INFO", note="no score yet: reloading the page once")  # v45
+            try:
+                sb.uc_open_with_reconnect(url, 4)
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            return _as_fetch_scores_on_page(sb, url, True)
+        if not profit and not solv:
+            try:
+                os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                with open(os.path.join(DIAGNOSTICS_DIR, "as_scores_row{}.html".format(os.environ.get("ROW_NUMBER", ""))), "w", encoding="utf-8") as handle:
+                    handle.write(sb.get_page_source()[:400000])
+            except Exception:
+                pass
+            pr, sv = result.get("profit") or {}, result.get("solv") or {}
+            step("scores", "FAIL", reason="no score found", hasProfit=result.get("hasProfit"), hasSolv=result.get("hasSolv"), rounds=rounds,
+                 profitCard=pr.get("cardFound"), profitScore=pr.get("score"), profitText=repr(pr.get("dbg"))[:260],
+                 solvCard=sv.get("cardFound"), solvScore=sv.get("score"), solvText=repr(sv.get("dbg"))[:260])
+            return
+        scores = {"url": url}
+        if profit:
+            scores["profit"] = profit
+        if solv:
+            scores["solv"] = solv
+        _AS_RATIOS["scores"] = scores
+        step("scores", "OK", profit=(profit or {}).get("score"), solv=(solv or {}).get("score"),
+             profitItems=len((profit or {}).get("items") or []), solvItems=len((solv or {}).get("items") or []),
+             profitColor=(profit or {}).get("color"), solvColor=(solv or {}).get("color"), rounds=rounds)
+    except Exception as scores_error:
+        step("scores", "FAIL", reason=type(scores_error).__name__)
+
+
+_AS_CHECKS_JS = r"""
+var out = {found: false, checks: [], expanded: false, dbg: ''};
+function norm(s) { return String(s || '').replace(/\s+/g, ' ').trim(); }
+function rgbOf(str) {
+  var m = String(str || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+  if (!m) { return null; }
+  if (m[4] !== undefined && parseFloat(m[4]) === 0) { return null; }
+  return [+m[1], +m[2], +m[3]];
+}
+function classify(c) {
+  var r = c[0], g = c[1], b = c[2];
+  if (r > 200 && g > 130 && b < 110) { return 'warn'; }
+  if (r > 150 && g < 110 && b < 130) { return 'bad'; }
+  if (g > r + 20 && g > b) { return 'ok'; }
+  return null;
+}
+function statusOf(svg) {
+  var cands = [];
+  try {
+    var cs = getComputedStyle(svg);
+    cands.push(cs.fill, cs.stroke, cs.color);
+    var inner = svg.querySelector('path,circle');
+    if (inner) { var ci = getComputedStyle(inner); cands.push(ci.fill, ci.stroke); }
+  } catch (e) {}
+  for (var i = 0; i < cands.length; i++) {
+    var c = rgbOf(cands[i]);
+    if (c) { var k = classify(c); if (k) { return k; } }
+  }
+  var cls = String(svg.getAttribute('class') || '') + ' ' + String(svg.parentElement ? svg.parentElement.className : '');
+  cls = cls.toLowerCase();
+  if (/(check|success)/.test(cls)) { return 'ok'; }
+  if (/(times|xmark|cross|danger|error)/.test(cls)) { return 'bad'; }
+  if (/(warn|exclam|minus)/.test(cls)) { return 'warn'; }
+  return null;
+}
+var head = null;
+document.querySelectorAll('*').forEach(function (e) {
+  if (!head && e.children.length === 0 && /^Due Diligence Checks/i.test(norm(e.textContent))) { head = e; }
+});
+if (!head) { return out; }
+var cont = head;
+for (var up = 0; up < 8; up++) {
+  if (!cont.parentElement) { break; }
+  cont = cont.parentElement;
+  if (cont.querySelectorAll('svg').length >= 4) { break; }
+}
+out.found = true;
+out.expanded = /\bHide\b/.test(norm(cont.innerText || ''));
+var seen = {};
+cont.querySelectorAll('svg').forEach(function (svg) {
+  var pill = svg.parentElement;
+  for (var u = 0; u < 4 && pill && pill !== cont && norm(pill.textContent).length < 6; u++) { pill = pill.parentElement; }
+  if (!pill || pill === cont) { return; }
+  if (pill.querySelectorAll('svg').length > 1) { return; }
+  var txt = norm(pill.innerText || pill.textContent);
+  if (!txt || /^(View All|Hide)$/i.test(txt) || txt.length > 140) { return; }
+  var m = txt.match(/^(.*?)\s+(-?[\d.,]+\s*(?:%|x|B|M|K|T)?(?:\s*>\s*-?[\d.,]+\s*(?:%|x|B|M|K|T)?)?)$/);
+  var name = m ? m[1] : txt;
+  var val = m ? m[2] : '';
+  if (name.length < 4 || seen[txt]) { return; }
+  seen[txt] = 1;
+  out.checks.push({t: name.slice(0, 90), v: val.slice(0, 24), s: statusOf(svg)});
+});
+out.dbg = norm(cont.innerText || '').slice(0, 200);
+return out;
+"""
+
+_AS_VIEW_ALL_JS = (
+    "var best = null;"
+    "document.querySelectorAll('a, button, span, div').forEach(function (e) {"
+    "  if (!best && e.children.length <= 2 && (e.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase() === 'view all' && e.offsetParent !== null) { best = e; } });"
+    "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';"
+)
+
+
+def fetch_as_score_details(sb, abbrev_as):
+    """v39: opens the AlphaSpread Profitability / Solvency pages named by the summary cards, clicks 'View All' and stores every
+    due-diligence check under _AS_RATIOS['scores'][kind]['checks']. Never raises; on any failure the summary card's reasons stay."""
+    if os.environ.get("AS_SCORE_DETAILS", "0") != "1" or os.environ.get("AS_SCORES", "1") == "0":
+        return
+    scores = _AS_RATIOS.get("scores")
+    if not isinstance(scores, dict):
+        return
+    base = "https://www.alphaspread.com/security/{}".format(as_path(abbrev_as))
+    for kind, page in (("profit", "profitability"), ("solv", "solvency")):
+        card = scores.get(kind)
+        if not isinstance(card, dict):
+            continue
+        href = str(card.get("href") or "")
+        url = href if ("alphaspread.com" in href and page[:6] in href.lower()) else "{}/{}".format(base, page)
+        try:
+            sb.uc_open_with_reconnect(url, 5)
+            sb.sleep(1.5)
+            deadline = time.time() + int(os.environ.get("AS_SCORE_DETAILS_WAIT", "20"))
+            data = {}
+            while time.time() < deadline:
+                try:
+                    data = sb.execute_script(_AS_CHECKS_JS) or {}
+                except Exception:
+                    data = {}
+                if data.get("found") and len(data.get("checks") or []) >= 3:
+                    break
+                try:
+                    sb.execute_script("window.scrollTo(0, 500);")
+                except Exception:
+                    pass
+                sb.sleep(1.2)
+            clicked = ""
+            if data.get("found") and not data.get("expanded"):
+                try:
+                    clicked = sb.execute_script(_AS_VIEW_ALL_JS) or ""
+                except Exception:
+                    clicked = ""
+                if clicked == "clicked":
+                    sb.sleep(1.5)
+                    try:
+                        data = sb.execute_script(_AS_CHECKS_JS) or data
+                    except Exception:
+                        pass
+            checks = []
+            for item in (data.get("checks") or [])[:40]:
+                if isinstance(item, dict) and str(item.get("t") or "").strip():
+                    status = item.get("s") if item.get("s") in ("ok", "warn", "bad") else None
+                    checks.append({"t": str(item["t"]).strip()[:90], "v": str(item.get("v") or "").strip()[:24], "s": status})
+            if len(checks) >= 3:
+                card["checks"] = checks
+                step("scores_detail", "OK", kind=kind, checks=len(checks), expanded=data.get("expanded"), viewAll=clicked or "-",
+                     ok=sum(1 for c in checks if c["s"] == "ok"), warn=sum(1 for c in checks if c["s"] == "warn"), bad=sum(1 for c in checks if c["s"] == "bad"),
+                     unknown=sum(1 for c in checks if c["s"] is None))
+            else:
+                try:
+                    os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                    with open(os.path.join(DIAGNOSTICS_DIR, "as_{}_row{}.html".format(page, os.environ.get("ROW_NUMBER", ""))), "w", encoding="utf-8") as handle:
+                        handle.write(sb.get_page_source()[:400000])
+                except Exception:
+                    pass
+                step("scores_detail", "FAIL", kind=kind, reason="fewer than 3 checks", found=data.get("found"), viewAll=clicked or "-",
+                     text=repr(data.get("dbg"))[:200], url=url[-60:])
+        except Exception as detail_error:
+            step("scores_detail", "FAIL", kind=kind, reason=type(detail_error).__name__)
+
+
+def fetch_as_hist(sb, abbrev_as):
+    """v30/v31: reads the AlphaSpread 'valuation history' sentence (.../summary) and stores {rank, headline, context, url} under
+    _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
+    scrolls in steps until it appears. On failure it saves diagnostics/as_hist_row<N>.html. Never raises."""
+    url = "https://www.alphaspread.com/security/{}/summary".format(as_path(abbrev_as))
+    _QM_WALL.clear()   # v49: never reuse the widget of the previous stock
+    try:
+        _as_open_cf(sb, url, 5)
+        if "just a moment" in (sb.get_title() or "").lower():
+            step("hist", "FAIL", reason="blocked")
+            return
+        sb.sleep(2.0)
+        deadline = time.time() + int(os.environ.get("AS_HIST_WAIT", "45"))
+        probe = {}
+        scroll_y = 0
+        rounds = 0
+        while time.time() < deadline:
+            rounds += 1
+            try:
+                probe = sb.execute_script(_AS_HIST_PROBE_JS) or {}
+            except Exception:
+                probe = {}
+            if (probe.get("headline") or "").strip() and not probe.get("loading"):
+                break
+            if probe.get("hasText") and rounds >= 2:
+                break  # v33: the class name of the headline is not always there; the sentence is in the text
+            try:
+                if probe.get("box"):
+                    sb.execute_script("document.querySelector('.valuation-history-context').scrollIntoView({block: 'center'});")
+                else:
+                    height = int(probe.get("height") or 0)
+                    step_px = max(500, int(probe.get("vh") or 700) - 100)
+                    scroll_y = scroll_y + step_px
+                    if height and scroll_y > height:
+                        scroll_y = 0
+                    sb.execute_script("window.scrollTo(0, {});".format(scroll_y))
+            except Exception:
+                pass
+            sb.sleep(1.5)
+        _as_fetch_scores_on_page(sb, url)  # v35: Profitability / Solvency cards, same page visit
+        if os.environ.get("AS_FIN", "1") != "0":   # v49: Wall St Estimates widget, same page visit (the summary page is opened once)
+            try:
+                import as_qm_data
+                _QM_WALL.clear()
+                _QM_WALL.update(as_qm_data.read_wall_st(sb, step))
+                _QM_WALL["visited"] = (_QM_WALL.get("rev") is not None or _QM_WALL.get("earn") is not None)   # empty (widget still "Loading") -> the QM step reads the page again
+            except Exception:
+                pass
+        headline = (probe.get("headline") or "").strip()
+        context = (probe.get("context") or "").strip()
+        if not headline:
+            try:
+                visible_text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+            except Exception:
+                visible_text = ""
+            fallback = _as_hist_text_fallback(visible_text) or _as_hist_text_fallback(_as_strip_text(sb.get_page_source()))
+            if fallback:
+                headline, context = fallback, ""
+                step("hist", "INFO", note="headline element missing, sentence found in the page text")
+        if not headline:
+            try:
+                os.makedirs(DIAGNOSTICS_DIR, exist_ok=True)
+                with open(os.path.join(DIAGNOSTICS_DIR, "as_hist_row{}.html".format(os.environ.get("ROW_NUMBER", "")) ), "w", encoding="utf-8") as handle:
+                    handle.write(sb.get_page_source()[:AS_PAGE_SAVE_CHARS if "AS_PAGE_SAVE_CHARS" in globals() else 400000])
+            except Exception:
+                pass
+            step("hist", "FAIL", reason="headline did not appear", rounds=rounds, box=probe.get("box"), loading=probe.get("loading"),
+                 scrollHeight=probe.get("height"), title=(sb.get_title() or "")[:60], url=(sb.get_current_url() or "")[:90])
+            return
+        rank, rule = _as_parse_hist(headline, context)
+        # v32: the 'More details' window has the exact figure ("Cheaper than on 63% of days over 5 years"); the one-line
+        # sentence often has none ("valued in line with its history"). The window's figure wins when it is there.
+        modal = {}
+        try:
+            modal = _as_parse_hist_modal(_as_hist_open_details(sb))
+        except Exception:
+            modal = {}
+        if modal.get("rank") is not None:
+            rank, rule = modal["rank"], "details-window"
+        if rank is None:
+            step("hist", "FAIL", reason="sentence not understood", headline=headline[:90], context=context[:140], modal=",".join(sorted(modal.keys())))
+            return
+        _AS_RATIOS["hist"] = {"rank": rank, "rule": rule, "headline": headline[:160], "context": context[:260], "url": url,
+                              "label": modal.get("label"), "today": modal.get("today"),
+                              "expReturn": modal.get("exp_return"), "cheapReturn": modal.get("cheap_return")}
+        step("hist", "OK", rank=rank, rule=rule, today=modal.get("today"), rounds=rounds, headline=headline[:60])
+    except Exception as hist_error:
+        step("hist", "FAIL", reason=type(hist_error).__name__)
+
+
+def post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """Posts the collected AS ratios once (target ASRP); never touches the DCF result."""
+    if not _AS_RATIOS:
+        return
+    ratios = dict(_AS_RATIOS)
+    _AS_RATIOS.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASRP", row_number, abbrev, sheet_name, {"ratios": ratios})
+        info["ratios"] = {"posted": bool(posted), "got": sorted(ratios.keys()),
+                          "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as ratios_error:
+        print("❌ AS ratios post failed: {}".format(ratios_error))
+        info["ratios"] = {"posted": False, "got": sorted(ratios.keys()), "reason": str(ratios_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
+# ----------------------------------------------------------------------------
+# v18: structural quality metrics (as_quality_metrics.py) from the AlphaSpread statement pages
+# ----------------------------------------------------------------------------
+_AS_QUALITY = {}
+_QM_SRC = {}   # v48: moat block + TTM "now" block, kept even when an annual statement page is blocked and fetch_as_quality gives up
+_QM_WALL = {}   # v49: Wall St Estimates widget read during the summary visit of fetch_as_hist
+_QM_PROF = {"html": ""}   # v48: profitability page of the current stock, reused by the Quality Model step
+AS_QUALITY_PAGES = (("profitability", "profitability"), ("income", "financials/income-statement"),
+                    ("balance", "financials/balance-sheet"), ("cashflow", "financials/cash-flow-statement"))
+
+
+# v21: the statement pages have an Annual / Quarterly / TTM switch. Income + cash flow -> TTM, balance sheet -> Quarterly.
+AS_TTM_TOGGLE = {"income": ("TTM", r"TTM\s+[A-Z][a-z]{2}\s+\d{4}"), "cashflow": ("TTM", r"TTM\s+[A-Z][a-z]{2}\s+\d{4}"),
+                 "balance": ("Quarterly", r"Q\d\s*FY\d{4}")}
+
+
+def _as_click_view(sb, toggle):
+    """v45: clicks the view switch by its visible text (up to 3 attempts, 12 s each) and returns the page source once the new header shows; '' on failure."""
+    label, ready_pattern = toggle
+    key = "quality_view_" + label.lower()
+    js = ("var want = arguments[0], best = null;"
+          "document.querySelectorAll('button, a, label, li, span, div').forEach(function (e) {"
+          "  if (e.children.length === 0 && (e.textContent || '').trim() === want) { best = best || e; } });"
+          "if (!best) { return 'none'; } best.scrollIntoView({block: 'center'}); best.click(); return 'clicked';")
+    reason = "header did not change"
+    for attempt in range(1, 4):
+        try:
+            if sb.execute_script(js, label) != "clicked":
+                reason = "toggle not found"
+                sb.sleep(2.0)
+                continue
+            for _ in range(12):
+                sb.sleep(1.0)
+                source = sb.get_page_source()
+                if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
+                    step(key, "OK", chars=len(source), attempt=attempt)
+                    return source
+            reason = "header did not change"
+        except Exception as view_error:
+            reason = type(view_error).__name__
+            sb.sleep(2.0)
+    step(key, "FAIL", reason=reason, attempts=3)
+    return ""
+
+
+def fetch_as_quality(sb, abbrev_as):
+    """Never raises: the DCF must not depend on it. Fills _AS_QUALITY with the metrics dict (see as_quality_metrics)."""
+    _AS_QUALITY.clear()
+    _QM_SRC.clear()
+    _QM_PROF["html"] = ""
+    try:
+        import as_quality_metrics
+    except Exception as import_error:
+        step("quality", "FAIL", reason="as_quality_metrics.py missing: " + type(import_error).__name__)
+        return
+    base = "https://www.alphaspread.com/security/{}/".format(as_path(abbrev_as))
+    pages, ttm_pages, q_pages = {}, {}, {}
+    for name, path in AS_QUALITY_PAGES:
+        try:
+            source = ""
+            for open_try in (1, 2, 3):   # v48: a Cloudflare page in the middle of the run is retried (wait, verification click, reopen)
+                sb.uc_open_with_reconnect(base + path, 4)
+                source = ""
+                for _ in range(14):
+                    source = sb.get_page_source()
+                    ready = ("3Y Average ROIC" in source) if name == "profitability" else bool(re.search(r"FY\s*20\d\d", source))
+                    if ready:
+                        break
+                    if "just a moment" in (sb.get_title() or "").lower() and _ >= 4:
+                        break
+                    sb.sleep(1.5)
+                if "just a moment" not in (sb.get_title() or "").lower():
+                    break
+                step("quality_" + name, "INFO", note="Cloudflare page, retry {}".format(open_try))
+                sb.sleep(20 * open_try)
+                try:
+                    sb.uc_gui_click_captcha()
+                    sb.sleep(4.0)
+                except Exception:
+                    pass
+            if "just a moment" in (sb.get_title() or "").lower():
+                step("quality_" + name, "FAIL", reason="blocked")
+                continue
+            pages[name] = source
+            step("quality_" + name, "OK", chars=len(source))
+            if name == "profitability":
+                _QM_PROF["html"] = source
+            if name in AS_TTM_TOGGLE:  # v21: same page, other view (TTM / Quarterly); never blocks the annual metrics
+                ttm_pages[name] = _as_click_view(sb, AS_TTM_TOGGLE[name])
+                if name in ("income", "cashflow") and not ttm_pages[name]:  # v45: TTM toggle failed -> the Quarterly toggle (reliable) gives 4-quarter sums
+                    q_pages[name] = _as_click_view(sb, ("Quarterly", r"Q\d\s*FY\d{4}"))
+        except Exception as page_error:
+            step("quality_" + name, "FAIL", reason=type(page_error).__name__)
+    moat_source = ""
+    try:  # v22: AlphaSpread "Economic Moat" page (rating + advantage tags); never blocks the metrics
+        _as_open_cf(sb, base + "qualitative/block/economic-moat", 4)
+        for _ in range(12):
+            moat_source = sb.get_page_source()
+            if "What is Economic Moat?" in moat_source or "How we rate moats" in moat_source:   # old / new (2026-10-20) page layout
+                break
+            sb.sleep(1.5)
+        step("quality_moat_page", "OK", chars=len(moat_source))
+    except Exception as moat_page_error:
+        step("quality_moat_page", "FAIL", reason=type(moat_page_error).__name__)
+    try:   # v48: moat + TTM block for the Quality Model, independent of the annual statement pages
+        if moat_source:
+            import as_moat
+            _QM_SRC["moat"] = as_moat.parse_moat(moat_source)
+        if ttm_pages.get("income") or q_pages.get("income"):
+            import as_ttm_metrics
+            _QM_SRC["now"] = as_ttm_metrics.compute_now(ttm_pages.get("income", ""), ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
+                                                        income_q_html=q_pages.get("income", ""), cashflow_q_html=q_pages.get("cashflow", ""))
+        step("qm_src", "OK", moat=(_QM_SRC.get("moat") or {}).get("rating"), ttm=bool((_QM_SRC.get("now") or {}).get("signals")))
+    except Exception as qm_src_error:
+        step("qm_src", "FAIL", reason=type(qm_src_error).__name__ + ": " + str(qm_src_error)[:60])
+    if not all(k in pages for k in ("income", "balance", "cashflow")):
+        step("quality", "FAIL", reason="statement pages missing: " + ",".join(sorted(pages.keys())))
+        return
+    try:
+        result = as_quality_metrics.compute_metrics(pages.get("profitability", ""), pages["income"], pages["balance"], pages["cashflow"])
+    except Exception as compute_error:
+        step("quality", "FAIL", reason="compute " + type(compute_error).__name__ + ": " + str(compute_error)[:60])
+        return
+    diag = result.get("diagnostics", {})
+    _AS_QUALITY.update({
+        "metrics": result["metrics"], "scores": result["scores"], "partial_structural": result["partial_structural"],
+        "coverage_pct": result["coverage_pct"], "display": result["display"], "flags": result["flags"],
+        "scrapedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "details": result.get("details"),  # v20: the numbers behind each cell (for the cell notes)
+        "diag": {"roic3y_source": diag.get("roic3y_source"), "last5": diag.get("last5"), "notes": diag.get("notes"),
+                 "income_cols": (diag.get("income") or {}).get("columns"), "warnings": [v.get("warning") for v in (diag.get("income"), diag.get("balance"), diag.get("cashflow")) if v and v.get("warning")]},
+    })
+    v4_block = None
+    try:  # v22: Q v4 (as_quality_v4.py) next to the old Struct; the sheet shows both until the old columns are removed
+        import as_quality_v4
+        v4_full = as_quality_v4.compute_v4(pages.get("profitability", ""), pages["income"], pages["balance"], pages["cashflow"])
+        det = v4_full.get("details") or {}
+        v4_block = {k: v4_full.get(k) for k in ("v", "profile", "metrics", "scores", "weights", "q", "q_capped", "coverage_pct", "flags", "warnings", "display")}
+        v4_block["diag"] = {k: det.get(k) for k in ("profile_reason", "diag_roic_sbc_med5", "diag_sbc_pct_rev", "diag_roic_netcash_med5", "diag_nii_share_pretax",
+                                                     "goodwill_pct", "interest_cover", "rev_cagr_long")}
+        _AS_QUALITY["v4"] = v4_block
+        step("quality_v4", "OK", scorer=v4_full.get("v"), q=v4_full.get("q_capped"), profile=v4_full.get("profile"), cov=v4_full.get("coverage_pct"), flags=",".join(v4_full.get("flags") or []) or "none")
+    except Exception as v4_error:
+        step("quality_v4", "FAIL", reason=type(v4_error).__name__ + ": " + str(v4_error)[:60])
+    try:
+        import as_moat
+        if moat_source:
+            moat_block = as_moat.parse_moat(moat_source)
+            _AS_QUALITY["moat"] = moat_block
+            step("quality_moat", "OK", rating=moat_block.get("rating"), tags=",".join(moat_block.get("advantages") or []) or "none", warnings=";".join(moat_block.get("warnings") or []) or "none")
+    except Exception as moat_error:
+        step("quality_moat", "FAIL", reason=type(moat_error).__name__ + ": " + str(moat_error)[:60])
+    now_block = None
+    if ttm_pages.get("income") or q_pages.get("income"):  # v45: cash flow is optional (only the FCF margin signal needs it); Quarterly view is the fallback
+        try:
+            import as_ttm_metrics
+            now_block = as_ttm_metrics.compute_now(ttm_pages.get("income", ""), ttm_pages.get("cashflow", ""), ttm_pages.get("balance", ""),
+                                                   profile=(v4_block or {}).get("profile") or "NF",
+                                                   income_q_html=q_pages.get("income", ""), cashflow_q_html=q_pages.get("cashflow", ""))
+            _AS_QUALITY["now"] = now_block
+            step("quality_now", "OK", now=now_block.get("now"), signals=now_block.get("signals"), warnings=";".join(now_block.get("warnings") or []) or "none")
+        except Exception as now_error:
+            step("quality_now", "FAIL", reason=type(now_error).__name__ + ": " + str(now_error)[:60])
+    else:
+        step("quality_now", "FAIL", reason="income TTM view missing")
+    step("quality", "OK", struct=result["partial_structural"], cov=result["coverage_pct"], flags=",".join(result["flags"]) or "none", roic_scale=diag.get("roic_scale"), roic_min5=(result["metrics"].get("roic_min5") if result.get("metrics") else None))
+
+
+_AS_QM = {}
+_RUN_START = time.monotonic()
+_QM_LAST = {}   # v54: {'missing': [...]} of the last Quality Model payload
+
+
+def _as_fin_open_page(sb, url, ready_pattern):
+    """v47/v48: opens one AlphaSpread page and waits until ready_pattern shows in the page text; '' when it stays a Cloudflare page.
+    v48: 3 attempts, each with a wait and a verification click when Cloudflare shows."""
+    for attempt in (1, 2, 3):
+        sb.uc_open_with_reconnect(url, 4)
+        source = ""
+        for tick in range(14):
+            source = sb.get_page_source()
+            if re.search(ready_pattern, re.sub(r"<[^>]+>", " ", source)):
+                return source
+            if "just a moment" in (sb.get_title() or "").lower() and tick >= 3:
+                break
+            sb.sleep(1.5)
+        if "just a moment" in (sb.get_title() or "").lower():
+            sb.sleep(20 * attempt)
+            try:
+                sb.uc_gui_click_captcha()
+                sb.sleep(4.0)
+            except Exception:
+                pass
+            continue
+        return source
+    return ""
+
+
+def fetch_as_qm(sb, abbrev_as):
+    """v48: Quality Model raw data (QM JSON): profitability checklist, analyst estimates, solvency + buyback / moat / TTM already read. Never raises.
+    Env AS_FIN="0" (workflow input as_fin) skips it."""
+    _AS_QM.clear()
+    if os.environ.get("AS_FIN", "1") == "0":
+        step("qm", "INFO", note="AS_FIN=0: Quality Model data not refreshed")
+        return
+    try:
+        import as_qm_data
+    except Exception as import_error:
+        step("qm", "FAIL", reason="as_qm_data.py missing: " + type(import_error).__name__)
+        return
+    try:   # v48: the buyback block is blocked now and then -> one more try before the Quality Model is assembled
+        if not (isinstance(_AS_RATIOS, dict) and _AS_RATIOS.get("buyback")):
+            sb.sleep(15)
+            fetch_as_buyback(sb, abbrev_as)
+    except Exception:
+        pass
+    try:
+        qm = as_qm_data.fetch_as_qm(sb, abbrev_as, step, _as_fin_open_page, prof_html=_QM_PROF.get("html"),
+                                    buyback=(_AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None),
+                                    moat=(_AS_QUALITY.get("moat") or _QM_SRC.get("moat")),
+                                    now_block=(_AS_QUALITY.get("now") or _QM_SRC.get("now")),
+                                    wall=(dict(_QM_WALL) if _QM_WALL.get("visited") else None),
+                                    roic_series=((((_AS_QUALITY.get("details") or {}).get("roic") or {}).get("raw")) or None),
+                                    margin_series=(((_AS_QUALITY.get("details") or {}).get("margins")) or None))
+        if qm:
+            qm["fin"] = bool(((_AS_QUALITY.get("v4") or {}).get("profile")) == "FIN")   # v53: financials are not scored / excluded on ND/EBITDA
+            try:
+                _QM_LAST["missing"] = as_qm_data.qm_missing(qm)   # v54: drives the completion pass
+            except Exception:
+                _QM_LAST["missing"] = []
+            _AS_QM.update(qm)
+            step("qm", "OK", prof=len(qm.get("prof") or {}), est=bool(qm.get("est")), moat=qm.get("moat"), bb=(qm.get("bb") or {}).get("cur"))
+        else:
+            step("qm", "FAIL", reason="nothing read")
+    except Exception as qm_error:
+        step("qm", "FAIL", reason=type(qm_error).__name__ + ": " + str(qm_error)[:60])
+
+
+def qm_completion_passes(webhook_url, row_number, abbrev_as, sheet_name, info, headless):
+    """v54: when the Quality Model payload of the main pass lacks inputs (blocked pages), run the missing parts again in a FRESH browser (a new
+    browser often passes Cloudflare where the old one stays blocked) and post the result again; the sheet keeps what it already has.
+    Env AS_QM_FILL_PASSES (default 2, 0 = off). Never raises."""
+    try:
+        passes = int(os.environ.get("AS_QM_FILL_PASSES", "2"))
+    except ValueError:
+        passes = 2
+    if os.environ.get("AS_FIN", "1") == "0" or passes <= 0:
+        return
+    statement_inputs = {"ROIC", "Op mgn", "FCF mgn", "Gross Margin", "Rev g", "ND/EBITDA", "Moat"}
+    for n in range(1, passes + 1):
+        missing = list(_QM_LAST.get("missing") or [])
+        if not missing:
+            return
+        if time.monotonic() - _RUN_START > int(os.environ.get("AS_QM_FILL_MAX_ELAPSED", "1020")):
+            print("⏹️ QM completion pass skipped: run already took {:.0f}s".format(time.monotonic() - _RUN_START))
+            return
+        pause = random.uniform(20, 40)
+        print("🔁 QM completion pass {}/{}: still missing {} -- fresh browser after {:.0f}s".format(n, passes, ",".join(missing), pause))
+        time.sleep(pause)
+        _QM_LAST["missing"] = []
+        try:
+            step_begin("ASDCF", 90 + n, "headless" if headless else "headed")
+            _STEP_CTX["blocked"] = 0
+            with SB(uc=True, headless=headless) as sb2:
+                if statement_inputs & set(missing):
+                    fetch_as_quality(sb2, abbrev_as)
+                if "Shr chg" in missing and not (isinstance(_AS_RATIOS, dict) and _AS_RATIOS.get("buyback")):
+                    fetch_as_buyback(sb2, abbrev_as)
+                _QM_WALL.clear()
+                fetch_as_qm(sb2, abbrev_as)
+                post_as_qm_if_any(webhook_url, row_number, abbrev_as, sheet_name, info)
+            step("qm_fill", "OK", pass_=n, missing_after=",".join(_QM_LAST.get("missing") or []) or "-")
+        except BaseException as fill_error:
+            print("⚠️ QM completion pass {} failed: {}".format(n, str(fill_error)[:100]))
+            if isinstance(fill_error, KeyboardInterrupt):
+                raise
+
+def post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v48: posts the Quality Model data once (target ASQM, fn_91_12); never touches the DCF result."""
+    if not _AS_QM:
+        return
+    qm = dict(_AS_QM)
+    _AS_QM.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASQM", row_number, abbrev, sheet_name, {"qm": qm})
+        info["qm"] = {"posted": bool(posted), "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as qm_post_error:
+        print("❌ Quality Model post failed: {}".format(qm_post_error))
+        info["qm"] = {"posted": False, "reason": str(qm_post_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
+def post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """Posts the computed quality metrics once (target ASQ); never touches the DCF result."""
+    if not _AS_QUALITY:
+        return
+    quality = dict(_AS_QUALITY)
+    _AS_QUALITY.clear()
+    if os.environ.get("AS_POST_QUALITY_V4", "0") != "1":   # v59
+        info["quality"] = {"posted": False, "struct": quality.get("partial_structural"), "cov": quality.get("coverage_pct"), "reason": "not sent (Quality v4 columns removed)"}
+        return
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "ASQ", row_number, abbrev, sheet_name, {"quality": quality})
+        info["quality"] = {"posted": bool(posted), "struct": quality.get("partial_structural"), "cov": quality.get("coverage_pct"),
+                           "reason": None if posted else _LAST_POST.get("reason")}
+    except Exception as quality_error:
+        print("❌ AS quality post failed: {}".format(quality_error))
+        info["quality"] = {"posted": False, "reason": str(quality_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
+def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
+    """
+    Opens AlphaSpread's DCF page for abbrev_as, opens View Calculation ->
+    Full Model and returns the JSON-ready dict built by as_dcf_extractor.
+    Read-only: the extractor only ever clicks those two labels. Raises on any
+    problem; run_bot catches that per provider, so SW is never blocked.
+    """
+    if as_dcf_extractor is None:
+        raise RuntimeError(
+            "as_dcf_extractor.py is not in the repository root -- AlphaSpread"
+            " DCF skipped"
+        )
 
     try:
-        response = requests.post(webhook_url, json=payload, timeout=120)
+        sb.set_window_size(WINDOW_WIDTH, WINDOW_HEIGHT)
+    except Exception as size_error:
+        print("⚠️ could not set window size: {}".format(size_error))
 
-    except Exception as post_error:
-        print(
-            "❌ Row {} ({}): AS webhook POST itself failed: {}".format(
-                row_number, abbrev_as, post_error
+    dcf_failed = False
+    dcf_cf = False
+    _FAST_BLOCK["on"] = False
+    try:
+        step("run_extractor", "INFO", abbrev=abbrev_as)
+        data = as_dcf_extractor.scrape_as_dcf_data(sb, abbrev_as)
+        step("extract_table", "OK", periods=len(data.get("periods") or []),
+             sections=len(data.get("sections") or []))
+
+    except Exception as error:
+        if isinstance(error, getattr(as_dcf_extractor, "AsDcfCloudflare", ())):
+            # v62: Cloudflare page on the DCF page itself -> end this attempt now; run_bot relaunches with a fresh browser
+            dcf_cf = True
+            step("as_dcf_cloudflare", "FAIL", reason="CLOUDFLARE_PAGE")
+            _FAST_BLOCK["on"] = False
+            raise CloudflareBlocked("AlphaSpread DCF page is still the Cloudflare page: {}".format(str(error)[:120]))
+        dcf_failed = True
+        _FAST_BLOCK["on"] = True   # v60
+        failure_report(sb, "as_dcf_" + (str(error).split(":")[0].strip().lower() or "failed")[:40],
+                       str(error), looking_for="view calculation|full model|calculation|dcf")
+        log_as_page_state(sb)
+        save_as_diagnostics(sb, row_number, "scrape failed")
+
+        if isinstance(error, as_dcf_extractor.AsDcfLoginRequired):
+            print(
+                "🔒 AlphaSpread asked for a login instead of opening the DCF"
+                " model -- nothing was written."
             )
-        )
+
+        raise
+
+    finally:
+        # v19: the DCF goes FIRST (AlphaSpread showed a login wall on the DCF
+        # modal when 7 other pages had been opened before it). Ratios and
+        # quality run afterwards, also when the DCF failed, so they are kept.
+        # v46: when the DCF failed AND two following pages show the Cloudflare page, stop at once and let run_bot retry with a fresh browser
+        # (the old run kept opening pages for 3-4 minutes, all blocked, and was never retried: Amazon, MercadoLibre 2026-10-19).
+        def _stop_if_blocked():
+            if dcf_failed and _STEP_CTX.get("blocked", 0) >= 1:   # v60: was 2
+                raise CloudflareBlocked("AlphaSpread shows the Cloudflare page on {} steps after the DCF failed".format(_STEP_CTX.get("blocked", 0)))
+        if os.environ.get("AS_RATIOS", "1") != "0" and not dcf_cf:
+            fetch_as_ratios(sb, abbrev_as)
+            _stop_if_blocked()
+            fetch_as_buyback(sb, abbrev_as)
+            _stop_if_blocked()
+            if os.environ.get("AS_HIST", "1") != "0":
+                fetch_as_hist(sb, abbrev_as)  # v30
+                _stop_if_blocked()
+                fetch_as_score_details(sb, abbrev_as)  # v39
+        if os.environ.get("AS_QUALITY", "1") != "0" and not dcf_cf:
+            _stop_if_blocked()
+            fetch_as_quality(sb, abbrev_as)
+        if os.environ.get("AS_FIN", "1") != "0" and not dcf_cf:   # v48: Quality Model raw data (QM JSON)
+            _stop_if_blocked()
+            fetch_as_qm(sb, abbrev_as)
+
+    _FAST_BLOCK["on"] = False
+    if SAVE_DIAGNOSTICS_ALWAYS:
+        save_as_diagnostics(sb, row_number, "always-on")
+
+    return data
+
+
+# ----------------------------------------------------------------------------
+# Posting
+# ----------------------------------------------------------------------------
+# v7: facts about the last webhook post, read by run_bot's summary
+_LAST_POST = {}
+
+
+# v10: an unreadable reply (Google HTML error page although Apps Script
+# succeeded) or a failed/timed-out POST is retried: the write goes to a fixed
+# cell, so posting the same payload again only overwrites it with the same value.
+POST_UNREADABLE_RETRIES = int(os.environ.get("POST_UNREADABLE_RETRIES", "5"))
+POST_RETRY_PAUSE_SECONDS = 6
+POST_LOCK_RETRY_PAUSE_SECONDS = 20  # v12: base pause after LOCK_TIMEOUT (plus jitter)
+
+
+def post_provider_json(webhook_url, target, row_number, abbrev, sheet_name, data):
+    """
+    v10 wrapper: posts, and re-posts the identical payload (up to
+    POST_UNREADABLE_RETRIES times) when the reply was unreadable or the POST
+    itself failed. Any readable reply (written / refused / not written) is final.
+    """
+    posted = False
+    for post_try in range(1, POST_UNREADABLE_RETRIES + 2):
+        posted = _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name, data)
+        reason = str(_LAST_POST.get("reason") or "")
+        # v12: a LOCK_TIMEOUT refusal (another row held the document lock for 60 s
+        # while several rows ran at once) wrote nothing, so re-posting is safe.
+        retryable = (reason == "reply_unreadable" or reason.startswith("post_failed")
+                     or reason == "refused:LOCK_TIMEOUT")
+        if posted or not retryable:
+            if posted and post_try > 1:
+                print("   (v10) confirmed on post try {}".format(post_try))
+            return posted
+        if post_try <= POST_UNREADABLE_RETRIES:
+            print("🔁 Row {} {}: reply unreadable/POST failed ({}) -- re-posting the same payload in {} s (try {} of {})".format(
+                row_number, target, reason, POST_RETRY_PAUSE_SECONDS, post_try + 1, POST_UNREADABLE_RETRIES + 1))
+            if reason == "refused:LOCK_TIMEOUT":
+                time.sleep(POST_LOCK_RETRY_PAUSE_SECONDS + random.uniform(0, 25))
+            else:
+                time.sleep(POST_RETRY_PAUSE_SECONDS)
+    _LAST_POST["reason"] = reason + "_after_retries"
+    return posted
+
+
+def _post_provider_json_once(webhook_url, target, row_number, abbrev, sheet_name, data):
+    """
+    POSTs one provider's JSON to the Apps Script webhook (the SAME Web App
+    URL as insider_score_scraper.py -- one doPost per project -- routed
+    there by the payload's own "target" field). Returns True only when the
+    webhook confirmed it actually wrote the cell.
+    """
+    # The webhook reads the abbreviation under the exact key its provider
+    # registry names: abbrevSW for target "SW", abbrevGF for "GF", ...
+    payload = {
+        "target": target,
+        "sheetName": sheet_name,
+        "rowNumber": row_number,
+        ABBREV_KEY_BY_TARGET.get(target.upper(), "abbrev" + target.upper()): abbrev,
+        "data": data,
+    }
+    if _POST_FLAGS.get("skipRecalc") and target.upper() in ("MS", "SW", "SWP", "ASRP"):
+        payload["skipRecalc"] = True
+    elif target.upper() in (_POST_FLAGS.get("skipTargets") or ()):
+        payload["skipRecalc"] = True  # v29: SW-only follow-up run -- the SW webhook recalculates once, the SWP page data only writes its cells
+    if _POST_FLAGS.get("recalcOnly") and target.upper() == "ASRP":
+        payload["recalcOnly"] = True
+
+    label = "Row {} ({}) {}".format(row_number, abbrev, target)
+
+    try:
+        # v24: providers run in parallel processes, but their webhooks go one at a time (each handler holds the sheet's
+        # document lock; overlapping posts caused LOCK_TIMEOUT refusals). The file lock is released when the reply is back.
+        with open(POST_LOCK_PATH, "a") as post_lock_file:
+            fcntl.flock(post_lock_file, fcntl.LOCK_EX)
+            try:
+                response = requests.post(
+                    webhook_url, json=payload, timeout=WEBHOOK_TIMEOUT_SECONDS
+                )
+            finally:
+                fcntl.flock(post_lock_file, fcntl.LOCK_UN)
+    except Exception as post_error:
+        print("❌ {}: webhook POST itself failed: {}".format(label, post_error))
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "post_failed:" + type(post_error).__name__})
         return False
 
     reply_received_at = utc_clock_text()
+    body = read_webhook_json(response, label)
 
-    response_body = read_webhook_json(
-        response, "Row {} ({}) AS".format(row_number, abbrev_as)
-    )
-
-    # VERSION 11: the webhook's own Apps Script log is not always visible,
-    # so print the whole JSON reply (trimmed) -- it carries the reason and
-    # any per-column result fn_90_02 reports.
-    # VERSION 13: with the UTC time the reply was received.
     try:
         print(
-            "   AS webhook reply (UTC {}): ".format(reply_received_at)
-            + json.dumps(response_body, ensure_ascii=False)[:1500]
+            "   {} webhook reply (UTC {}): ".format(target, reply_received_at)
+            + json.dumps(body, ensure_ascii=False)[:1500]
         )
     except Exception:
         pass
 
-    if response_body is None:
+    if body is None:
         print(
             "   The response could not be read, so it is unknown whether the"
             " webhook wrote the value -- check the sheet or Apps Script"
             " Executions before assuming it failed."
         )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "reply_unreadable"})
         return False
 
-    if response_body.get("ok") and response_body.get("written"):
-        print(
-            "✅ Row {} ({}): AS vs usual = \"{}\"".format(
-                row_number,
-                abbrev_as,
-                response_body.get("vsUsualText"),
-            )
-        )
+    if body.get("ok") and body.get("shadow"):
+        # v11: MS shadow mode -- the webhook parsed and compared, wrote nothing, on purpose.
+        print("✅ {}: parsed in SHADOW mode (nothing written): {}".format(label, json.dumps(body.get("summary"), ensure_ascii=False)[:400]))
+        _LAST_POST.clear(); _LAST_POST.update({"ok": True, "chars": body.get("chars"), "column": "shadow"})
         return True
 
-    if response_body.get("ok"):
+    if body.get("ok") and body.get("written"):
         print(
-            "⏩ Row {} ({}): AS webhook accepted but did not write ({})".format(
-                row_number, abbrev_as, response_body.get("reason")
+            "✅ {}: JSON written ({} chars, column {})".format(
+                label, body.get("chars"), body.get("column")
             )
         )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": True, "chars": body.get("chars"), "column": body.get("column")})
+        return True
+
+    if body.get("ok"):
+        print(
+            "⏩ {}: webhook accepted but did not write ({})".format(
+                label, body.get("reason")
+            )
+        )
+        _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "not_written:" + str(body.get("reason"))})
         return False
 
-    print(
-        "❌ Row {} ({}): AS webhook refused/failed ({})".format(
-            row_number, abbrev_as, response_body.get("reason")
-        )
-    )
+    print("❌ {}: webhook refused/failed ({})".format(label, body.get("reason")))
+    _LAST_POST.clear(); _LAST_POST.update({"ok": False, "reason": "refused:" + str(body.get("reason"))})
     return False
 
 
-VERSION = "v15"
-AS_LAUNCH_MODES = [m.strip().lower() for m in os.environ.get("AS_LAUNCH_MODES", "headed,headed,headless").split(",") if m.strip()]
+# ----------------------------------------------------------------------------
+# v7: one-line machine-readable run summary
+# ----------------------------------------------------------------------------
+def print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc):
+    """Prints "📋 RUN_SUMMARY {json}" -- one line, never raises."""
+    try:
+        providers_out = {}
+
+        for target, info in trace.items():
+            entry = dict(info)
+
+            if target == "ASDCF" and as_dcf_extractor is not None:
+                entry["extractor"] = getattr(as_dcf_extractor, "VERSION", "?")
+
+            providers_out[target] = entry
+
+        summary = {
+            "v": "v47",
+            "versions": module_versions(),
+            "sheet": sheet_name,
+            "row": row_number,
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "startedUtc": run_started_utc,
+            "secondsTotal": round(time.monotonic() - run_started),
+            "providers": providers_out,
+        }
+        print("📋 RUN_SUMMARY " + json.dumps(summary, ensure_ascii=False, separators=(",", ":")))
+        # v27: tell the workflow that SW was blocked on every attempt, so it can start a SW-only follow-up
+        # run on a fresh runner (blocks come in clusters per runner address).
+        sw_info = providers_out.get("SW")
+        if sw_info is not None and sw_info.get("status") != "ok":
+            with open("sw_retry.flag", "w") as flag_file:
+                flag_file.write("blocked")
+            print("🔁 SW did not succeed -> sw_retry.flag written (the workflow may start a SW-only follow-up run)")
+    except Exception as summary_error:
+        print("⚠️ could not build RUN_SUMMARY: {}".format(summary_error))
 
 
-def run_alphaspread_launches(webhook_url, row_number, abbrev_as, sheet_name):
-    """VERSION 15: AS Price + AS Hist. One fresh browser launch per entry of AS_LAUNCH_MODES; stops at the first launch that
-    gets the real summary page and posts it. Diagnostics are saved only when the last launch also fails."""
-    modes = AS_LAUNCH_MODES or ["headed"]
-    for number, mode in enumerate(modes, 1):
-        headless = (mode == "headless")
-        last = (number == len(modes))
-        print("🚀 AlphaSpread launch {}/{} ({})".format(number, len(modes), "headless" if headless else "headed"))
+# ----------------------------------------------------------------------------
+# Entry point
+# ----------------------------------------------------------------------------
+def post_sw_skin_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v43: posts the Skin score + note (target SKIN) for this row once."""
+    if not _SW_SKIN:
+        return
+    result = dict(_SW_SKIN)
+    _SW_SKIN.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        data = {"score": result["score"], "note": result["note"], "parts": result["parts"], "inputs": result["inputs"]}
+        posted = post_provider_json(webhook_url, "SKIN", row_number, abbrev, sheet_name, data)
+        info["skin"] = {"posted": bool(posted), "score": result["score"], "reason": None if posted else _LAST_POST.get("reason")}
+        step("post_skin", "OK" if posted else "FAIL", score=result["score"], reason=None if posted else _LAST_POST.get("reason"))
+    except Exception as skin_error:
+        print("❌ SW skin post failed: {}".format(skin_error))
+        info["skin"] = {"posted": False, "reason": str(skin_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
+def post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info):
+    """v13: posts the collected SW pages (target SWP) once; never touches the SW JSON result."""
+    post_sw_skin_if_any(webhook_url, row_number, abbrev, sheet_name, info)  # v43
+    if not _SW_PAGES:
+        return
+    pages = dict(_SW_PAGES)
+    _SW_PAGES.clear()
+    saved_post = dict(_LAST_POST)
+    try:
+        posted = post_provider_json(webhook_url, "SWP", row_number, abbrev, sheet_name, {"pages": pages})
+        info["pages"] = {"posted": bool(posted), "got": sorted(pages.keys()),
+                         "reason": None if posted else _LAST_POST.get("reason"),
+                         "column": _LAST_POST.get("column")}
+    except Exception as pages_error:
+        print("❌ SW pages post failed: {}".format(pages_error))
+        info["pages"] = {"posted": False, "got": sorted(pages.keys()), "reason": str(pages_error)[:80]}
+    finally:
+        _LAST_POST.clear()
+        _LAST_POST.update(saved_post)
+
+
+def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_name, run_started, run_started_utc):
+    """
+    v24: one child process per provider (same script, env ONLY_TARGET), each with its own browser, started a few
+    seconds apart. Tabs in one browser would not help: a WebDriver runs one command at a time and background tabs are
+    throttled, so the real gain is separate browsers. Webhook posts are serialised by POST_LOCK_PATH. Child output is
+    streamed with a [TARGET] prefix; their traces are merged into one RUN_SUMMARY.
+    """
+    children = []
+    ordered = [p for p in providers if p[1]]
+    # slowest first: Simply Wall St, then AlphaSpread, then MarketScreener
+    rank = {"SW": 0, "ASDCF": 1, "MS": 2, "GFP": 3}
+    ordered.sort(key=lambda p: rank.get(p[0], 9))
+    for target, abbrev, _ in providers:
+        if not abbrev:
+            print("⏩ Row {}: no abbreviation for {} -- skipping.".format(row_number, target))
+            trace[target] = {"abbrev": "", "status": "skipped", "attempts": []}
+    print("🧵 v24: running {} providers in parallel ({})".format(len(ordered), ", ".join(p[0] for p in ordered)))
+
+    def pump(target, process):
+        for line in process.stdout:
+            print("[{}] {}".format(target, line.rstrip("\n")), flush=True)
+
+    as_abbrev = next((p[1] for p in providers if p[0] == "ASDCF" and p[1]), "")
+    single_recalc = SINGLE_RECALC and bool(as_abbrev)
+    if single_recalc:
+        print("🧮 v26: MS / SW handlers skip their own recalculation; one final recalculation follows the last provider.")
+
+    for index, (target, abbrev, _) in enumerate(ordered):
+        trace_path = os.path.join(tempfile.gettempdir(), "trace_{}_{}.json".format(target, os.getpid()))
+        if os.path.exists(trace_path):
+            os.remove(trace_path)
+        child_env = dict(os.environ, ONLY_TARGET=target, TRACE_OUT=trace_path, PYTHONUNBUFFERED="1", GH_LOG_UPLOAD="0")  # the parent uploads the combined log once
+        if single_recalc:
+            child_env["SKIP_RECALC"] = "1"
+        process = subprocess.Popen([sys.executable, os.path.abspath(__file__)], env=child_env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        reader = threading.Thread(target=pump, args=(target, process), daemon=True)
+        reader.start()
+        children.append((target, abbrev, process, reader, trace_path))
+        if index < len(ordered) - 1:
+            time.sleep(PARALLEL_START_GAP_SECONDS)
+
+    for target, abbrev, process, reader, trace_path in children:
+        process.wait()
+        reader.join(timeout=5)
         try:
-            with SB(uc=True, headless=headless) as sb:
-                diagnostics_reason = None
-                try:
-                    as_html = scrape_alphaspread_html(sb, abbrev_as)
-                except Exception as as_scrape_error:
-                    print("❌ Row {} ({}): AS scrape itself failed (launch {}/{}): {}".format(
-                        row_number, abbrev_as, number, len(modes), as_scrape_error))
-                    if last:
-                        try:
-                            save_alphaspread_diagnostics(sb, row_number, abbrev_as, "AS scrape itself failed")
-                        except Exception as diagnostics_error:
-                            print("⚠️ AS diagnostics themselves failed: {}".format(diagnostics_error))
-                    continue
-                as_written = post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, as_html)
-                if not as_written:
-                    diagnostics_reason = "scrape succeeded but the webhook did not write"
-                elif ALPHASPREAD_WAIT_STATE.get("headline_appeared") is False:
-                    diagnostics_reason = "headline never appeared (page posted anyway)"
-                if diagnostics_reason:
-                    try:
-                        save_alphaspread_diagnostics(sb, row_number, abbrev_as, diagnostics_reason)
-                    except Exception as diagnostics_error:
-                        print("⚠️ AS diagnostics themselves failed: {}".format(diagnostics_error))
-                return True
-        except Exception as launch_error:
-            print("⚠️ AlphaSpread launch {}/{} could not run: {}".format(number, len(modes), launch_error))
-    return False
+            with open(trace_path) as trace_file:
+                trace.update(json.load(trace_file))
+        except Exception as trace_error:
+            print("⚠️ {}: child ended without a trace ({}); exit code {}".format(target, trace_error, process.returncode))
+            trace[target] = {"abbrev": abbrev, "status": "error", "attempts": [], "reason": "child_no_trace_rc{}".format(process.returncode)}
+
+    if single_recalc and any((trace.get(t) or {}).get("status") in ("ok", "not_written") for t in ("MS", "SW", "ASDCF")):
+        try:
+            _POST_FLAGS["recalcOnly"] = True
+            final_started = time.monotonic()
+            with_lock_posted = post_provider_json(webhook_url, "ASRP", row_number, as_abbrev, sheet_name, {})
+            trace["RECALC"] = {"abbrev": as_abbrev, "status": "ok" if with_lock_posted else "error", "attempts": [],
+                               "seconds": round(time.monotonic() - final_started), "reason": None if with_lock_posted else _LAST_POST.get("reason")}
+            print("🧮 v26: final single recalculation {} ({} s)".format("done" if with_lock_posted else "FAILED: {}".format(_LAST_POST.get("reason")),
+                                                                      round(time.monotonic() - final_started)))
+        except Exception as recalc_error:
+            print("❌ v26: final recalculation failed: {}".format(recalc_error))
+        finally:
+            _POST_FLAGS.pop("recalcOnly", None)
+
+    print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
+    print("🧹 Task complete!")
+
+
+SCRIPT_VERSION = "provider_json_scraper v62"   # bump on every change to this file
+
+
+def as_path(abbrev_as):
+    """v61: AlphaSpread URL path of an abbreviation: spaces become '-' (sto/atco a -> sto/atco-a); the original abbreviation stays unchanged for posting."""
+    return re.sub(r"\s+", "-", str(abbrev_as or "").strip().strip("/"))
+
+
+def module_versions():
+    """Version index of this script and the helper modules (each module has a VERSION constant); '?' when a module is missing."""
+    out = [SCRIPT_VERSION]
+    for name in ("as_dcf_extractor", "as_qm_data", "as_quality_metrics", "as_moat", "as_ttm_metrics"):
+        try:
+            mod = __import__(name)
+            out.append(str(getattr(mod, "VERSION", name + " ?")))
+        except Exception:
+            out.append(name + " MISSING")
+    return out
 
 
 def run_bot():
-    print("🤖 Booting up the row-refresh scraper (single-row mode)...")
-    print("📦 VERSIONS | insider_score_scraper {}".format(VERSION))
+    print("🤖 Booting up the provider-JSON scraper v26 (single-row mode)...")
+    print("📦 VERSIONS | " + " | ".join(module_versions()))
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
     sheet_name = os.environ["SHEET_NAME"]
 
-    # VERSION 5 FIX (REQUESTED DIRECTLY, REAL CONFIRMED GAP): abbrev_is
-    # is now ALSO read as an OPTIONAL environment variable (default '',
-    # mirroring abbrev_as's own v4 treatment exactly), rather than a
-    # required os.environ[...] lookup. Previously a row with a real,
-    # resolved AlphaSpread abbreviation but NO InsiderScreener coverage
-    # at all (a genuine, real possibility -- these are two independent
-    # providers with independent company coverage) could never trigger
-    # this workflow at all, since insider_score_scraper.yml's own
-    # abbrev_is input was required: true and this line would raise a
-    # KeyError the moment it was left blank. See
-    # insider_score_scraper.yml's own matching VERSION 5 entry for the
-    # input-declaration side of this same fix.
-    abbrev_is = os.environ.get("ABBREV_IS", "").strip()
+    if os.environ.get("SKIP_RECALC") == "1":
+        _POST_FLAGS["skipRecalc"] = True   # v26 (child process of a parallel run)
+    elif os.environ.get("ONLY_TARGET", "").strip().upper() == "SW":
+        _POST_FLAGS["skipTargets"] = ("SWP",)   # v29: SW-only follow-up run: one full recalculation (after SW), not two
 
-    # VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): abbrev_as is
-    # read as an OPTIONAL environment variable (default '', not a
-    # required os.environ[...] lookup) -- not every real trigger of this
-    # workflow will necessarily have a real, resolved abbrevAS available
-    # for that row yet (or a caller not yet updated to pass it at all),
-    # and this must never turn what used to be a working Insider Buying
-    # Score run into a hard failure just because the newer, optional AS
-    # piece was not supplied. See insider_score_scraper.yml's own
-    # matching VERSION 4 entry for this same input declared optional
-    # there too.
-    abbrev_as = os.environ.get("ABBREV_AS", "").strip()
+    run_started = time.monotonic()
+    run_started_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    trace = {}  # v7: per provider facts for the RUN_SUMMARY line
+
+    # Every provider's abbreviation is OPTIONAL (default ''), exactly like
+    # insider_score_scraper.py's abbrev_is / abbrev_as: a row may have any
+    # subset of them, and an empty one just skips that provider.
+    abbrev_sw = os.environ.get("ABBREV_SW", "").strip()
+    abbrev_as = os.environ.get("ABBREV_AS", "").strip()  # v5
+    abbrev_ms = os.environ.get("ABBREV_MS", "").strip()  # v11
+    abbrev_gf = os.environ.get("ABBREV_GF", "").strip()  # v14
 
     print(
-        "🎯 Sheet={} | Row={} | IS={} | AS={}".format(
-            sheet_name, row_number, abbrev_is or "(none)", abbrev_as or "(none)"
+        "🎯 Sheet={} | Row={} | SW={} | AS={} | MS={} | GF={}".format(
+            sheet_name, row_number, abbrev_sw or "(none)", abbrev_as or "(none)", abbrev_ms or "(none)", abbrev_gf or "(none)"
         )
     )
 
-    if not abbrev_is and not abbrev_as:
+    # (target key, abbreviation, scrape function). Add GF here later.
+    providers = [
+        ("SW", abbrev_sw, scrape_sw_data),
+        ("ASDCF", abbrev_as, scrape_as_dcf),
+        ("MS", abbrev_ms, scrape_ms_data),
+    ]
+    if GF_ENABLED:
+        providers.append(("GFP", abbrev_gf, scrape_gf_data))  # v14: trace/summary key GFP, webhook target GFP (v24: only when GF_ENABLED=1)
+    elif abbrev_gf:
+        print("⏩ GuruFocus is switched off (GF_ENABLED=0) -- ABBREV_GF ignored.")
+
+    only_target = os.environ.get("ONLY_TARGET", "").strip()
+    child_mode = bool(only_target)
+    if child_mode:
+        providers = [p for p in providers if p[0] == only_target]
+
+    if not any(abbrev for _, abbrev, _ in providers):
         print(
-            "⏩ Row {}: neither abbrev_is nor abbrev_as was provided --"
+            "⏩ Row {}: no provider abbreviation was provided --"
             " nothing to scrape this run.".format(row_number)
         )
+        print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
         return
 
-    # v15: the headless browser is only started when there is an InsiderScreener company to read (AlphaSpread has its own launches below)
-    with (SB(uc=True, headless=True) if abbrev_is else contextlib.nullcontext()) as sb:
-        # ------------------------------------------------------------------
-        # Insider Buying Score -- only attempted when a real abbrev_is was
-        # actually provided (VERSION 5: this check itself is new; the
-        # scrape/post call inside was already wrapped in its own
-        # try/except from v4, so a failure here still cannot block the AS
-        # scrape below).
-        # ------------------------------------------------------------------
-        if abbrev_is:
-            try:
-                html = scrape_company_html(sb, abbrev_is)
-                post_to_webhook(webhook_url, row_number, abbrev_is, sheet_name, html)
+    active = [p for p in providers if p[1]]
+    if PARALLEL_PROVIDERS and not child_mode and len(active) > 1:
+        run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_name, run_started, run_started_utc)
+        return
 
-            except Exception as scrape_error:
-                print(
-                    "❌ Row {} ({}): IS scrape itself failed: {}".format(
-                        row_number, abbrev_is, scrape_error
-                    )
-                )
-        else:
+    modes_text = os.environ.get("LAUNCH_MODES", DEFAULT_LAUNCH_MODES)
+    launch_modes = [
+        m.strip().lower() for m in modes_text.split(",") if m.strip()
+    ] or ["headless"]
+
+    for target, abbrev, scrape in providers:
+        if not abbrev:
             print(
-                "⏩ Row {}: no abbrev_is provided -- skipping Insider Buying"
-                " Score scrape this run.".format(row_number)
+                "⏩ Row {}: no abbreviation for {} -- skipping.".format(
+                    row_number, target
+                )
             )
+            trace[target] = {"abbrev": "", "status": "skipped", "attempts": []}
+            continue
 
-    # VERSION 15: AlphaSpread runs in its own browser launch(es), after the InsiderScreener part.
-    if abbrev_as:
-        run_alphaspread_launches(webhook_url, row_number, abbrev_as, sheet_name)
+        info = {"abbrev": abbrev, "status": "error", "attempts": []}
+        trace[target] = info
+        if target == "SW":
+            _SW_PAGES.clear()
+        if target == "ASDCF":
+            _AS_RATIOS.clear()
+            _AS_QUALITY.clear()
+            _AS_QM.clear()
+        provider_clock = time.monotonic()
 
+        # Each provider in its OWN try/except: one failing can never
+        # block another from still being attempted and posted.
+        try:
+            attempts = max(1, int(os.environ.get("CF_RETRY_ATTEMPTS", DEFAULT_CF_RETRY_ATTEMPTS)))
+        except ValueError:
+            attempts = DEFAULT_CF_RETRY_ATTEMPTS
+        if target == "SW":
+            attempts = min(attempts, int(os.environ.get("SW_MAX_ATTEMPTS", "3")))  # v25: blocks come in clusters per runner address
+        if target == "GFP":
+            attempts = min(attempts, GF_MAX_ATTEMPTS)  # v15: GuruFocus blocks are rarely cleared by retrying
+
+        provider_started = time.monotonic()
+
+        for attempt in range(1, attempts + 1):
+            if attempt > 1:
+                pause = random.uniform(CF_RETRY_WAIT_MIN_SECONDS, CF_RETRY_WAIT_MAX_SECONDS)
+                if target == "ASDCF":
+                    pause = random.uniform(15, 30)   # v62: was 30-60 (v46); a fresh browser launch is what helps, not a long pause
+                print("🔁 {}: blocked by Cloudflare in every mode -- retry {}/{} after {:.0f}s".format(
+                    target, attempt, attempts, pause))
+                time.sleep(pause)
+
+            finished = False  # True = succeeded or failed for a non-Cloudflare reason: no retry
+
+            for mode in launch_modes:
+                headless = mode != "headed"
+                browser_ready = False
+                print("🚀 {}: launching {} browser{}".format(
+                    target, mode, "" if attempt == 1 else " (attempt {})".format(attempt)))
+                launch_clock = time.monotonic()
+                _LAST_POST.clear()
+                step_begin(target, attempt, mode)
+
+                try:
+                    use_cdp = (target == "SW" and SW_ENGINE == "cdp")  # v42
+                    swallowed_error = []  # v44: the SB context manager can swallow an exception raised inside "with" (then "posted" was never set)
+                    posted = None
+                    with (SB(uc=True, test=True, locale="en") if use_cdp else SB(uc=True, headless=headless)) as sb:
+                        try:
+                            browser_ready = True
+                            data = scrape(CdpSB(sb) if use_cdp else sb, abbrev, row_number, headless)
+                            posted = post_provider_json(
+                                webhook_url, target, row_number, abbrev, sheet_name, data
+                            )
+                            step("post_to_sheet", "OK" if posted else "FAIL",
+                                 chars=_LAST_POST.get("chars"), column=_LAST_POST.get("column"),
+                                 reason=_LAST_POST.get("reason"))
+                            if target == "SW":
+                                post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                            elif target == "ASDCF":
+                                post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                                post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                                post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        except BaseException as inner_error:
+                            swallowed_error.append(inner_error)
+                            raise
+                    if swallowed_error and posted is None:
+                        raise swallowed_error[0]
+                    if target == "ASDCF":
+                        qm_completion_passes(webhook_url, row_number, abbrev, sheet_name, info, headless)   # v54
+                    info["attempts"].append({"n": attempt, "mode": mode, "result": "ok" if posted else "scraped_not_written",
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "ok" if posted else "not_written"
+                    for key in ("chars", "column", "reason"):
+                        if _LAST_POST.get(key) is not None:
+                            info[key] = _LAST_POST.get(key)
+                    finished = True
+                    break
+
+                except CloudflareBlocked as blocked:
+                    print(
+                        "🛑 Row {} ({}): {} blocked in {} mode: {}".format(
+                            row_number, abbrev, target, mode, blocked
+                        )
+                    )
+                    info["attempts"].append({"n": attempt, "mode": mode, "result": "blocked",
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "blocked"
+                    if target == "SW":
+                        post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    elif target == "ASDCF":
+                        post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    continue
+
+                except Exception as scrape_error:
+                    print(
+                        "❌ Row {} ({}): {} scrape itself failed ({} mode): {}".format(
+                            row_number, abbrev, target, mode, scrape_error
+                        )
+                    )
+                    info["attempts"].append({"n": attempt, "mode": mode,
+                                             "result": "error:" + str(scrape_error).replace("\n", " ")[:80],
+                                             "step": _STEP_CTX["last"], "sec": round(time.monotonic() - launch_clock)})
+                    info["status"] = "error"
+                    if target == "SW":
+                        post_sw_pages_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    elif target == "ASDCF":
+                        post_as_ratios_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_quality_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                        post_as_qm_if_any(webhook_url, row_number, abbrev, sheet_name, info)
+                    if not browser_ready:
+                        # The browser itself could not start (e.g. no display
+                        # for headed mode) -- try the next mode.
+                        continue
+                    finished = True
+                    break
+
+            if finished:
+                break
+
+            if time.monotonic() - provider_started >= (CF_RETRY_BUDGET_SECONDS * 2 if target == "ASDCF" else CF_RETRY_BUDGET_SECONDS):
+                print("⏹️ {}: retry time budget ({}s) used up -- giving up on this provider.".format(
+                    target, CF_RETRY_BUDGET_SECONDS))
+                break
+
+        info["seconds"] = round(time.monotonic() - provider_clock)
+
+    if child_mode and os.environ.get("TRACE_OUT"):
+        with open(os.environ["TRACE_OUT"], "w") as trace_file:
+            json.dump(trace, trace_file)
+        return
+    print_run_summary(trace, sheet_name, row_number, run_started, run_started_utc)
     print("🧹 Task complete!")
 
 
