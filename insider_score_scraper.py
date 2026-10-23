@@ -16,6 +16,17 @@ Google Apps Script webhook (fn_90_01_InsiderScoreWebhook_StockData_60),
 which scores it using that project's own already-built, already-verified
 "Insider Buying Score" logic.
 
+VERSION 15 (2026-10-23): AlphaSpread (AS Price + AS Hist) is blocked by Cloudflare on about two thirds of the rows
+(real logs 22-23 Oct: 57 of 88 rows failed, each failure burned ~5 minutes of waiting in the SAME blocked browser session).
+Changes, AlphaSpread part only (the InsiderScreener part is unchanged):
+  * AlphaSpread gets its own browser launch, HEADED (virtual display) by default: in provider_json_scraper headless was blocked
+    7 of 7 times and headed passed far more often. Env AS_LAUNCH_MODES (default "headed,headed,headless") = one fresh browser
+    launch per entry; a new launch is a new browser fingerprint, which works better than waiting in a blocked session.
+  * Inside one launch: the page is opened with uc_open_with_reconnect (v14 used a plain open on the first try), then on the
+    Cloudflare page one uc_gui_click_captcha() click and two short re-checks (about 25 s) instead of 4 tries with 20/40/60/80 s sleeps.
+  * Diagnostics (screenshot/HTML) are saved only on the last launch.
+  * The run prints a version line: "📦 VERSIONS | insider_score_scraper v15".
+
 VERSION 14 (2026-10-19): scrape_alphaspread_html retries (up to 4 tries) when
 AlphaSpread answers with its Cloudflare page ("Just a moment", ~29 KB) instead of
 the real summary, and raises instead of posting that page (AS Price was MISSING
@@ -377,6 +388,7 @@ v1 -- First version -- read every configured company's own abbrevIS from
 ============================================================================
 """
 
+import contextlib
 import json
 import os
 import re
@@ -741,20 +753,17 @@ def scrape_alphaspread_html(sb, abbrev_as):
     # time) and re-open with uc_open_with_reconnect. If every try is blocked this
     # raises, so nothing is posted and the old cell stays (run_bot logs the error
     # and saves diagnostics).
+    # VERSION 15: one launch = one short attempt (see the v15 note at the top of the file).
     last_problem = "unknown"
     page_ok = False
-    for attempt in range(1, 5):
-        print("🌐 Navigating to: {} (try {} of 4)".format(target_url, attempt))
-        try:
-            if attempt == 1:
-                sb.open(target_url)
-            else:
-                sb.uc_open_with_reconnect(target_url, reconnect_time=6)
-            sb.sleep(2)
-        except Exception as open_error:
-            last_problem = "open failed: {}".format(open_error)
-            sb.sleep(15 * attempt)
-            continue
+    print("🌐 Navigating to: {} (launch attempt)".format(target_url))
+    try:
+        sb.uc_open_with_reconnect(target_url, reconnect_time=6)
+        sb.sleep(2)
+    except Exception as open_error:
+        raise RuntimeError("AlphaSpread open failed: {}".format(open_error))
+
+    def _as_page_state():
         try:
             page_title = (sb.get_title() or "").lower()
         except Exception:
@@ -763,15 +772,28 @@ def scrape_alphaspread_html(sb, abbrev_as):
             page_length = len(sb.get_page_source() or "")
         except Exception:
             page_length = 0
-        if "just a moment" in page_title or page_length < 100000:
-            last_problem = "Cloudflare/short page (title={!r}, {} chars)".format(page_title[:30], page_length)
-            print("⚠️ AlphaSpread did not give the real summary ({}) -- waiting {} s".format(last_problem, 20 * attempt))
-            sb.sleep(20 * attempt)
-            continue
-        page_ok = True
-        break
-    if not page_ok:
-        raise RuntimeError("AlphaSpread summary not usable after 4 tries: {}".format(last_problem))
+        blocked = ("just a moment" in page_title) or page_length < 100000
+        return blocked, page_title, page_length
+
+    blocked, page_title, page_length = _as_page_state()
+    if blocked:
+        print("⚠️ AlphaSpread shows the Cloudflare page (title={!r}, {} chars) -- one verification click, then two short re-checks".format(page_title[:30], page_length))
+        try:
+            sb.sleep(6)
+            sb.uc_gui_click_captcha()
+            print("🖱️ Tried uc_gui_click_captcha()")
+        except Exception as click_error:
+            print("⚠️ uc_gui_click_captcha failed: {}".format(click_error))
+        for wait_seconds in (8, 10):
+            sb.sleep(wait_seconds)
+            blocked, page_title, page_length = _as_page_state()
+            if not blocked:
+                print("✅ Cloudflare cleared after the click")
+                break
+    if blocked:
+        last_problem = "Cloudflare/short page (title={!r}, {} chars)".format(page_title[:30], page_length)
+        raise RuntimeError("AlphaSpread summary not usable in this launch: {}".format(last_problem))
+    page_ok = True
 
     print(
         "⏳ Waiting up to {}s for the real valuation-history element"
@@ -1276,8 +1298,51 @@ def post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, 
     return False
 
 
+VERSION = "v15"
+AS_LAUNCH_MODES = [m.strip().lower() for m in os.environ.get("AS_LAUNCH_MODES", "headed,headed,headless").split(",") if m.strip()]
+
+
+def run_alphaspread_launches(webhook_url, row_number, abbrev_as, sheet_name):
+    """VERSION 15: AS Price + AS Hist. One fresh browser launch per entry of AS_LAUNCH_MODES; stops at the first launch that
+    gets the real summary page and posts it. Diagnostics are saved only when the last launch also fails."""
+    modes = AS_LAUNCH_MODES or ["headed"]
+    for number, mode in enumerate(modes, 1):
+        headless = (mode == "headless")
+        last = (number == len(modes))
+        print("🚀 AlphaSpread launch {}/{} ({})".format(number, len(modes), "headless" if headless else "headed"))
+        try:
+            with SB(uc=True, headless=headless) as sb:
+                diagnostics_reason = None
+                try:
+                    as_html = scrape_alphaspread_html(sb, abbrev_as)
+                except Exception as as_scrape_error:
+                    print("❌ Row {} ({}): AS scrape itself failed (launch {}/{}): {}".format(
+                        row_number, abbrev_as, number, len(modes), as_scrape_error))
+                    if last:
+                        try:
+                            save_alphaspread_diagnostics(sb, row_number, abbrev_as, "AS scrape itself failed")
+                        except Exception as diagnostics_error:
+                            print("⚠️ AS diagnostics themselves failed: {}".format(diagnostics_error))
+                    continue
+                as_written = post_alphaspread_to_webhook(webhook_url, row_number, abbrev_as, sheet_name, as_html)
+                if not as_written:
+                    diagnostics_reason = "scrape succeeded but the webhook did not write"
+                elif ALPHASPREAD_WAIT_STATE.get("headline_appeared") is False:
+                    diagnostics_reason = "headline never appeared (page posted anyway)"
+                if diagnostics_reason:
+                    try:
+                        save_alphaspread_diagnostics(sb, row_number, abbrev_as, diagnostics_reason)
+                    except Exception as diagnostics_error:
+                        print("⚠️ AS diagnostics themselves failed: {}".format(diagnostics_error))
+                return True
+        except Exception as launch_error:
+            print("⚠️ AlphaSpread launch {}/{} could not run: {}".format(number, len(modes), launch_error))
+    return False
+
+
 def run_bot():
     print("🤖 Booting up the row-refresh scraper (single-row mode)...")
+    print("📦 VERSIONS | insider_score_scraper {}".format(VERSION))
 
     webhook_url = os.environ["GAS_WEBHOOK_URL"]
     row_number = int(os.environ["ROW_NUMBER"])
@@ -1322,7 +1387,8 @@ def run_bot():
         )
         return
 
-    with SB(uc=True, headless=True) as sb:
+    # v15: the headless browser is only started when there is an InsiderScreener company to read (AlphaSpread has its own launches below)
+    with (SB(uc=True, headless=True) if abbrev_is else contextlib.nullcontext()) as sb:
         # ------------------------------------------------------------------
         # Insider Buying Score -- only attempted when a real abbrev_is was
         # actually provided (VERSION 5: this check itself is new; the
@@ -1347,59 +1413,9 @@ def run_bot():
                 " Score scrape this run.".format(row_number)
             )
 
-        # ------------------------------------------------------------------
-        # VERSION 4 ADDITION (REQUESTED DIRECTLY, NEW WORK): AlphaSpread
-        # "valuation history" scrape, reusing this SAME already-running
-        # browser session -- only attempted when a real abbrev_as was
-        # actually provided. A separate, independent try/except, so an
-        # IS-side failure above (or an AS-side failure here) can never
-        # block the other from still being attempted and posted.
-        #
-        # VERSION 6: on failure, also records real page diagnostics (see
-        # save_alphaspread_diagnostics) before moving on. That call is
-        # itself fully guarded, so it can never turn an AS failure into
-        # a bigger one.
-        # ------------------------------------------------------------------
-        if abbrev_as:
-            diagnostics_reason = None
-
-            try:
-                as_html = scrape_alphaspread_html(sb, abbrev_as)
-                as_written = post_alphaspread_to_webhook(
-                    webhook_url, row_number, abbrev_as, sheet_name, as_html
-                )
-
-                if not as_written:
-                    diagnostics_reason = (
-                        "scrape succeeded but the webhook did not write"
-                    )
-                elif ALPHASPREAD_WAIT_STATE.get("headline_appeared") is False:
-                    diagnostics_reason = (
-                        "headline never appeared (page posted anyway)"
-                    )
-
-            except Exception as as_scrape_error:
-                print(
-                    "❌ Row {} ({}): AS scrape itself failed: {}".format(
-                        row_number, abbrev_as, as_scrape_error
-                    )
-                )
-                diagnostics_reason = "AS scrape itself failed"
-
-            # VERSION 7: diagnostics are now saved for BOTH situations --
-            # a scrape that threw (v6) and a scrape that worked but whose
-            # value the webhook did not write (e.g. VALUE_NULL).
-            if diagnostics_reason:
-                try:
-                    save_alphaspread_diagnostics(
-                        sb, row_number, abbrev_as, diagnostics_reason
-                    )
-                except Exception as diagnostics_error:
-                    print(
-                        "⚠️ AS diagnostics themselves failed: {}".format(
-                            diagnostics_error
-                        )
-                    )
+    # VERSION 15: AlphaSpread runs in its own browser launch(es), after the InsiderScreener part.
+    if abbrev_as:
+        run_alphaspread_launches(webhook_url, row_number, abbrev_as, sheet_name)
 
     print("🧹 Task complete!")
 
