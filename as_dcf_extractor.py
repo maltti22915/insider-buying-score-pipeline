@@ -51,7 +51,10 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v6
+VERSION: as_dcf_extractor v7
+v7 -- 2026-10-23: a failed attempt cost ~157 s on average (34 failed attempts = 89 min in one 24 h log): _pass_cloudflare 3 rounds x 25 s, then another 45 s wait for 'View Calculation'
+   on a page that was still the Cloudflare page. Now _pass_cloudflare = 2 rounds x 15 s (about 45 s) and, when the page is STILL the Cloudflare page, AsDcfCloudflare is raised at once
+   (no 45 s wait) so run_bot can relaunch with a fresh browser.
 v5 -- 2026-10-20: Cloudflare page handling. In the SAP runs of 2026-10-20 all 5 attempts stayed on the "Performing security verification ... Verification
    successful. Waiting for www.alphaspread.com to respond" page for the whole 15 s wait and were reported as VIEW_CALCULATION_NOT_FOUND. Now, right after the page is
    opened, _pass_cloudflare() waits for the page to clear (up to 25 s), tries the verification click, and re-opens the URL (up to 3 rounds) before the normal waits start.
@@ -134,7 +137,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v6"
+VERSION = "as_dcf_extractor v7"
 PROBE_AFTER_SECONDS = 15
 MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
@@ -146,6 +149,10 @@ class AsDcfError(Exception):
 
 
 class AsDcfLoginRequired(AsDcfError):
+    pass
+
+
+class AsDcfCloudflare(AsDcfError):
     pass
 
 
@@ -754,7 +761,7 @@ def _is_cloudflare(sb):
         return False
 
 
-def _pass_cloudflare(sb, url, rounds=3, wait_seconds=25):
+def _pass_cloudflare(sb, url, rounds=2, wait_seconds=15):
     """v5: returns True when the page is NOT the Cloudflare page any more. Each round: wait up to wait_seconds for the page to clear by itself, then try the
     verification click, then re-open the URL. Never raises."""
     for round_no in range(1, rounds + 1):
@@ -803,7 +810,8 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
 
     # 0a. (v5) a Cloudflare page instead of the DCF page: give it time / retry before the normal waits start
     if _is_cloudflare(sb):
-        _pass_cloudflare(sb, url)
+        if not _pass_cloudflare(sb, url):
+            raise AsDcfCloudflare("CLOUDFLARE_PAGE: the DCF page is still the Cloudflare page after the wait and the verification click")
 
     # 0. (v3) make sure browser scripts really run before waiting for anything
     _check_js_channel(sb)
