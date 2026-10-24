@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v70: the widget fallback (current buyback yield when the table row is locked) waits for the lazy render: up to 3 reads with scroll / wait / reload, and the FAIL line logs diag= with the page text around 'Buyback' (v69 read it once, without waiting, and failed for ORCL).
   v69: FIX v68 read the NEXT company's row when the stock's own cells were hidden (BILI got Alphabet's -1.04/1.88/2.05/1.2): the four cells must now follow the ticker directly, 'Unlock' = missing; ORCL's own row is 'Unlock' for visitors, so the current yield is then taken from the 'Buyback Yield -6.44%' widget (investor-returns/i/buybacks), 3Y / 5Y / 10Y stay missing (Shr chg = now alone, Shr \u0394 '-').
   v68: Buybacks table: NO first-row fallback (v67 read a peer row for ORCL: now -1.04 instead of -6.44); the stock's row is found by ticker only, values are the first 4 value tokens after the ticker; when the row is not found the step logs diag= (table text) so the layout can be checked.
   v67: SHARE COUNT spec 2026-10-24: buyback read ONLY from the Buybacks table of .../dividends#buybacks (columns Company | Buyback Yield | Average Yield 3Y | 5Y | 10Y), row of the stock by ticker (first row if the ticker is not found); values now / y3 / y5 / y10, a dash cell = missing, a real 0.00% is a number; the summary widget and dividend block are not read any more; posted as bb {cur, y3, y5, y10, avg5=y5}.
@@ -1739,16 +1740,33 @@ def fetch_as_buyback(sb, abbrev_as):
                 pass
         if not _bb_ready(values) or (values.get("now") is not None and all(values.get(k) is None for k in ("y3", "y5", "y10"))) or values.get("locked"):
             # v69: the table row is hidden ("Unlock") or has only the current yield -> the current yield from the widget page (3Y / 5Y / 10Y stay missing)
+            wdiag = ""
             try:
                 wurl = "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))
                 _as_open_cf(sb, wurl, 5)
-                widget = _as_extract_buyback_widget(_as_strip_text(sb.get_page_source()))
+                widget = {}
+                for wtry in range(3):   # v70: the widget renders lazily, like the table: wait / scroll / re-read (the last try reloads the page)
+                    wtext = _as_strip_text(sb.get_page_source())
+                    widget = _as_extract_buyback_widget(wtext)
+                    if widget.get("now") is not None:
+                        break
+                    at = wtext.find("Buyback")
+                    wdiag = ("widget not found | " + wtext[max(0, at - 60):at + 300]) if at >= 0 else ("no 'Buyback' text, page length " + str(len(wtext)))
+                    try:
+                        if wtry == 2:
+                            sb.uc_open_with_reconnect(wurl, 5)
+                        sb.execute_script("window.scrollTo(0,document.body.scrollHeight/3);")
+                        sb.sleep(4 + 3 * wtry)
+                    except Exception:
+                        pass
                 if widget.get("now") is not None and not _bb_ready(values):
                     values = dict(widget, diag=(values or {}).get("diag", ""))
                 elif widget.get("now") is not None and values.get("now") is not None and abs(widget["now"] - values["now"]) > 0.05:
                     step("buyback", "INFO", note="table now differs from widget", table=values.get("now"), widget=widget["now"])
             except Exception:
                 pass
+            if not _bb_ready(values) and wdiag:
+                values = dict(values or {}, diag=((values or {}).get("diag", "") + " || " + wdiag))
         if _bb_ready(values):
             _AS_RATIOS["buyback"] = values
             step("buyback", "OK", ticker=ticker, **{k: v for k, v in values.items() if k != "diag"})
@@ -3058,7 +3076,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v69"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v70"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
