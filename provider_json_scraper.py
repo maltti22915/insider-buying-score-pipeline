@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v69: FIX v68 read the NEXT company's row when the stock's own cells were hidden (BILI got Alphabet's -1.04/1.88/2.05/1.2): the four cells must now follow the ticker directly, 'Unlock' = missing; ORCL's own row is 'Unlock' for visitors, so the current yield is then taken from the 'Buyback Yield -6.44%' widget (investor-returns/i/buybacks), 3Y / 5Y / 10Y stay missing (Shr chg = now alone, Shr \u0394 '-').
   v68: Buybacks table: NO first-row fallback (v67 read a peer row for ORCL: now -1.04 instead of -6.44); the stock's row is found by ticker only, values are the first 4 value tokens after the ticker; when the row is not found the step logs diag= (table text) so the layout can be checked.
   v67: SHARE COUNT spec 2026-10-24: buyback read ONLY from the Buybacks table of .../dividends#buybacks (columns Company | Buyback Yield | Average Yield 3Y | 5Y | 10Y), row of the stock by ticker (first row if the ticker is not found); values now / y3 / y5 / y10, a dash cell = missing, a real 0.00% is a number; the summary widget and dividend block are not read any more; posted as bb {cur, y3, y5, y10, avg5=y5}.
   v66: PARTIAL Quality Model refresh (env QM_ONLY = workflow input qm_only, e.g. 'Shr chg' or 'ROIC,Moat'): the stage groups statement pages / analyst estimates / buyback run only when one of their inputs is missing; a buyback-only run opens no extra page; the payload is posted with partial=True and the sheet keeps all stored values it does not carry (fn_91_11 v7).
@@ -1662,29 +1663,36 @@ def _bb_cell(token):
 
 
 def _as_extract_buyback(text, ticker=None):
-    """v68: reads ONLY the table under the heading "Buybacks" (columns Company | Buyback Yield | Average Yield (3Y) | (5Y) | (10Y)) and takes the
-    row of the stock itself, found by its ticker (any text may sit between the ticker and the four values). NO first-row fallback any more
-    (v67 took a peer row for ORCL): when the ticker is not found nothing is returned and the table text is handed back as "diag" for the log.
-    Returns {now, y3, y5, y10, match, src} (None for a missing cell) or {"diag": "..."}."""
+    """v69: reads ONLY the Buybacks table (Company | Buyback Yield | Average Yield (3Y) | (5Y) | (10Y)). The row of the stock is found by its ticker and
+    its FOUR cells must follow the ticker directly (a cell is a value, a dash, or "Unlock" = hidden for visitors without a subscription). v68 took the
+    next four value tokens wherever they were and so read the NEXT company's row when the stock's own cells were "Unlock" (BILI got Alphabet's numbers).
+    Returns {now, y3, y5, y10, match, src} (None = missing or locked cell) or {"diag": ..., "locked": True/False}."""
     head = re.search(r"Buyback Yield\s+Average Yield\s*\(3Y\)\s+Average Yield\s*\(5Y\)\s+Average Yield\s*\(10Y\)", text, re.I)
     if not head:
         at = text.find("Buyback")
-        return {"diag": "no table header | " + (text[max(0, at - 80):at + 400] if at >= 0 else "no 'Buyback' text on the page")}
-    scope = text[head.end():head.end() + 1500]
+        return {"diag": "no table header | " + (text[max(0, at - 80):at + 400] if at >= 0 else "no 'Buyback' text on the page"), "locked": False}
+    scope = text[head.end():head.end() + 2500]
     stop = re.search(r"Dividend\s+(?:Yield|History|Payout|Growth)", scope, re.I)
     if stop:
         scope = scope[:stop.start()]
+    cell = r"(" + _BB_VAL + r"|Unlock)"
     found = None
     if ticker:
-        for hit in re.finditer(r"(?<![A-Za-z0-9.])" + re.escape(ticker) + r"(?![A-Za-z0-9])", scope, re.I):
-            tokens = re.findall(_BB_VAL, scope[hit.end():hit.end() + 220])
-            if len(tokens) >= 4:
-                found = tokens[:4]
-                break
+        found = re.search(r"(?<![A-Za-z0-9.])" + re.escape(ticker) + r"(?![A-Za-z0-9])\s+" + cell + r"\s+" + cell + r"\s+" + cell + r"\s+" + cell, scope, re.I)
     if not found:
-        return {"diag": "ticker " + str(ticker) + " not found | " + scope[:500]}
-    vals = [_bb_cell(t) for t in found]
+        return {"diag": "ticker " + str(ticker) + " not found | " + scope[:400], "locked": False}
+    vals = [None if g.lower() == "unlock" else _bb_cell(g) for g in found.groups()]
+    if all(v is None for v in vals):
+        return {"diag": "row of " + str(ticker) + " is locked (Unlock) or empty", "locked": True}
     return {"now": vals[0], "y3": vals[1], "y5": vals[2], "y10": vals[3], "match": "ticker", "src": "table"}
+
+
+def _as_extract_buyback_widget(text):
+    """v69: only the CURRENT buyback yield from the 'Buyback Yield -6.44%' widget (the table row is locked for visitors); 3Y / 5Y / 10Y stay missing."""
+    found = re.search(r"Buyback Yield\s*:?\s*([-\u2212]?\s*\d[\d.,]*)\s*%", text)
+    if not found:
+        return {}
+    return {"now": _as_num(found.group(1).replace("\u2212", "-").replace(" ", "")), "y3": None, "y5": None, "y10": None, "match": "widget", "src": "summary"}
 
 
 def _bb_ready(values):
@@ -1716,7 +1724,7 @@ def fetch_as_buyback(sb, abbrev_as):
         values = _as_extract_buyback(_as_strip_text(source), ticker)
         # the table renders lazily - up to 3 extra tries (scroll to the Buybacks table, wait, re-read; the last try reloads the page)
         for attempt in range(3):
-            if _bb_ready(values):
+            if _bb_ready(values) or values.get("locked"):   # v69: a locked row will not unlock by waiting
                 break
             try:
                 if attempt == 2:
@@ -1729,9 +1737,21 @@ def fetch_as_buyback(sb, abbrev_as):
                 values = _as_extract_buyback(_as_strip_text(sb.get_page_source()), ticker)
             except Exception:
                 pass
+        if not _bb_ready(values) or (values.get("now") is not None and all(values.get(k) is None for k in ("y3", "y5", "y10"))) or values.get("locked"):
+            # v69: the table row is hidden ("Unlock") or has only the current yield -> the current yield from the widget page (3Y / 5Y / 10Y stay missing)
+            try:
+                wurl = "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))
+                _as_open_cf(sb, wurl, 5)
+                widget = _as_extract_buyback_widget(_as_strip_text(sb.get_page_source()))
+                if widget.get("now") is not None and not _bb_ready(values):
+                    values = dict(widget, diag=(values or {}).get("diag", ""))
+                elif widget.get("now") is not None and values.get("now") is not None and abs(widget["now"] - values["now"]) > 0.05:
+                    step("buyback", "INFO", note="table now differs from widget", table=values.get("now"), widget=widget["now"])
+            except Exception:
+                pass
         if _bb_ready(values):
             _AS_RATIOS["buyback"] = values
-            step("buyback", "OK", ticker=ticker, **values)
+            step("buyback", "OK", ticker=ticker, **{k: v for k, v in values.items() if k != "diag"})
         else:
             step("buyback", "FAIL", reason="no Buybacks table row for the ticker (or no current yield) on the page", ticker=ticker, diag=(values or {}).get("diag", ""))
     except Exception as buyback_error:
@@ -3038,7 +3058,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v68"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v69"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
