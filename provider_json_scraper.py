@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v72: FIX of v61: AlphaSpread URL path of an abbreviation with a space uses %20 (sto/lifco%20b), not '-' (sto/lifco-b and sto/atco-a give 404 pages in the logs); as_dcf_extractor v8 does the same. The abbreviation search (Column D) was right all along.
   v71: an abbrevAS written with %20 (sto/lifco%20b) is used as it is in every AlphaSpread URL (no space to replace) and the Buybacks ticker is decoded (LIFCO B).
   v70: the widget fallback (current buyback yield when the table row is locked) waits for the lazy render: up to 3 reads with scroll / wait / reload, and the FAIL line logs diag= with the page text around 'Buyback' (v69 read it once, without waiting, and failed for ORCL).
   v69: FIX v68 read the NEXT company's row when the stock's own cells were hidden (BILI got Alphabet's -1.04/1.88/2.05/1.2): the four cells must now follow the ticker directly, 'Unlock' = missing; ORCL's own row is 'Unlock' for visitors, so the current yield is then taken from the 'Buyback Yield -6.44%' widget (investor-returns/i/buybacks), 3Y / 5Y / 10Y stay missing (Shr chg = now alone, Shr \u0394 '-').
@@ -3078,12 +3079,13 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v71"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v72"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
-    """v61: AlphaSpread URL path of an abbreviation: spaces become '-' (sto/atco a -> sto/atco-a); the original abbreviation stays unchanged for posting."""
-    return re.sub(r"\s+", "-", str(abbrev_as or "").strip().strip("/"))
+    """v72: AlphaSpread URL path of an abbreviation: a space becomes %20, exactly as AlphaSpread writes it (sto/lifco b -> sto/lifco%20b, sto/lagr b -> sto/lagr%20b);
+    the v61 hyphen form (lifco-b, atco-a) gives a 404. The original abbreviation stays unchanged for posting. An abbreviation already written with %20 passes unchanged."""
+    return re.sub(r"\s+", "%20", str(abbrev_as or "").strip().strip("/"))
 
 
 def module_versions():
