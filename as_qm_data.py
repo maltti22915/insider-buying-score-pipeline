@@ -5,12 +5,12 @@ TTM block are already read by provider_json_scraper.py (fetch_as_quality / fetch
 
 QM payload ("qm", posted as target ASQM, stored in the "QM JSON" cell):
   {v:1, fetched, prof:{roic|opm|fcfm|gm|nm|roe: {now, avg3, prev}}, est:{rev3, rev3_n, rev_cagr_fwd, opi3, opi3_n, opi_cagr_fwd, rev_lt, rev_lt_years},
-   bb:{cur, avg5}, solv:{bankr, net_cash, net_debt_text}, moat, ttm:{rev_growth, rev_accel, nd_ebitda, nd_ebitda_prev, int_cover, sbc_pct_rev}, flags:[..]}
+   bb:{cur, y3, y5, y10, avg5}, solv:{bankr, net_cash, net_debt_text}, moat, ttm:{rev_growth, rev_accel, nd_ebitda, nd_ebitda_prev, int_cover, sbc_pct_rev}, flags:[..]}
 """
 import re
 from datetime import datetime, timezone
 
-VERSION = "as_qm_data v1.16"   # v1.16 ttm capex_prev, ocf_prev, ocfm_now/prev/3y (CAPEX_SURGE); widget value 0 = missing | v1.15 est.earn_lt / earn_lt_years / earn_lt_basis (Operating Income, fallback Net Income) and ttm.earn_g / earn_g_nm | v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
+VERSION = "as_qm_data v1.17"   # v1.17 bb {cur, y3, y5, y10, avg5=y5} from the Buybacks table | v1.16 ttm capex_prev, ocf_prev, ocfm_now/prev/3y (CAPEX_SURGE); widget value 0 = missing | v1.15 est.earn_lt / earn_lt_years / earn_lt_basis (Operating Income, fallback Net Income) and ttm.earn_g / earn_g_nm | v1.14 Net Income long-term CAGR (analyst-estimates page, fallback Operating Income) and 10Y price change (summary page period button) for the COMPOUNDER gates / PRICE_LAGS_BUSINESS | v1.13 AlphaSpread insider block removed (insider data comes only from InsiderScreener) | v1.12 insider parser tries every "Insider" occurrence, debug dumps windows around Bought/Sold/12 months words | v1.11 v1.11 insider trading block (bought / sold USD, 0-12 months) read on the summary visit; Chinese unit mapping |  v1.10 widget values only from the widget text itself | v1.9 qm_missing (completion pass), solvency debug text 500 chars | v1.8 margins computed + na list | v1.7 ROIC computed from the statements when the page has none | v1.6 ROIC debug text | v1.5 card layout of the profitability page (parse_profitability_cards) | v1.4 qm_prof diagnostics | v1.3 solvency retry | v1.2 read_wall_st shared with the summary visit | v1.1 Wall St widget | v1.0 first
 
 PROFILE_METRICS = {   # key -> label as printed on the profitability checklist
     "gm": "Gross Margin", "opm": "Operating Margin", "nm": "Net Margin", "fcfm": "Free Cash Flow Margin", "roe": "ROE", "roic": "ROIC",
@@ -480,7 +480,7 @@ def fetch_as_qm(sb, abbrev_as, step, open_page, prof_html=None, buyback=None, mo
     if (wall or {}).get("px10") is not None:
         qm["px10"] = wall.get("px10")
     if buyback:
-        qm["bb"] = {"cur": buyback.get("current"), "avg5": buyback.get("avg")}
+        qm["bb"] = {"cur": buyback.get("now"), "y3": buyback.get("y3"), "y5": buyback.get("y5"), "y10": buyback.get("y10"), "avg5": buyback.get("y5")}
     if moat:
         qm["moat"] = moat.get("rating")
     if now_block:
