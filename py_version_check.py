@@ -28,14 +28,14 @@ import os
 import re
 import sys
 
-VERSION = "py_version_check v2"
+VERSION = "py_version_check v3"
 
 # file -> expected version (a number such as 66 or 1.16)
 EXPECTED = {
-    "provider_json_scraper.py": "66",
+    "provider_json_scraper.py": "67",
     "insider_score_scraper.py": "15",
     "as_dcf_extractor.py": "7",
-    "as_qm_data.py": "1.16",
+    "as_qm_data.py": "1.17",
     "as_quality_metrics.py": "6",
     "as_moat.py": "1.3",
     "as_ttm_metrics.py": "1.7",
