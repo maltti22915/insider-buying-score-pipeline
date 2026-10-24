@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v68: Buybacks table: NO first-row fallback (v67 read a peer row for ORCL: now -1.04 instead of -6.44); the stock's row is found by ticker only, values are the first 4 value tokens after the ticker; when the row is not found the step logs diag= (table text) so the layout can be checked.
   v67: SHARE COUNT spec 2026-10-24: buyback read ONLY from the Buybacks table of .../dividends#buybacks (columns Company | Buyback Yield | Average Yield 3Y | 5Y | 10Y), row of the stock by ticker (first row if the ticker is not found); values now / y3 / y5 / y10, a dash cell = missing, a real 0.00% is a number; the summary widget and dividend block are not read any more; posted as bb {cur, y3, y5, y10, avg5=y5}.
   v66: PARTIAL Quality Model refresh (env QM_ONLY = workflow input qm_only, e.g. 'Shr chg' or 'ROIC,Moat'): the stage groups statement pages / analyst estimates / buyback run only when one of their inputs is missing; a buyback-only run opens no extra page; the payload is posted with partial=True and the sheet keeps all stored values it does not carry (fn_91_11 v7).
   v65: buyback also readable from the summary-page 'Investor Returns' widget ('Buyback Yield -6.44%', next to 'Dividend Yield 1.62%' which v62 had taken as the buyback for ORCL); no 5Y average there (avg5 stays empty).
@@ -1661,28 +1662,29 @@ def _bb_cell(token):
 
 
 def _as_extract_buyback(text, ticker=None):
-    """v67: reads ONLY the table under the heading "Buybacks" (columns Company | Buyback Yield | Average Yield (3Y) | (5Y) | (10Y)) and takes the
-    row of the stock itself (the ticker shown under the company name; the first table row when the ticker is not found). The dividend-yield
-    block of the same page is never read. Returns {now, y3, y5, y10, match, src} (None for a missing cell) or {} when there is no table."""
+    """v68: reads ONLY the table under the heading "Buybacks" (columns Company | Buyback Yield | Average Yield (3Y) | (5Y) | (10Y)) and takes the
+    row of the stock itself, found by its ticker (any text may sit between the ticker and the four values). NO first-row fallback any more
+    (v67 took a peer row for ORCL): when the ticker is not found nothing is returned and the table text is handed back as "diag" for the log.
+    Returns {now, y3, y5, y10, match, src} (None for a missing cell) or {"diag": "..."}."""
     head = re.search(r"Buyback Yield\s+Average Yield\s*\(3Y\)\s+Average Yield\s*\(5Y\)\s+Average Yield\s*\(10Y\)", text, re.I)
     if not head:
-        return {}
+        at = text.find("Buyback")
+        return {"diag": "no table header | " + (text[max(0, at - 80):at + 400] if at >= 0 else "no 'Buyback' text on the page")}
     scope = text[head.end():head.end() + 1500]
     stop = re.search(r"Dividend\s+(?:Yield|History|Payout|Growth)", scope, re.I)
     if stop:
         scope = scope[:stop.start()]
-    cells = r"\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")"
-    found, match = None, None
+    found = None
     if ticker:
-        found = re.search(r"(?<![A-Za-z0-9.])" + re.escape(ticker) + r"(?![A-Za-z0-9])" + cells, scope, re.I)
-        match = "ticker"
+        for hit in re.finditer(r"(?<![A-Za-z0-9.])" + re.escape(ticker) + r"(?![A-Za-z0-9])", scope, re.I):
+            tokens = re.findall(_BB_VAL, scope[hit.end():hit.end() + 220])
+            if len(tokens) >= 4:
+                found = tokens[:4]
+                break
     if not found:
-        found = re.search(r"[A-Za-z][^%\u2014]{0,80}?" + cells, scope)   # first row of the table
-        match = "first_row"
-    if not found:
-        return {}
-    vals = [_bb_cell(found.group(i)) for i in (1, 2, 3, 4)]
-    return {"now": vals[0], "y3": vals[1], "y5": vals[2], "y10": vals[3], "match": match, "src": "table"}
+        return {"diag": "ticker " + str(ticker) + " not found | " + scope[:500]}
+    vals = [_bb_cell(t) for t in found]
+    return {"now": vals[0], "y3": vals[1], "y5": vals[2], "y10": vals[3], "match": "ticker", "src": "table"}
 
 
 def _bb_ready(values):
@@ -1731,7 +1733,7 @@ def fetch_as_buyback(sb, abbrev_as):
             _AS_RATIOS["buyback"] = values
             step("buyback", "OK", ticker=ticker, **values)
         else:
-            step("buyback", "FAIL", reason="no Buybacks table row (or no current yield) on the page", ticker=ticker)
+            step("buyback", "FAIL", reason="no Buybacks table row for the ticker (or no current yield) on the page", ticker=ticker, diag=(values or {}).get("diag", ""))
     except Exception as buyback_error:
         step("buyback", "FAIL", reason=type(buyback_error).__name__)
 
@@ -3036,7 +3038,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v67"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v68"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
