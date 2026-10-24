@@ -32,7 +32,8 @@ another: one failing never blocks another.
 
 VERSION HISTORY
 ----------------------------------------------------------------------------
-VERSION 22
+VERSION 23
+  v67: SHARE COUNT spec 2026-10-24: buyback read ONLY from the Buybacks table of .../dividends#buybacks (columns Company | Buyback Yield | Average Yield 3Y | 5Y | 10Y), row of the stock by ticker (first row if the ticker is not found); values now / y3 / y5 / y10, a dash cell = missing, a real 0.00% is a number; the summary widget and dividend block are not read any more; posted as bb {cur, y3, y5, y10, avg5=y5}.
   v66: PARTIAL Quality Model refresh (env QM_ONLY = workflow input qm_only, e.g. 'Shr chg' or 'ROIC,Moat'): the stage groups statement pages / analyst estimates / buyback run only when one of their inputs is missing; a buyback-only run opens no extra page; the payload is posted with partial=True and the sheet keeps all stored values it does not carry (fn_91_11 v7).
   v65: buyback also readable from the summary-page 'Investor Returns' widget ('Buyback Yield -6.44%', next to 'Dividend Yield 1.62%' which v62 had taken as the buyback for ORCL); no 5Y average there (avg5 stays empty).
   v64: Quality Model completion pass also starts when the main pass produced NO Quality Model payload at all (ORCL 2026-10-23: hist blocked, quality/qm steps did not run, Row JSON stayed without QM data); a 'stages after the DCF' log line shows which stages run.
@@ -1648,66 +1649,70 @@ def fetch_as_ratios(sb, abbrev_as):
             step("ratio_" + name, "FAIL", reason=type(ratio_error).__name__)
 
 
-def _as_extract_buyback(text):
-    """v63: headline numbers of the AlphaSpread BUYBACK block only. The text is cut at the heading "Buyback Yield" (and stops at the
-    next "Dividend" heading), so the Current/Min/Max/Average/Median yield of the dividend block is never read (that was the cause of
-    dividend payers showing their dividend yield as share change)."""
-    out = {}
-    start = None
-    for found in re.finditer(r"Buyback Yield", text):
-        start = found.start()
-        break
-    if start is None:
-        scope = ""
-    else:
-        scope = text[start:start + 2500]
-        stop = re.search(r"Dividend\s+(?:Yield|History|Payout|Growth)", scope[12:], re.I)
-        if stop:
-            scope = scope[:12 + stop.start()]
-    for label, key in (("Current Yield", "current"), ("Min Yield", "min"), ("Max Yield", "max"),
-                       ("Average Yield", "avg"), ("Median Yield", "median")):
-        found = re.search(re.escape(label) + r"\s*:?\s*(-?[\d.,]+)\s*%", scope, re.I)
-        if found:
-            out[key] = _as_num(found.group(1))
-    if "current" not in out:
-        # v65: summary-page widget "Investor Returns": 'Dividend Yield 1.62%' / 'Buyback Yield -6.44%' (no Current/Min/Max labels)
-        found = re.search(r"Buyback Yield\s*:?\s*(-?[\d.,]+)\s*%", text)
-        if found:
-            out["current"] = _as_num(found.group(1))
-            out["src"] = "summary"
-    if "current" not in out:
-        found = re.search(r"[Cc]urrent buyback yield for .{1,40}? is\s*(-?[\d.,]+)\s*%", text)
-        if found:
-            out["current"] = _as_num(found.group(1))
-    return out
+_BB_VAL = r"(?:[-\u2212\u2013]?\s*\d[\d.,]*\s*%|[\u2014\u2013-])"   # v67: "-6.44%", "3.31%", or a dash / em dash = missing
+
+
+def _bb_cell(token):
+    """v67: one cell of the Buybacks table -> float, or None for a dash / empty cell. A real 0.00% is returned as 0.0 (never missing)."""
+    token = (token or "").strip().replace("\u2212", "-").replace("\u2013", "-")
+    if "%" not in token:
+        return None
+    return _as_num(token.replace(" ", ""))
+
+
+def _as_extract_buyback(text, ticker=None):
+    """v67: reads ONLY the table under the heading "Buybacks" (columns Company | Buyback Yield | Average Yield (3Y) | (5Y) | (10Y)) and takes the
+    row of the stock itself (the ticker shown under the company name; the first table row when the ticker is not found). The dividend-yield
+    block of the same page is never read. Returns {now, y3, y5, y10, match, src} (None for a missing cell) or {} when there is no table."""
+    head = re.search(r"Buyback Yield\s+Average Yield\s*\(3Y\)\s+Average Yield\s*\(5Y\)\s+Average Yield\s*\(10Y\)", text, re.I)
+    if not head:
+        return {}
+    scope = text[head.end():head.end() + 1500]
+    stop = re.search(r"Dividend\s+(?:Yield|History|Payout|Growth)", scope, re.I)
+    if stop:
+        scope = scope[:stop.start()]
+    cells = r"\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")\s+(" + _BB_VAL + r")"
+    found, match = None, None
+    if ticker:
+        found = re.search(r"(?<![A-Za-z0-9.])" + re.escape(ticker) + r"(?![A-Za-z0-9])" + cells, scope, re.I)
+        match = "ticker"
+    if not found:
+        found = re.search(r"[A-Za-z][^%\u2014]{0,80}?" + cells, scope)   # first row of the table
+        match = "first_row"
+    if not found:
+        return {}
+    vals = [_bb_cell(found.group(i)) for i in (1, 2, 3, 4)]
+    return {"now": vals[0], "y3": vals[1], "y5": vals[2], "y10": vals[3], "match": match, "src": "table"}
 
 
 def _bb_ready(values):
-    """v55: the buyback numbers are usable only when current and average are read and are not the all-zero placeholder of a block that has not rendered yet (a real 0.00 is never stored)."""
-    if values.get("current") is None or (values.get("avg") is None and values.get("src") != "summary"):   # v65: the summary widget has no 5Y average
-        return False
-    nums = [v for v in values.values() if isinstance(v, (int, float))]
-    return not (nums and all(abs(v) < 1e-9 for v in nums))
+    """v67: usable when the current buyback yield (now) is read. Missing 3Y / 5Y / 10Y cells stay None; a real 0.00 is a number, never missing."""
+    return isinstance(values, dict) and values.get("now") is not None
+
+
+def _qm_bb(bb):
+    """v67: the buyback numbers as posted to the sheet: cur = now, y3 / y5 / y10 (None = missing), avg5 = y5 (old name, kept)."""
+    return {"cur": bb.get("now"), "y3": bb.get("y3"), "y5": bb.get("y5"), "y10": bb.get("y10"), "avg5": bb.get("y5")}
+
+
+def _bb_ticker(abbrev_as):
+    """v67: the ticker part of abbrevAS ('nyse/orcl' -> 'ORCL')."""
+    return str(abbrev_as or "").split("/")[-1].strip().upper() or None
 
 
 def fetch_as_buyback(sb, abbrev_as):
-    """v28: reads the AlphaSpread buyback block (…/dividends#buybacks) and stores it under _AS_RATIOS['buyback']. Never raises."""
-    url = "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))
-    fallback_url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
+    """v67: opens https://www.alphaspread.com/security/{exchange}/{ticker}/dividends#buybacks, waits until the Buybacks table has rendered
+    and reads its row for the stock (now / 3Y / 5Y / 10Y) into _AS_RATIOS['buyback']. Never raises."""
+    url = "https://www.alphaspread.com/security/{}/dividends#buybacks".format(as_path(abbrev_as))
+    ticker = _bb_ticker(abbrev_as)
     try:
         _as_open_cf(sb, url, 5)
         source = sb.get_page_source()
         if "just a moment" in (sb.get_title() or "").lower() or len(source) < 3000:
             step("buyback", "FAIL", reason="blocked")
             return
-        values = _as_extract_buyback(_as_strip_text(source))
-        if "Buyback Yield" not in source and values.get("current") is None:
-            # v63: the buyback page is not there (404 / other layout): old page, buyback block only
-            url = fallback_url
-            _as_open_cf(sb, url, 5)
-            source = sb.get_page_source()
-            values = _as_extract_buyback(_as_strip_text(source))
-        # v44: the block renders lazily - up to 3 extra tries (scroll to the block, wait, re-read; last try reloads the page)
+        values = _as_extract_buyback(_as_strip_text(source), ticker)
+        # the table renders lazily - up to 3 extra tries (scroll to the Buybacks table, wait, re-read; the last try reloads the page)
         for attempt in range(3):
             if _bb_ready(values):
                 break
@@ -1719,14 +1724,14 @@ def fetch_as_buyback(sb, abbrev_as):
                 sb.sleep(4 + 3 * attempt)
                 sb.execute_script("window.scrollBy(0,400);")
                 sb.sleep(2)
-                values = _as_extract_buyback(_as_strip_text(sb.get_page_source()))
+                values = _as_extract_buyback(_as_strip_text(sb.get_page_source()), ticker)
             except Exception:
                 pass
         if _bb_ready(values):
             _AS_RATIOS["buyback"] = values
-            step("buyback", "OK", **values)
+            step("buyback", "OK", ticker=ticker, **values)
         else:
-            step("buyback", "FAIL", reason="no buyback numbers on the page (or only zeros: not stored as 0)", got=",".join(sorted(values.keys())))
+            step("buyback", "FAIL", reason="no Buybacks table row (or no current yield) on the page", ticker=ticker)
     except Exception as buyback_error:
         step("buyback", "FAIL", reason=type(buyback_error).__name__)
 
@@ -2539,11 +2544,11 @@ def fetch_as_qm(sb, abbrev_as):
     if only and not (only & (QM_STATEMENT_LABELS | QM_EST_LABELS)):
         # v66: only the buyback is missing: nothing else is opened, the value read in the ratio stage is posted alone
         bb = _AS_RATIOS.get("buyback") if isinstance(_AS_RATIOS, dict) else None
-        if isinstance(bb, dict) and bb.get("current") is not None:
+        if isinstance(bb, dict) and bb.get("now") is not None:
             _AS_QM.update({"v": 1, "fetched": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "flags": [], "partial": True,
-                           "bb": {"cur": bb.get("current"), "avg5": bb.get("avg")}})
+                           "bb": _qm_bb(bb)})
             _QM_LAST["missing"] = []
-            step("qm", "OK", partial="Shr chg only", bb=bb.get("current"))
+            step("qm", "OK", partial="Shr chg only", bb=bb.get("now"), y3=bb.get("y3"), y5=bb.get("y5"), y10=bb.get("y10"))
         else:
             _QM_LAST["missing"] = ["Shr chg"]
             step("qm", "FAIL", reason="partial: buyback not read", partial="Shr chg only")
@@ -3031,7 +3036,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v66"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v67"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
