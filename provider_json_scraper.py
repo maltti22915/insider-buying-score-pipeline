@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v71: an abbrevAS written with %20 (sto/lifco%20b) is used as it is in every AlphaSpread URL (no space to replace) and the Buybacks ticker is decoded (LIFCO B).
   v70: the widget fallback (current buyback yield when the table row is locked) waits for the lazy render: up to 3 reads with scroll / wait / reload, and the FAIL line logs diag= with the page text around 'Buyback' (v69 read it once, without waiting, and failed for ORCL).
   v69: FIX v68 read the NEXT company's row when the stock's own cells were hidden (BILI got Alphabet's -1.04/1.88/2.05/1.2): the four cells must now follow the ticker directly, 'Unlock' = missing; ORCL's own row is 'Unlock' for visitors, so the current yield is then taken from the 'Buyback Yield -6.44%' widget (investor-returns/i/buybacks), 3Y / 5Y / 10Y stay missing (Shr chg = now alone, Shr \u0394 '-').
   v68: Buybacks table: NO first-row fallback (v67 read a peer row for ORCL: now -1.04 instead of -6.44); the stock's row is found by ticker only, values are the first 4 value tokens after the ticker; when the row is not found the step logs diag= (table text) so the layout can be checked.
@@ -1708,7 +1709,8 @@ def _qm_bb(bb):
 
 def _bb_ticker(abbrev_as):
     """v67: the ticker part of abbrevAS ('nyse/orcl' -> 'ORCL')."""
-    return str(abbrev_as or "").split("/")[-1].strip().upper() or None
+    from urllib.parse import unquote   # v71: 'sto/lifco%20b' -> 'LIFCO B' (the ticker as the Buybacks table shows it)
+    return unquote(str(abbrev_as or "").split("/")[-1]).strip().upper() or None
 
 
 def fetch_as_buyback(sb, abbrev_as):
@@ -3076,7 +3078,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v70"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v71"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
