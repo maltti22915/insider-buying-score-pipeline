@@ -51,7 +51,8 @@ USAGE
 
 Errors: AsDcfError (generic), AsDcfLoginRequired (a login form appeared).
 
-VERSION: as_dcf_extractor v7
+VERSION: as_dcf_extractor v8 (2026-10-24: a space in the abbreviation becomes %20 in the URL, as AlphaSpread writes it: sto/lifco%20b; v7-v8 changes from v61 used '-' which gives a 404)
+PREVIOUS: as_dcf_extractor v7
 v7 -- 2026-10-23: a failed attempt cost ~157 s on average (34 failed attempts = 89 min in one 24 h log): _pass_cloudflare 3 rounds x 25 s, then another 45 s wait for 'View Calculation'
    on a page that was still the Cloudflare page. Now _pass_cloudflare = 2 rounds x 15 s (about 45 s) and, when the page is STILL the Cloudflare page, AsDcfCloudflare is raised at once
    (no 45 s wait) so run_bot can relaunch with a fresh browser.
@@ -137,7 +138,7 @@ import re
 import time
 from datetime import datetime, timezone
 
-VERSION = "as_dcf_extractor v7"
+VERSION = "as_dcf_extractor v8"
 PROBE_AFTER_SECONDS = 15
 MAX_PROBE_MATCHES = 40
 DCF_URL_TEMPLATE = "https://www.alphaspread.com/security/{abbrev}/dcf-valuation"
@@ -800,7 +801,7 @@ def scrape_as_dcf_data(sb, abbrev_as, page_timeout=45, step_timeout=25, poll_int
     if not abbrev:
         raise AsDcfError("EMPTY_ABBREV_AS")
 
-    url = DCF_URL_TEMPLATE.format(abbrev=__import__("re").sub(r"\s+", "-", str(abbrev).strip().strip("/")))
+    url = DCF_URL_TEMPLATE.format(abbrev=__import__("re").sub(r"\s+", "%20", str(abbrev).strip().strip("/")))
     _log("opening {}".format(url))
 
     try:
