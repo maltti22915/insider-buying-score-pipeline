@@ -20,7 +20,7 @@ Each signal scores 0 at the weak end, 60 at "no change", 100 at the strong end (
 Also returns TTM levels and TTM net debt / EBITDA and interest cover (net debt from the latest quarter).
 """
 
-VERSION = "as_ttm_metrics v1.7"   # v1.7 levels capex_prev, ocf_prev, ocfm_now, ocfm_prev, ocfm_3y (CAPEX_SURGE) | v1.6 levels earn_g / earn_g_nm (TTM operating income vs the previous 12 months) | v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
+VERSION = "as_ttm_metrics v1.8"   # v1.8 rev_growth from the income statement alone when the cash flow TTM ends earlier | v1.7 levels capex_prev, ocf_prev, ocfm_now, ocfm_prev, ocfm_3y (CAPEX_SURGE) | v1.6 levels earn_g / earn_g_nm (TTM operating income vs the previous 12 months) | v1.5: levels capex_ttm, ocf_ttm, sga_ttm, sga_prev (Quality Model flags INVESTMENT_PHASE)
 
 import re
 from html.parser import HTMLParser
@@ -262,8 +262,18 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     out["levels"]["ocfm_now"], out["levels"]["ocfm_prev"] = _ocfm[0], _ocfm[1]
     _have = [m for m in _ocfm if m is not None]
     out["levels"]["ocfm_3y"] = sum(_have) / len(_have) if len(_have) == 3 else None
+    # v1.8: the cash flow TTM can end much earlier than the income TTM (BILI: income Jun 2026, cash flow Dec 2024). Revenue growth needs the income
+    # statement only, so it is taken from the income statement's own latest window and the one 12 months before it.
+    inc_growth = None
+    if ip[-1] != latest:
+        _r_now, _r_prev = _g(inc, "Revenue", ip[-1]), _g(inc, "Revenue", _shift(ip[-1], -12))
+        if _r_now and _r_prev:
+            inc_growth = 100.0 * (_r_now / _r_prev - 1.0)
+            out["warnings"].append("rev_growth from the income statement alone ({} vs {})".format(ip[-1], _shift(ip[-1], -12)))
     if prev not in ip:
         out["warnings"].append("no TTM window 12 months before {}: no change signals".format(latest))
+        if inc_growth is not None:
+            out["signals"]["rev_growth"] = inc_growth
         return out
     if "_sbc" in out:
         out["levels"]["sbc_pct_rev"] = out.pop("_sbc")
@@ -276,7 +286,7 @@ def compute_now(income_ttm_html, cashflow_ttm_html, balance_q_html, rev_cagr5_pc
     sig = out["signals"]
     if now_w["revenue"] and prev_w["revenue"]:
         growth = 100.0 * (now_w["revenue"] / prev_w["revenue"] - 1.0)
-        sig["rev_growth"] = growth
+        sig["rev_growth"] = growth if inc_growth is None else inc_growth
         base = None
         if rev_cagr5_pct is not None:
             base, how = rev_cagr5_pct, "5y CAGR"
