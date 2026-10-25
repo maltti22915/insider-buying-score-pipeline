@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v73: AS Hist: 'less than 1% of days' is understood (NVDA / PM failed with 'sentence not understood'), the 'More details' window too; a loose sentence fallback ('this cheap or cheaper on N% of days'); the summary page is opened again when the browser stayed on another page (EVO / NVDA); a failed read logs diag= with the page text about 'usual' / 'history' / 'of days'.
   v72: FIX of v61: AlphaSpread URL path of an abbreviation with a space uses %20 (sto/lifco%20b), not '-' (sto/lifco-b and sto/atco-a give 404 pages in the logs); as_dcf_extractor v8 does the same. The abbreviation search (Column D) was right all along.
   v71: an abbrevAS written with %20 (sto/lifco%20b) is used as it is in every AlphaSpread URL (no space to replace) and the Buybacks ticker is decoded (LIFCO B).
   v70: the widget fallback (current buyback yield when the table row is locked) waits for the lazy render: up to 3 reads with scroll / wait / reload, and the FAIL line logs diag= with the page text around 'Buyback' (v69 read it once, without waiting, and failed for ORCL).
@@ -1794,10 +1795,10 @@ def _as_parse_hist(headline, context):
     Returns (rank or None, rule text)."""
     text = re.sub(r"\s+", " ", "{} {}".format(headline or "", context or "")).strip()
     rules = (
-        (r"this cheap or cheaper on (?:just |only |about )?(\d{1,3})\s*%", lambda n: 100 - n, "cheap-or-cheaper"),
-        (r"less so than on (\d{1,3})\s*%", lambda n: n, "less-so-than"),
-        (r"this expensive or more expensive on (?:just |only |about )?(\d{1,3})\s*%", lambda n: n, "expensive-or-more"),
-        (r"more so than on (\d{1,3})\s*%", lambda n: 100 - n, "more-so-than"),
+        (r"this cheap or cheaper on (?:just |only |about |less than |fewer than |under )?(\d{1,3})\s*%", lambda n: 100 - n, "cheap-or-cheaper"),
+        (r"less so than on (?:less than |fewer than )?(\d{1,3})\s*%", lambda n: n, "less-so-than"),
+        (r"this expensive or more expensive on (?:just |only |about |less than |fewer than |under )?(\d{1,3})\s*%", lambda n: n, "expensive-or-more"),
+        (r"more so than on (?:less than |fewer than )?(\d{1,3})\s*%", lambda n: 100 - n, "more-so-than"),
     )
     for pattern, convert, name in rules:
         found = re.search(pattern, text, re.I)
@@ -1831,6 +1832,14 @@ def _as_hist_text_fallback(text):
     return found.group(1).strip() if found else ""
 
 
+def _as_hist_loose_fallback(text):
+    """v73: last resort when the usual 'TICKER is cheaper than usual...' sentence is not found: any sentence of the page that says how often
+    the stock was this cheap / expensive ('... was this cheap or cheaper on just 21% of days ...'), so the percentage can still be parsed."""
+    text = re.sub(r"[ \t\xa0]+", " ", text or "")
+    found = re.search(r"([^.\n]{0,160}(?:this cheap or cheaper|this expensive or more expensive|less so than|more so than)[^.\n]{0,60}?\d{1,3}\s*%[^.\n]{0,40})", text, re.I)
+    return found.group(1).strip() if found else ""
+
+
 _AS_HIST_OPEN_JS = (
     "var want = 'more details', best = null;"
     "document.querySelectorAll('a, button, span').forEach(function (e) {"
@@ -1847,7 +1856,7 @@ def _as_parse_hist_modal(text):
     Returns a dict with whatever was found: rank, label, today (signed %: + undervalued, - overvalued), exp_return, cheap_return."""
     text = re.sub(r"[ \t\xa0]+", " ", text or "")
     out = {}
-    found = re.search(r"(Cheaper|More expensive|Dearer|Pricier) than on (\d{1,3})\s*%\s*of days", text, re.I)
+    found = re.search(r"(Cheaper|More expensive|Dearer|Pricier) than on (?:less than |fewer than |<\s*)?(\d{1,3})\s*%\s*of days", text, re.I)
     if found and 0 <= int(found.group(2)) <= 100:
         n = int(found.group(2))
         out["rank"] = n if found.group(1).lower() == "cheaper" else 100 - n
@@ -2247,6 +2256,11 @@ def fetch_as_hist(sb, abbrev_as):
     _QM_WALL.clear()   # v49: never reuse the widget of the previous stock
     try:
         _as_open_cf(sb, url, 5)
+        if "/summary" not in (sb.get_current_url() or ""):   # v73: the browser stayed on another page (EVO / NVDA were read on .../revenue): open the summary page again
+            try:
+                sb.uc_open_with_reconnect(url, 5)
+            except Exception:
+                pass
         if "just a moment" in (sb.get_title() or "").lower():
             step("hist", "FAIL", reason="blocked")
             return
@@ -2294,7 +2308,7 @@ def fetch_as_hist(sb, abbrev_as):
                 visible_text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
             except Exception:
                 visible_text = ""
-            fallback = _as_hist_text_fallback(visible_text) or _as_hist_text_fallback(_as_strip_text(sb.get_page_source()))
+            fallback = _as_hist_text_fallback(visible_text) or _as_hist_text_fallback(_as_strip_text(sb.get_page_source())) or _as_hist_loose_fallback(visible_text)
             if fallback:
                 headline, context = fallback, ""
                 step("hist", "INFO", note="headline element missing, sentence found in the page text")
@@ -2305,8 +2319,13 @@ def fetch_as_hist(sb, abbrev_as):
                     handle.write(sb.get_page_source()[:AS_PAGE_SAVE_CHARS if "AS_PAGE_SAVE_CHARS" in globals() else 400000])
             except Exception:
                 pass
+            try:   # v73: what the page says about its history / usual valuation, to see why the sentence is missing
+                at_hist = [m.start() for m in re.finditer(r"usual|history|of days|Unlock", visible_text)]
+                snippet = " ~ ".join(re.sub(r"\s+", " ", visible_text[max(0, a - 60):a + 140]) for a in at_hist[:3])[:420]
+            except Exception:
+                snippet = ""
             step("hist", "FAIL", reason="headline did not appear", rounds=rounds, box=probe.get("box"), loading=probe.get("loading"),
-                 scrollHeight=probe.get("height"), title=(sb.get_title() or "")[:60], url=(sb.get_current_url() or "")[:90])
+                 scrollHeight=probe.get("height"), title=(sb.get_title() or "")[:60], url=(sb.get_current_url() or "")[:90], diag=snippet or "no 'usual' / 'history' / 'of days' text")
             return
         rank, rule = _as_parse_hist(headline, context)
         # v32: the 'More details' window has the exact figure ("Cheaper than on 63% of days over 5 years"); the one-line
@@ -3079,7 +3098,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v72"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v73"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
