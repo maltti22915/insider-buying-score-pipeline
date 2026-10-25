@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v74: buyback fallback (locked table row) reads the 'Buyback Yield' widget on the SUMMARY page first, then the investor-returns page (BILI / SE found no widget on the investor-returns page); the posted bb carries src and read date; as_ttm_metrics v1.8 (revenue growth from the income statement when the cash flow TTM ends earlier, e.g. BILI).
   v73: AS Hist: 'less than 1% of days' is understood (NVDA / PM failed with 'sentence not understood'), the 'More details' window too; a loose sentence fallback ('this cheap or cheaper on N% of days'); the summary page is opened again when the browser stayed on another page (EVO / NVDA); a failed read logs diag= with the page text about 'usual' / 'history' / 'of days'.
   v72: FIX of v61: AlphaSpread URL path of an abbreviation with a space uses %20 (sto/lifco%20b), not '-' (sto/lifco-b and sto/atco-a give 404 pages in the logs); as_dcf_extractor v8 does the same. The abbreviation search (Column D) was right all along.
   v71: an abbrevAS written with %20 (sto/lifco%20b) is used as it is in every AlphaSpread URL (no space to replace) and the Buybacks ticker is decoded (LIFCO B).
@@ -1706,7 +1707,8 @@ def _bb_ready(values):
 
 def _qm_bb(bb):
     """v67: the buyback numbers as posted to the sheet: cur = now, y3 / y5 / y10 (None = missing), avg5 = y5 (old name, kept)."""
-    return {"cur": bb.get("now"), "y3": bb.get("y3"), "y5": bb.get("y5"), "y10": bb.get("y10"), "avg5": bb.get("y5")}
+    return {"cur": bb.get("now"), "y3": bb.get("y3"), "y5": bb.get("y5"), "y10": bb.get("y10"), "avg5": bb.get("y5"),
+            "src": bb.get("src"), "read": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}   # v74: src (table / summary) and read date: a row that gave only the current yield is read again after 3 days
 
 
 def _bb_ticker(abbrev_as):
@@ -1745,24 +1747,25 @@ def fetch_as_buyback(sb, abbrev_as):
         if not _bb_ready(values) or (values.get("now") is not None and all(values.get(k) is None for k in ("y3", "y5", "y10"))) or values.get("locked"):
             # v69: the table row is hidden ("Unlock") or has only the current yield -> the current yield from the widget page (3Y / 5Y / 10Y stay missing)
             wdiag = ""
+            widget = {}
             try:
-                wurl = "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))
-                _as_open_cf(sb, wurl, 5)
-                widget = {}
-                for wtry in range(3):   # v70: the widget renders lazily, like the table: wait / scroll / re-read (the last try reloads the page)
-                    wtext = _as_strip_text(sb.get_page_source())
-                    widget = _as_extract_buyback_widget(wtext)
+                for wurl in ("https://www.alphaspread.com/security/{}/summary".format(as_path(abbrev_as)),
+                             "https://www.alphaspread.com/security/{}/investor-returns/i/buybacks".format(as_path(abbrev_as))):
+                    _as_open_cf(sb, wurl, 5)   # v74: the 'Investor Returns' widget lives on the summary page; the investor-returns page is the second place
+                    for wtry in range(2):
+                        wtext = _as_strip_text(sb.get_page_source())
+                        widget = _as_extract_buyback_widget(wtext)
+                        if widget.get("now") is not None:
+                            break
+                        at = wtext.find("Buyback")
+                        wdiag = ("widget not found | " + wtext[max(0, at - 60):at + 300]) if at >= 0 else ("no 'Buyback' text, page length " + str(len(wtext)))
+                        try:
+                            sb.execute_script("window.scrollTo(0,document.body.scrollHeight/3);")
+                            sb.sleep(4 + 3 * wtry)
+                        except Exception:
+                            pass
                     if widget.get("now") is not None:
                         break
-                    at = wtext.find("Buyback")
-                    wdiag = ("widget not found | " + wtext[max(0, at - 60):at + 300]) if at >= 0 else ("no 'Buyback' text, page length " + str(len(wtext)))
-                    try:
-                        if wtry == 2:
-                            sb.uc_open_with_reconnect(wurl, 5)
-                        sb.execute_script("window.scrollTo(0,document.body.scrollHeight/3);")
-                        sb.sleep(4 + 3 * wtry)
-                    except Exception:
-                        pass
                 if widget.get("now") is not None and not _bb_ready(values):
                     values = dict(widget, diag=(values or {}).get("diag", ""))
                 elif widget.get("now") is not None and values.get("now") is not None and abs(widget["now"] - values["now"]) > 0.05:
@@ -3098,7 +3101,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v73"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v74"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
