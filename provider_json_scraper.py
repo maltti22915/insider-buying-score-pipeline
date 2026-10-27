@@ -33,6 +33,8 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v76: industry line with ONE part (UNH: 'Health Care') is the sector, industry stays empty (log 'industry: single value'); description hint (insurance / insurer / bank / brokerage / broker, not preceded by 'not a') posted as ratios.industry.descHint.
+  v75: industry / sector: the line under 'What <company> Does' on the AlphaSpread summary page (e.g. 'Retail · Consumer Discretionary') is read during the existing summary visit and posted in the ASRP payload as ratios.industry = {industry, sector}; fn_91_07 v10 stores it in the abbreviation JSON (column D) as industryAS / sectorAS. Log step 'industry'.
   v74: buyback fallback (locked table row) reads the 'Buyback Yield' widget on the SUMMARY page first, then the investor-returns page (BILI / SE found no widget on the investor-returns page); the posted bb carries src and read date; as_ttm_metrics v1.8 (revenue growth from the income statement when the cash flow TTM ends earlier, e.g. BILI).
   v73: AS Hist: 'less than 1% of days' is understood (NVDA / PM failed with 'sentence not understood'), the 'More details' window too; a loose sentence fallback ('this cheap or cheaper on N% of days'); the summary page is opened again when the browser stayed on another page (EVO / NVDA); a failed read logs diag= with the page text about 'usual' / 'history' / 'of days'.
   v72: FIX of v61: AlphaSpread URL path of an abbreviation with a space uses %20 (sto/lifco%20b), not '-' (sto/lifco-b and sto/atco-a give 404 pages in the logs); as_dcf_extractor v8 does the same. The abbreviation search (Column D) was right all along.
@@ -2251,6 +2253,65 @@ def fetch_as_score_details(sb, abbrev_as):
             step("scores_detail", "FAIL", kind=kind, reason=type(detail_error).__name__)
 
 
+def _as_split_industry(lines):
+    """v76: from the page text lines, the line after 'What <company> Does'. Two terms separated by a middle dot (industry, sector) or ONE term
+    (UNH: 'Health Care' = the sector). Returns (industry, sector, description_text); industry '' when only one term. (None, None, '') when not found."""
+    for i, line in enumerate(lines):
+        if re.match(r"^\s*What\s+.+\s+Does\s*$", line or "", re.I):
+            terms = None
+            desc = []
+            for k, nxt in enumerate(lines[i + 1:i + 8]):
+                if re.match(r"^\s*(Headquarters|Employees|IPO date)\b", nxt or "", re.I):
+                    break
+                if terms is None and "\u00b7" in (nxt or ""):
+                    parts = [p.strip() for p in nxt.split("\u00b7") if p.strip()]
+                    terms = parts
+                    continue
+                if terms is None and k == 0 and len(nxt) <= 60 and not nxt.endswith("."):
+                    terms = [nxt.strip()]   # v76: single term line
+                    continue
+                if terms is not None:
+                    desc.append(nxt)
+            if not terms:
+                return None, None, ""
+            if len(terms) >= 2:
+                return terms[0][:60], terms[1][:60], " ".join(desc)[:1200]
+            return "", terms[0][:60], " ".join(desc)[:1200]
+    return None, None, ""
+
+
+_FIN_WORDS = re.compile(r"(?<!not a )(?<!not an )\b(insurance|insurer|insurers|bank|banks|banking|brokerage|broker)\b", re.I)
+
+
+def _as_desc_hint(desc):
+    """v76: first FIN-like word of the description paragraph ('insurance', 'bank', 'brokerage', ...) not preceded by 'not a' / 'not an'; '' when none."""
+    m = _FIN_WORDS.search(desc or "")
+    return m.group(1).lower() if m else ""
+
+
+def _as_read_industry(sb):
+    """v75/v76: reads 'Retail / Consumer Discretionary' (term 1 / term 2; ONE term = sector only) under 'What <company> Does' on the open summary page and stores it in
+    _AS_RATIOS['industry'] = {industry, sector, descHint}. Never raises; the run goes on when it fails."""
+    try:
+        text = sb.execute_script("return document.body ? (document.body.innerText || '') : '';") or ""
+        lines = [re.sub(r"\s+", " ", x).strip() for x in text.split("\n")]
+        lines = [x for x in lines if x]
+        industry, sector, desc = _as_split_industry(lines)
+        if sector:
+            hint = _as_desc_hint(desc)
+            _AS_RATIOS["industry"] = {"industry": industry, "sector": sector, "descHint": hint}
+            if industry:
+                step("industry", "OK", industry=industry, sector=sector, descHint=hint or "-")
+            else:
+                step("industry", "OK", note="industry: single value", sector=sector, descHint=hint or "-")
+        else:
+            at = [m.start() for m in re.finditer(r"Does\b", text)]
+            snippet = " ~ ".join(re.sub(r"\s+", " ", text[max(0, a - 40):a + 120]) for a in at[:2])[:300]
+            step("industry", "FAIL", reason="line under 'What ... Does' not found", diag=snippet or "no 'Does' text")
+    except Exception as industry_error:
+        step("industry", "FAIL", reason=type(industry_error).__name__)
+
+
 def fetch_as_hist(sb, abbrev_as):
     """v30/v31: reads the AlphaSpread 'valuation history' sentence (.../summary) and stores {rank, headline, context, url} under
     _AS_RATIOS['hist']. The block is a lazy Livewire component below the fold (v30 never saw it after 40 s without scrolling), so v31
@@ -2268,6 +2329,7 @@ def fetch_as_hist(sb, abbrev_as):
             step("hist", "FAIL", reason="blocked")
             return
         sb.sleep(2.0)
+        _as_read_industry(sb)   # v75: industry / sector line, same summary visit
         deadline = time.time() + int(os.environ.get("AS_HIST_WAIT", "45"))
         probe = {}
         scroll_y = 0
@@ -3101,7 +3163,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v74"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v76"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
