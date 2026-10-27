@@ -20,7 +20,7 @@ HOW TO KEEP IT CURRENT
   Every time a listed file gets a new version, the number in EXPECTED changes with it (this file is delivered together with that change).
   Version lines read:  VERSION = "name v66" / SCRIPT_VERSION = "name v66"  |  "VERSION: name v3" in the docstring  |  "# VERSION 13" in a workflow.
 
-VERSION: py_version_check v2 -- (2026-10-23) workflow files are looked up in .github/workflows/ as well (v1 reported provider_json_scraper.yml as MISSING).
+VERSION: py_version_check v12 -- (2026-10-27) provider_json_scraper 76. v11 -- (2026-10-27) provider_json_scraper 75. v2 -- (2026-10-23) workflow files are looked up in .github/workflows/ as well (v1 reported provider_json_scraper.yml as MISSING).
   v1 -- new.
 ============================================================================
 """
@@ -28,11 +28,11 @@ import os
 import re
 import sys
 
-VERSION = "py_version_check v10"
+VERSION = "py_version_check v12"
 
 # file -> expected version (a number such as 66 or 1.16)
 EXPECTED = {
-    "provider_json_scraper.py": "74",
+    "provider_json_scraper.py": "76",
     "insider_score_scraper.py": "15",
     "as_dcf_extractor.py": "8",
     "as_qm_data.py": "1.18",
