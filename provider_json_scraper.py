@@ -33,6 +33,7 @@ another: one failing never blocks another.
 VERSION HISTORY
 ----------------------------------------------------------------------------
 VERSION 23
+  v77: new input as_multiples / env AS_MULTIPLES: "0" skips ONLY the three AlphaSpread ratio pages (p/e, p/ocf, p/fcf); Apps Script sends 0 when the stored multiples were read less than 3 days ago (fn_24_82 v1); the other AlphaSpread steps run as before.
   v76: industry line with ONE part (UNH: 'Health Care') is the sector, industry stays empty (log 'industry: single value'); description hint (insurance / insurer / bank / brokerage / broker, not preceded by 'not a') posted as ratios.industry.descHint.
   v75: industry / sector: the line under 'What <company> Does' on the AlphaSpread summary page (e.g. 'Retail · Consumer Discretionary') is read during the existing summary visit and posted in the ASRP payload as ratios.industry = {industry, sector}; fn_91_07 v10 stores it in the abbreviation JSON (column D) as industryAS / sectorAS. Log step 'industry'.
   v74: buyback fallback (locked table row) reads the 'Buyback Yield' widget on the SUMMARY page first, then the investor-returns page (BILI / SE found no widget on the investor-returns page); the posted bb carries src and read date; as_ttm_metrics v1.8 (revenue growth from the income statement when the cash flow TTM ends earlier, e.g. BILI).
@@ -2852,8 +2853,11 @@ def scrape_as_dcf(sb, abbrev_as, row_number, headless=True):
             if dcf_failed and _STEP_CTX.get("blocked", 0) >= 1:   # v60: was 2
                 raise CloudflareBlocked("AlphaSpread shows the Cloudflare page on {} steps after the DCF failed".format(_STEP_CTX.get("blocked", 0)))
         if os.environ.get("AS_RATIOS", "1") != "0" and not dcf_cf:
-            fetch_as_ratios(sb, abbrev_as)
-            _stop_if_blocked()
+            if os.environ.get("AS_MULTIPLES", "1") != "0":   # v77: stored multiples younger than 3 days are kept by Apps Script (fn_24_82): the three ratio pages are not opened
+                fetch_as_ratios(sb, abbrev_as)
+                _stop_if_blocked()
+            else:
+                step("ratios", "OK", skipped="AS_MULTIPLES=0 (stored multiples younger than 3 days)")
             fetch_as_buyback(sb, abbrev_as)
             _stop_if_blocked()
             if os.environ.get("AS_HIST", "1") != "0":
@@ -3163,7 +3167,7 @@ def run_providers_in_parallel(providers, trace, webhook_url, row_number, sheet_n
     print("🧹 Task complete!")
 
 
-SCRIPT_VERSION = "provider_json_scraper v76"   # bump on every change to this file
+SCRIPT_VERSION = "provider_json_scraper v77"   # bump on every change to this file
 
 
 def as_path(abbrev_as):
